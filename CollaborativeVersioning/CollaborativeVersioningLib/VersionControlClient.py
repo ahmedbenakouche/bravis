@@ -44,7 +44,7 @@ class VersionRecord:
 class VersionControlClient:
     """Client Push/Pull/Create pour le versioning collaboratif."""
 
-    DEFAULT_SERVER_URL = "http://localhost:8000"
+    DEFAULT_SERVER_URL = "https://anatovcs-server.icm-institute.org"
 
     def __init__(self, server_url: str | None = None, local_store_dir: str | None = None):
         self.server_url = (server_url or self.DEFAULT_SERVER_URL).rstrip("/")

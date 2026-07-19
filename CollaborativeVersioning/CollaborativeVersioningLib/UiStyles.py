@@ -1,19 +1,18 @@
 """Shared styles for the Collaborative Versioning UI — Ice Clinic theme."""
 
-# ── Palette (cool slate, clinical flat) ──────────────────────────────────────
-BG_DEEP = "#161920"
-BG_PANEL = "#1c2029"
-BG_ELEVATED = "#242933"
-BG_INPUT = "#2a303c"
-BORDER = "#353d4d"
+# ── Palette (neutral gray + ice accents) ─────────────────────────────────────
+BG_DEEP = "#2a2a2a"
+BG_PANEL = "#303030"
+BG_ELEVATED = "#383838"
+BG_INPUT = "#424242"
+BORDER = "#505050"
 BORDER_FOCUS = "#5b9fd4"
 TEXT_PRIMARY = "#eef2f7"
-TEXT_SECONDARY = "#a8b4c4"
-TEXT_MUTED = "#6b7789"
+TEXT_SECONDARY = "#b8bcc4"
+TEXT_MUTED = "#888888"
 ACCENT_ICE = "#5b9fd4"
 ACCENT_ICE_HOVER = "#4a8bc0"
 ACCENT_MINT = "#6ee7b7"
-ACCENT_MINT_HOVER = "#4ade9a"
 ACCENT_INDIGO = "#818cf8"
 ACCENT_INDIGO_HOVER = "#6366f1"
 ACCENT_AMBER = "#fbbf24"
@@ -33,6 +32,119 @@ DOCK_STYLE = f"""
 QWidget {{
   background-color: {BG_DEEP};
   color: {TEXT_PRIMARY};
+}}
+"""
+
+DOCK_LOCKED_STYLE = f"""
+QWidget {{
+  background-color: {BG_DEEP};
+  color: {TEXT_MUTED};
+}}
+QLabel {{
+  color: {TEXT_MUTED};
+}}
+QPushButton:disabled {{
+  background-color: {BG_ELEVATED};
+  color: {TEXT_MUTED};
+  border: 1px solid {BORDER};
+  font-weight: 600;
+  border-radius: 4px;
+  padding: 10px;
+}}
+QTextEdit:disabled {{
+  background-color: {BG_PANEL};
+  color: {TEXT_MUTED};
+  border: 1px solid {BORDER};
+  border-radius: 4px;
+}}
+QTableWidget {{
+  background-color: {BG_PANEL};
+  color: {TEXT_MUTED};
+  border: 1px solid {BORDER};
+}}
+QFrame {{
+  background-color: {BORDER};
+}}
+"""
+
+DOCK_WIDGET_LOCKED_STYLE = f"""
+QDockWidget {{
+  background-color: {BG_DEEP};
+  color: {TEXT_MUTED};
+}}
+QDockWidget::title {{
+  background-color: {BG_PANEL};
+  color: {TEXT_MUTED};
+  padding: 6px;
+  border: 1px solid {BORDER};
+}}
+"""
+
+DOCK_BTN_LOCKED_STYLE = f"""
+QPushButton {{
+  background-color: {BG_ELEVATED};
+  color: {TEXT_MUTED};
+  border: 1px solid {BORDER};
+  font-weight: 600;
+  border-radius: 4px;
+  padding: 10px;
+}}
+"""
+
+TABLE_LOCKED_STYLE = f"""
+QTableWidget {{
+  background-color: {BG_ELEVATED};
+  color: {TEXT_MUTED};
+  gridline-color: {BORDER};
+  border: 1px solid {BORDER};
+  border-radius: 4px;
+}}
+QHeaderView::section {{
+  background-color: {BG_DEEP};
+  color: {TEXT_MUTED};
+  border: none;
+  border-bottom: 1px solid {BORDER};
+}}
+"""
+
+DOCK_LOCK_BANNER_STYLE = f"""
+color: {TEXT_MUTED};
+font-size: 10px;
+font-weight: 600;
+font-style: italic;
+padding: 8px 10px;
+background-color: #222222;
+border: 1px dashed #404040;
+border-radius: 4px;
+"""
+
+SECTION_TITLE_LOCKED_STYLE = f"""
+font-weight: 600;
+font-size: 10px;
+color: {TEXT_MUTED};
+letter-spacing: 2px;
+padding: 0 0 5px 8px;
+border-left: 3px solid {BORDER};
+"""
+
+PLACEHOLDER_LOCKED_STYLE = f"""
+color: {TEXT_MUTED};
+font-size: 10px;
+padding: 8px 4px;
+background-color: {BG_ELEVATED};
+border-radius: 4px;
+border: 1px dashed {BORDER};
+"""
+
+FEED_LOCKED_STYLE = f"""
+QTextEdit {{
+  background-color: {BG_DEEP};
+  color: {TEXT_MUTED};
+  font-family: "Segoe UI", sans-serif;
+  font-size: 11px;
+  border: 1px solid {BORDER};
+  border-radius: 4px;
+  padding: 8px;
 }}
 """
 
@@ -105,7 +217,6 @@ border: none;
 # ── Status labels ────────────────────────────────────────────────────────────
 STATUS_WARNING = f"color: {ACCENT_AMBER}; font-weight: 600; font-size: 11px;"
 STATUS_OK = f"color: {ACCENT_MINT}; font-weight: 600; font-size: 11px;"
-STATUS_ERROR = f"color: {ACCENT_RED}; font-weight: 600; font-size: 11px;"
 STATUS_NEUTRAL = f"color: {TEXT_SECONDARY}; font-weight: 600; font-size: 11px;"
 
 # ── Buttons (flat, clinical) ───────────────────────────────────────────────────
@@ -115,20 +226,6 @@ QPushButton:disabled {{
   color: {TEXT_MUTED};
   border: 1px solid {BORDER};
 }}
-"""
-
-BTN_PRIMARY = f"""
-QPushButton {{
-  background-color: {ACCENT_MINT};
-  color: {BG_DEEP};
-  font-weight: 700;
-  border-radius: 4px;
-  border: none;
-  padding: 9px 14px;
-}}
-QPushButton:hover {{ background-color: {ACCENT_MINT_HOVER}; }}
-QPushButton:pressed {{ background-color: #34d399; }}
-{_BTN_DISABLED}
 """
 
 BTN_SECONDARY = f"""
@@ -171,8 +268,13 @@ QPushButton {{
   border-radius: 4px;
   border: none;
 }}
-QPushButton:hover {{ background-color: {ACCENT_ICE_HOVER}; color: white; }}
-QPushButton:pressed {{ background-color: #3b82c4; }}
+QPushButton:hover:enabled {{ background-color: {ACCENT_ICE_HOVER}; color: white; }}
+QPushButton:pressed:enabled {{ background-color: #3b82c4; }}
+QPushButton:disabled {{
+  background-color: {BG_ELEVATED};
+  color: {ACCENT_ICE};
+  border: 1px solid {BORDER};
+}}
 """
 
 BTN_HISTORY = f"""
@@ -184,8 +286,13 @@ QPushButton {{
   border-radius: 4px;
   border: none;
 }}
-QPushButton:hover {{ background-color: {ACCENT_INDIGO_HOVER}; }}
-QPushButton:pressed {{ background-color: #4f46e5; }}
+QPushButton:hover:enabled {{ background-color: {ACCENT_INDIGO_HOVER}; }}
+QPushButton:pressed:enabled {{ background-color: #4f46e5; }}
+QPushButton:disabled {{
+  background-color: {BG_ELEVATED};
+  color: {ACCENT_INDIGO};
+  border: 1px solid {BORDER};
+}}
 """
 
 BTN_CREATE = f"""
@@ -288,9 +395,9 @@ color: {TEXT_MUTED};
 margin-bottom: 4px;
 """
 
-DIALOG_HEADER_STYLE = f"""
-font-weight: 700;
-font-size: 11px;
+CHECKED_OUT_LABEL_STYLE = f"""
+font-size: 10px;
+font-weight: 600;
 color: {ACCENT_ICE};
-margin-bottom: 4px;
+margin-bottom: 2px;
 """

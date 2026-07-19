@@ -8,11 +8,15 @@ set(MODULE_PYTHON_SCRIPTS
   CollaborativeVersioningLib/DataManager.py
   CollaborativeVersioningLib/VersionControlClient.py
   CollaborativeVersioningLib/OntologyLoader.py
+  CollaborativeVersioningLib/simulation/__init__.py
+  CollaborativeVersioningLib/simulation/DemoData.py
   CollaborativeVersioningLib/GraphCanvas.py
   CollaborativeVersioningLib/UiStyles.py
   )
 
 set(MODULE_PYTHON_RESOURCES
+  CollaborativeVersioningLib/ontologies/Allen_Mouse_Brain_Atlas.json
+  CollaborativeVersioningLib/ontologies/Allen_Human_Brain_Atlas.json
   )
 
 #-----------------------------------------------------------------------------

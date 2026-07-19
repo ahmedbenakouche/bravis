@@ -17,11 +17,13 @@ import CollaborativeVersioningLib.GraphCanvas
 import CollaborativeVersioningLib.UiStyles
 
 # Change this string to verify that Reload picked up your edits.
-_UI_BUILD_TAG = "2026-07-17-ui-theme-ice-clinic-v18-en"
+_UI_BUILD_TAG = "2026-07-19-ui-workflow-v43-en"
 
 _LIB_MODULE_NAMES = (
     "CollaborativeVersioningLib.UiStyles",
+    "CollaborativeVersioningLib.DataManager",
     "CollaborativeVersioningLib.OntologyLoader",
+    "CollaborativeVersioningLib.simulation.DemoData",
     "CollaborativeVersioningLib.GraphCanvas",
     "CollaborativeVersioningLib",
 )
@@ -36,9 +38,18 @@ def _refreshLibModules() -> None:
 
 _refreshLibModules()
 
+from CollaborativeVersioningLib.simulation.DemoData import (
+    DEMO_SERVER_PROJECTS,
+    apply_server_pull,
+    format_version_display_plain,
+    load_project_history_bundle,
+)
 from CollaborativeVersioningLib.GraphCanvas import GRAPH_BUILD_TAG
 from CollaborativeVersioningLib.OntologyLoader import (
+    _qt_input_text,
     OntologyEditorDialog,
+    OntologyJsonHelpDialog,
+    ONTOLOGY_JSON_FILE_FILTER,
     document_to_graph_specs,
     load_ontology_file,
     load_preset,
@@ -46,6 +57,8 @@ from CollaborativeVersioningLib.OntologyLoader import (
     save_ontology_file,
 )
 from CollaborativeVersioningLib.UiStyles import (
+    ACCENT_INDIGO,
+    ACCENT_MINT,
     BTN_CONNECT,
     BTN_CREATE,
     BTN_DEPENDENCY,
@@ -53,35 +66,36 @@ from CollaborativeVersioningLib.UiStyles import (
     BTN_PULL,
     BTN_PUSH,
     BTN_SECONDARY,
+    CHECKED_OUT_LABEL_STYLE,
     COMMIT_STATUS_COLORS,
-    DIALOG_HEADER_STYLE,
     DIALOG_HINT_STYLE,
+    DOCK_LOCK_BANNER_STYLE,
+    DOCK_BTN_LOCKED_STYLE,
+    DOCK_LOCKED_STYLE,
     DOCK_STYLE,
+    DOCK_WIDGET_LOCKED_STYLE,
     FEED_COLOR_ERROR,
     FEED_COLOR_INFO,
+    FEED_LOCKED_STYLE,
     FEED_STYLE,
     FIELD_STYLE,
+    PLACEHOLDER_LOCKED_STYLE,
     PLACEHOLDER_STYLE,
+    SECTION_TITLE_LOCKED_STYLE,
     SECTION_TITLE_STYLE,
     SEPARATOR_STYLE,
     STATUS_NEUTRAL,
     STATUS_OK,
     STATUS_WARNING,
+    TABLE_LOCKED_STYLE,
     TABLE_STYLE,
     TEXT_MUTED,
     TEXT_SECONDARY,
 )
 
-LOCAL_PROJECT_NAME = "Local"
+LOCAL_PROJECT_NAME = "Local — new project"
 ONTOLOGY_COMBO_NONE_LABEL = "None"
 ONTOLOGY_COMBO_NONE_INDEX = 0
-
-
-def _qt_get_text(widget) -> str:
-    value = widget.text if hasattr(widget, "text") and not callable(widget.text) else widget.text()
-    if callable(value):
-        value = value()
-    return str(value).strip()
 
 
 def _qt_combo_text(combo) -> str:
@@ -98,36 +112,75 @@ def _qt_combo_count(combo) -> int:
     return int(value)
 
 
-DEMO_SERVER_PROJECTS = {
-    "Server — Project 1 — Allen mouse": {
-        "volume": "brain_ccf_v3.nrrd",
-        "segmentation": "annotations_main_v16.seg.nrrd",
-        "ontology": "allen_mouse_brain_ccf_v3.json",
-        "main_version": "6",
-    },
-    "Server — Project 2 — Human striatum": {
-        "volume": "mri_striatum_t1.nii.gz",
-        "segmentation": "striatum_labels_v8.seg.nrrd",
-        "ontology": "minimal_brain_regions.json",
-        "main_version": "6",
-    },
-    "Server — Project 3 — Collaborative demo": {
-        "volume": "demo_volume.nrrd",
-        "segmentation": "demo_seg.seg.nrrd",
-        "ontology": "minimal_brain_regions.json",
-        "main_version": "6",
-    },
-}
+def _qt_table_row_count(table) -> int:
+    value = table.rowCount
+    if callable(value):
+        value = value()
+    return int(value)
 
-# Simulated server commit log — column 1 is chronological order (1 = oldest).
-DEMO_COMMIT_HISTORY = [
-    ("6", "2026-07-10 14:30", "Camille Bernard", "Release v4.0 — Allen CCF v3 alignment", "pushed"),
-    ("5", "2026-07-09 11:05", "Dr. Elena Vasquez", "Expert review: striatum boundaries", "pushed"),
-    ("4", "2026-07-08 09:40", "Lucas Petit", "Merge branch 'feature/mesencephalon'", "merged"),
-    ("3", "2026-07-05 16:20", "Marie Dubois", "Refine hippocampus labels on coronal slices", "pushed"),
-    ("2", "2026-07-03 10:15", "Thomas Laurent", "Merge feature/striatum into main", "merged"),
-    ("1", "2026-06-28 08:00", "Sophie Martin", "Initial import from Allen Brain Atlas", "pushed"),
-]
+
+def _qt_widget_is_valid(widget) -> bool:
+    if widget is None:
+        return False
+    try:
+        if hasattr(widget, "isWidgetType"):
+            widget.isWidgetType()
+        else:
+            widget.metaObject()
+        return True
+    except (RuntimeError, ValueError):
+        return False
+
+
+def _safe_qt_call(widget, method_name: str, *args):
+    if not _qt_widget_is_valid(widget):
+        return False
+    method = getattr(widget, method_name, None)
+    if method is None:
+        return False
+    try:
+        method(*args)
+        return True
+    except (RuntimeError, ValueError):
+        return False
+
+
+class ProjectConfigDialog(qt.QDialog):
+    """Configuration dialog shown when creating a new local project."""
+
+    def __init__(self, parent=None) -> None:
+        qt.QDialog.__init__(self, parent)
+        self.setWindowTitle("New project configuration")
+        self.setMinimumWidth(420)
+
+        layout = qt.QFormLayout(self)
+        layout.setSpacing(10)
+
+        self.nameEdit = qt.QLineEdit()
+        self.nameEdit.setPlaceholderText("My annotation project")
+        self.nameEdit.setStyleSheet(FIELD_STYLE)
+        layout.addRow("Project name:", self.nameEdit)
+
+        self.descriptionEdit = qt.QLineEdit()
+        self.descriptionEdit.setPlaceholderText("Optional short description")
+        self.descriptionEdit.setStyleSheet(FIELD_STYLE)
+        layout.addRow("Description:", self.descriptionEdit)
+
+        self.messageEdit = qt.QLineEdit("Initial commit")
+        self.messageEdit.setStyleSheet(FIELD_STYLE)
+        layout.addRow("Initial commit message:", self.messageEdit)
+
+        buttons = qt.QDialogButtonBox(qt.QDialogButtonBox.Ok | qt.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def values(self) -> dict:
+        return {
+            "name": self.nameEdit.text.strip(),
+            "description": self.descriptionEdit.text.strip(),
+            "message": self.messageEdit.text.strip() or "Initial commit",
+        }
 
 
 class CollaborativeVersioning(ScriptedLoadableModule):
@@ -155,12 +208,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.logic = None
         self._currentVersionId = None
         self._rightDock = None
+        self._rightDockContainer = None
         self._server_pulled = False
         self._ontology_document = None
         self._ontology_preset_ids = [preset_id for preset_id, _label in preset_choices()]
         self._connected = False
         self._server_files_loaded = False
         self._active_server_project = None
+        self._ontology_server_combo_index = -1
+        self._local_project_name = None
+        self._local_project_description = None
+        self._local_project_created = False
+        self._suppress_asset_ui_updates = 0
+        self._suppress_history_selection_signal = False
+        self._project_history_bundle = None
 
     def setup(self) -> None:
         try:
@@ -180,14 +241,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._buildLeftPanel()
         self._buildRightDock()
         self._setupDefaults()
-        self._updateProjectModeUi()
-        self._ensureLocalDefaultOntology()
+        self._connected = False
+        self.connectionStatusLabel.text = "Not connected"
+        self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
+        self._applyDisconnectedUi()
         self.setupDeveloperSection()
         self._appendFeed(_("Collaborative Versioning module — UI MVP (E2)."))
         self._appendFeed(f"Build UI : {_UI_BUILD_TAG}")
         self._appendFeed(f"Graph build : {GRAPH_BUILD_TAG}")
 
     def _clearLayout(self) -> None:
+        self._disconnectProjectAssetSignals()
         while self.layout.count():
             item = self.layout.takeAt(0)
             widget = item.widget()
@@ -215,8 +279,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         connexionLayout = qt.QFormLayout(connexionButton)
         connexionLayout.setSpacing(8)
 
-        self.serverUrlEdit = qt.QLineEdit("http://localhost:8000")
-        self.serverUrlEdit.setPlaceholderText("http://localhost:8000")
+        self.serverUrlEdit = qt.QLineEdit("https://anatovcs-server.icm-institute.org")
+        self.serverUrlEdit.setPlaceholderText("https://anatovcs-server.icm-institute.org")
         self.serverUrlEdit.setStyleSheet(FIELD_STYLE)
         connexionLayout.addRow("Server URL:", self.serverUrlEdit)
 
@@ -245,6 +309,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         projectButton = ctk.ctkCollapsibleButton()
         projectButton.text = "Active project"
         projectButton.collapsed = False
+        self.projectButton = projectButton
         self.layout.addWidget(projectButton)
         projectLayout = qt.QVBoxLayout(projectButton)
         projectLayout.setSpacing(10)
@@ -286,10 +351,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.ontologyPresetCombo.setCurrentIndex(ONTOLOGY_COMBO_NONE_INDEX)
         ontologyPanelLayout.addWidget(self.ontologyPresetCombo)
         ontologyLocalActions = qt.QHBoxLayout()
+        self.ontologyHelpButton = qt.QPushButton("Help")
         self.loadOntologyButton = qt.QPushButton("Load JSON…")
         self.editOntologyButton = qt.QPushButton("Edit")
         self.exportOntologyButton = qt.QPushButton("Export")
-        for btn in (self.loadOntologyButton, self.editOntologyButton, self.exportOntologyButton):
+        for btn in (self.ontologyHelpButton, self.loadOntologyButton, self.editOntologyButton, self.exportOntologyButton):
             btn.setStyleSheet(BTN_SECONDARY + " font-size: 10px; padding: 3px 6px;")
             ontologyLocalActions.addWidget(btn)
         ontologyPanelLayout.addLayout(ontologyLocalActions)
@@ -308,6 +374,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.pushButton.setStyleSheet(BTN_PUSH)
         for btn in (self.createButton, self.pullButton, self.pushButton):
             actionsLayout.addWidget(btn)
+        self.createButton.setEnabled(False)
+        self.pullButton.setEnabled(False)
+        self.pushButton.setEnabled(False)
         projectLayout.addWidget(actionsRow)
 
         self.layout.addStretch(1)
@@ -315,12 +384,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.connectButton.connect("clicked()", self.onConnect)
         self.projectCombo.connect("currentIndexChanged(int)", self.onProjectChanged)
         self.ontologyPresetCombo.connect("currentIndexChanged(int)", self.onOntologyPresetChanged)
+        self.ontologyHelpButton.connect("clicked()", self.onOntologyJsonHelp)
         self.loadOntologyButton.connect("clicked()", self.onLoadOntologyJson)
         self.editOntologyButton.connect("clicked()", self.onEditOntology)
         self.exportOntologyButton.connect("clicked()", self.onExportOntologyJson)
         self.createButton.connect("clicked()", self.onCreateVersion)
         self.pushButton.connect("clicked()", self.onPush)
         self.pullButton.connect("clicked()", self.onPull)
+        self.volumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self._onProjectAssetsChanged)
+        self.segmentationSelector.connect("currentNodeChanged(vtkMRMLNode*)", self._onProjectAssetsChanged)
 
     def _configureDataNodeSelector(self, selector, node_types, none_enabled=False) -> None:
         """Existing scene nodes only (no create/delete entries)."""
@@ -344,17 +416,127 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 graph_title="Ontology",
                 graph_description="No ontology loaded.",
             )
+        self._updateRightDockAvailability()
+        self._updateVersionActionButtons()
 
     def _setOntologyComboNone(self) -> None:
         self.ontologyPresetCombo.blockSignals(True)
         self.ontologyPresetCombo.setCurrentIndex(ONTOLOGY_COMBO_NONE_INDEX)
         self.ontologyPresetCombo.blockSignals(False)
 
+    def _removeServerOntologyComboEntry(self) -> None:
+        combo = self.ontologyPresetCombo
+        if self._ontology_server_combo_index < 0:
+            return
+        combo.blockSignals(True)
+        if 0 <= self._ontology_server_combo_index < combo.count:
+            combo.removeItem(self._ontology_server_combo_index)
+        self._ontology_server_combo_index = -1
+        combo.blockSignals(False)
+
+    def _ontologyComboLabelFromPath(self, path: str) -> str:
+        name = os.path.basename(path)
+        if name.lower().endswith(".json"):
+            return name[:-5]
+        return os.path.splitext(name)[0]
+
+    def _setOntologyComboLoadedFilename(self, document=None, filename=None) -> None:
+        if filename:
+            label = self._ontologyComboLabelFromPath(filename)
+        elif document:
+            label = self._ontologyComboLabelFromPath(document.get("source_path") or "ontology.json")
+        else:
+            return
+        combo = self.ontologyPresetCombo
+        self._removeServerOntologyComboEntry()
+        combo.blockSignals(True)
+        combo.addItem(label)
+        self._ontology_server_combo_index = combo.count - 1
+        combo.setCurrentIndex(self._ontology_server_combo_index)
+        combo.blockSignals(False)
+
+    def _beginBatchUiUpdate(self) -> None:
+        self._suppress_asset_ui_updates += 1
+
+    def _endBatchUiUpdate(self, refresh: bool = True) -> None:
+        if self._suppress_asset_ui_updates > 0:
+            self._suppress_asset_ui_updates -= 1
+        if refresh and self._suppress_asset_ui_updates == 0:
+            qt.QTimer.singleShot(0, self._refreshProjectAssetUi)
+
+    def _rightDockUiAlive(self) -> bool:
+        return (
+            _qt_widget_is_valid(getattr(self, "_rightDock", None))
+            and _qt_widget_is_valid(getattr(self, "btnDependencyGraph", None))
+            and _qt_widget_is_valid(getattr(self, "btnHistoryGraph", None))
+        )
+
+    def _teardownRightDock(self) -> None:
+        table = getattr(self, "historyTableWidget", None)
+        if table is not None:
+            try:
+                table.disconnect("itemSelectionChanged()", self.onHistorySelectionChanged)
+            except (RuntimeError, ValueError, TypeError):
+                pass
+        for button, slot in (
+            (getattr(self, "btnDependencyGraph", None), self.onOpenDependencyGraph),
+            (getattr(self, "btnHistoryGraph", None), self.onOpenHistoryGraph),
+        ):
+            if button is None:
+                continue
+            try:
+                button.disconnect("clicked()", slot)
+            except (RuntimeError, ValueError, TypeError):
+                pass
+        self.btnDependencyGraph = None
+        self.btnHistoryGraph = None
+        self.feedTextEdit = None
+        self.historyTableWidget = None
+        self.historyPlaceholder = None
+        self._dockLockBanner = None
+        self._dockGraphsTitle = None
+        self._dockHistoryTitle = None
+        self._dockActivityTitle = None
+        self._dockSeparator = None
+        self._rightDockContainer = None
+
+    def _blockProjectAssetSignals(self, blocked: bool) -> None:
+        for name in ("volumeSelector", "segmentationSelector"):
+            selector = getattr(self, name, None)
+            if _qt_widget_is_valid(selector):
+                selector.blockSignals(blocked)
+
+    def _disconnectProjectAssetSignals(self) -> None:
+        for name in ("volumeSelector", "segmentationSelector"):
+            selector = getattr(self, name, None)
+            if selector is None:
+                continue
+            try:
+                selector.disconnect("currentNodeChanged(vtkMRMLNode*)", self._onProjectAssetsChanged)
+            except (RuntimeError, ValueError, TypeError):
+                pass
+            setattr(self, name, None)
+
+    def _refreshProjectAssetUi(self) -> None:
+        if not self._connected or self._suppress_asset_ui_updates > 0:
+            return
+        if not _qt_widget_is_valid(getattr(self, "pullButton", None)):
+            return
+        self._updateVersionActionButtons()
+        self._updateRightDockAvailability()
+
     def _clearProjectAssetFields(self) -> None:
-        self.volumeSelector.setCurrentNode(None)
-        self.segmentationSelector.setCurrentNode(None)
-        self._clearOntologyDocument()
-        self._setOntologyComboNone()
+        self._blockProjectAssetSignals(True)
+        try:
+            if _qt_widget_is_valid(getattr(self, "volumeSelector", None)):
+                self.volumeSelector.setCurrentNode(None)
+            if _qt_widget_is_valid(getattr(self, "segmentationSelector", None)):
+                self.segmentationSelector.setCurrentNode(None)
+            self._clearOntologyDocument()
+            self._removeServerOntologyComboEntry()
+            self._setOntologyComboNone()
+        finally:
+            self._blockProjectAssetSignals(False)
 
     def _setProjectAssetFieldsEnabled(self, enabled: bool) -> None:
         self.volumeSelector.setEnabled(enabled)
@@ -363,26 +545,37 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.loadOntologyButton.setEnabled(enabled)
         self.editOntologyButton.setEnabled(enabled)
         self.exportOntologyButton.setEnabled(enabled)
+        self.ontologyHelpButton.setEnabled(True)
 
     def _buildRightDock(self) -> None:
         mainWin = slicer.util.mainWindow()
+        self._teardownRightDock()
         for oldDock in mainWin.findChildren(qt.QDockWidget, "CollaborativeVersioning_RightDock"):
             mainWin.removeDockWidget(oldDock)
             oldDock.deleteLater()
+        self._rightDock = None
 
         self._rightDock = qt.QDockWidget("Collaborative Versioning — Collaborative mode", mainWin)
         self._rightDock.setObjectName("CollaborativeVersioning_RightDock")
         self._rightDock.setAllowedAreas(qt.Qt.RightDockWidgetArea)
+        self._rightDock.setStyleSheet(DOCK_STYLE)
 
         container = qt.QWidget()
+        self._rightDockContainer = container
         container.setStyleSheet(DOCK_STYLE)
         layout = qt.QVBoxLayout(container)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
-        graphsTitle = qt.QLabel("VISUAL EXPLORATION")
-        graphsTitle.setStyleSheet(SECTION_TITLE_STYLE)
-        layout.addWidget(graphsTitle)
+        self._dockLockBanner = qt.QLabel("Locked — connect to the server first.")
+        self._dockLockBanner.setWordWrap(True)
+        self._dockLockBanner.setStyleSheet(DOCK_LOCK_BANNER_STYLE)
+        self._dockLockBanner.setVisible(False)
+        layout.addWidget(self._dockLockBanner)
+
+        self._dockGraphsTitle = qt.QLabel("VISUAL EXPLORATION")
+        self._dockGraphsTitle.setStyleSheet(SECTION_TITLE_STYLE)
+        layout.addWidget(self._dockGraphsTitle)
 
         self.btnDependencyGraph = qt.QPushButton("View dependency graph")
         self.btnDependencyGraph.setStyleSheet(BTN_DEPENDENCY)
@@ -392,9 +585,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.btnHistoryGraph.setStyleSheet(BTN_HISTORY)
         layout.addWidget(self.btnHistoryGraph)
 
-        historyTitle = qt.QLabel("COMMIT HISTORY")
-        historyTitle.setStyleSheet(SECTION_TITLE_STYLE)
-        layout.addWidget(historyTitle)
+        self._dockHistoryTitle = qt.QLabel("COMMIT HISTORY")
+        self._dockHistoryTitle.setStyleSheet(SECTION_TITLE_STYLE)
+        layout.addWidget(self._dockHistoryTitle)
+
+        self.checkedOutLabel = qt.QLabel("")
+        self.checkedOutLabel.setWordWrap(True)
+        self.checkedOutLabel.setStyleSheet(CHECKED_OUT_LABEL_STYLE)
+        self.checkedOutLabel.setVisible(False)
+        layout.addWidget(self.checkedOutLabel)
 
         self.historyPlaceholder = qt.QLabel(
             "Commit history is available for server projects after Pull."
@@ -405,32 +604,29 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
         self.historyTableWidget = qt.QTableWidget()
         self.historyTableWidget.setColumnCount(5)
-        self.historyTableWidget.setHorizontalHeaderLabels(["#", "Date", "Author", "Message", "Status"])
+        self.historyTableWidget.setHorizontalHeaderLabels(["Version", "Date", "Author", "Message", "Status"])
         self.historyTableWidget.setAlternatingRowColors(True)
         self.historyTableWidget.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
         self.historyTableWidget.setSelectionMode(qt.QAbstractItemView.SingleSelection)
         self.historyTableWidget.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
         self.historyTableWidget.setStyleSheet(TABLE_STYLE)
+        self.historyTableWidget.verticalHeader().setVisible(False)
         self.historyTableWidget.horizontalHeader().setStretchLastSection(True)
         self.historyTableWidget.setMinimumHeight(130)
         self.historyTableWidget.setMaximumHeight(180)
         self.historyTableWidget.setVisible(False)
         layout.addWidget(self.historyTableWidget)
 
-        self.refreshHistoryButton = qt.QPushButton("Refresh commits")
-        self.refreshHistoryButton.setStyleSheet(BTN_SECONDARY + " font-size: 10px; padding: 4px 8px;")
-        self.refreshHistoryButton.setVisible(False)
-        layout.addWidget(self.refreshHistoryButton)
-
         separator = qt.QFrame()
         separator.setFrameShape(qt.QFrame.HLine)
         separator.setFrameShadow(qt.QFrame.Plain)
         separator.setStyleSheet(SEPARATOR_STYLE)
+        self._dockSeparator = separator
         layout.addWidget(separator)
 
-        activityTitle = qt.QLabel("LIVE ACTIVITY FEED")
-        activityTitle.setStyleSheet(SECTION_TITLE_STYLE)
-        layout.addWidget(activityTitle)
+        self._dockActivityTitle = qt.QLabel("LIVE ACTIVITY FEED")
+        self._dockActivityTitle.setStyleSheet(SECTION_TITLE_STYLE)
+        layout.addWidget(self._dockActivityTitle)
 
         self.feedTextEdit = qt.QTextEdit()
         self.feedTextEdit.setReadOnly(True)
@@ -442,22 +638,35 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
         self.btnDependencyGraph.connect("clicked()", self.onOpenDependencyGraph)
         self.btnHistoryGraph.connect("clicked()", self.onOpenHistoryGraph)
-        self.refreshHistoryButton.connect("clicked()", self._refreshHistoryTable)
         self.historyTableWidget.connect("itemSelectionChanged()", self.onHistorySelectionChanged)
+        self._setRightDockLocked(True)
+
+    def _applyDockGraphButtonsLocked(self) -> None:
+        for button in (
+            getattr(self, "btnDependencyGraph", None),
+            getattr(self, "btnHistoryGraph", None),
+        ):
+            if _qt_widget_is_valid(button):
+                button.setStyleSheet(DOCK_BTN_LOCKED_STYLE)
+                button.setEnabled(False)
+
+    def _styleDockGraphButton(self, button, enabled: bool, active_style: str) -> None:
+        if not _qt_widget_is_valid(button):
+            return
+        try:
+            button.setStyleSheet(active_style)
+            button.setEnabled(enabled)
+        except (RuntimeError, ValueError):
+            pass
 
     def _setupDefaults(self) -> None:
         self.userIdEdit.text = os.environ.get("USER", os.environ.get("USERNAME", "annotator"))
 
     def _promptCommitMessage(self, title: str, label: str, default: str = "") -> str | None:
-        message, ok = qt.QInputDialog.getText(
-            slicer.util.mainWindow(),
-            title,
-            label,
-            text=default,
-        )
-        if not ok or not message.strip():
+        message, ok = _qt_input_text(slicer.util.mainWindow(), title, label, default)
+        if not ok or not message:
             return None
-        return message.strip()
+        return message
 
     def _populateProjectCombo(self) -> None:
         self.projectCombo.blockSignals(True)
@@ -480,22 +689,217 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _currentProjectName(self) -> str:
         return _qt_combo_text(self.projectCombo) or LOCAL_PROJECT_NAME
 
+    def _isLocalProjectMode(self) -> bool:
+        return self._currentProjectName() == LOCAL_PROJECT_NAME
+
+    def _refreshUiState(self) -> None:
+        if not self._connected:
+            self._applyDisconnectedUi()
+            return
+        self._setRightDockLocked(False)
+        self._setActiveProjectSectionEnabled(True)
+        self._updateProjectModeUi()
+        self._updateRightDockAvailability()
+
+    def _applyDisconnectedUi(self) -> None:
+        self._setActiveProjectSectionEnabled(False)
+        self._setRightDockLocked(True)
+        self._updateCommitHistoryPanel()
+
+    def _setRightDockLocked(self, locked: bool) -> None:
+        if getattr(self, "_dockLockBanner", None):
+            self._dockLockBanner.setVisible(locked)
+        if getattr(self, "_rightDock", None):
+            self._rightDock.setStyleSheet(DOCK_WIDGET_LOCKED_STYLE if locked else "")
+        if getattr(self, "_rightDockContainer", None):
+            self._rightDockContainer.setStyleSheet(DOCK_LOCKED_STYLE if locked else DOCK_STYLE)
+        if getattr(self, "_dockSeparator", None):
+            self._dockSeparator.setStyleSheet(
+                "background-color: #282828; max-height: 1px; border: none;"
+                if locked
+                else SEPARATOR_STYLE
+            )
+        title_style = SECTION_TITLE_LOCKED_STYLE if locked else SECTION_TITLE_STYLE
+        for title in (
+            getattr(self, "_dockGraphsTitle", None),
+            getattr(self, "_dockHistoryTitle", None),
+            getattr(self, "_dockActivityTitle", None),
+        ):
+            if title is not None:
+                title.setStyleSheet(title_style)
+        if getattr(self, "historyPlaceholder", None):
+            self.historyPlaceholder.setStyleSheet(
+                PLACEHOLDER_LOCKED_STYLE if locked else PLACEHOLDER_STYLE
+            )
+        if locked:
+            self._applyDockGraphButtonsLocked()
+            if getattr(self, "feedTextEdit", None):
+                self.feedTextEdit.setEnabled(False)
+                self.feedTextEdit.setStyleSheet(FEED_LOCKED_STYLE)
+            if getattr(self, "historyTableWidget", None):
+                self.historyTableWidget.setEnabled(False)
+                self.historyTableWidget.setStyleSheet(TABLE_LOCKED_STYLE)
+            return
+        if getattr(self, "feedTextEdit", None):
+            self.feedTextEdit.setStyleSheet(FEED_STYLE)
+        if getattr(self, "historyTableWidget", None):
+            self.historyTableWidget.setEnabled(True)
+            self.historyTableWidget.setStyleSheet(TABLE_STYLE)
+        self._updateRightDockAvailability()
+
+    def _setActiveProjectSectionEnabled(self, enabled: bool) -> None:
+        if getattr(self, "projectButton", None):
+            self.projectButton.setEnabled(enabled)
+        for widget_name in (
+            "projectCombo",
+            "volumeSelector",
+            "segmentationSelector",
+            "ontologyPresetCombo",
+            "loadOntologyButton",
+            "editOntologyButton",
+            "exportOntologyButton",
+            "createButton",
+            "pullButton",
+            "pushButton",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+        if not enabled:
+            return
+        if self._isServerProjectMode() and not self._server_files_loaded:
+            self._setProjectAssetFieldsEnabled(False)
+        elif self._isServerProjectMode():
+            self._setProjectAssetFieldsEnabled(True)
+        else:
+            self._setProjectAssetFieldsEnabled(True)
+        self._updateVersionActionButtons()
+
+    def _canOpenDependencyGraph(self) -> bool:
+        if not self._connected:
+            return False
+        if not self._ontology_document:
+            return False
+        if self._isServerProjectMode():
+            return self._server_pulled
+        return self._isLocalProjectMode()
+
+    def _canOpenVersionTree(self) -> bool:
+        if not self._connected:
+            return False
+        if self._isLocalProjectMode():
+            return False
+        return self._server_pulled
+
+    def _updateRightDockAvailability(self) -> None:
+        if not self._connected or self._suppress_asset_ui_updates > 0:
+            return
+        if not self._rightDockUiAlive():
+            return
+        dependency_ok = self._canOpenDependencyGraph()
+        version_tree_ok = self._canOpenVersionTree()
+        self._styleDockGraphButton(self.btnDependencyGraph, dependency_ok, BTN_DEPENDENCY)
+        self._styleDockGraphButton(self.btnHistoryGraph, version_tree_ok, BTN_HISTORY)
+        _safe_qt_call(getattr(self, "feedTextEdit", None), "setEnabled", True)
+        feed = getattr(self, "feedTextEdit", None)
+        if _qt_widget_is_valid(feed):
+            try:
+                feed.setStyleSheet(FEED_STYLE)
+            except (RuntimeError, ValueError):
+                pass
+
+    def _hasVolume(self) -> bool:
+        if not getattr(self, "volumeSelector", None):
+            return False
+        node = self.volumeSelector.currentNode()
+        if node is None:
+            return False
+        scene = slicer.mrmlScene
+        return scene is not None and scene.GetNodeByID(node.GetID()) is not None
+
+    def _hasSegmentation(self) -> bool:
+        if not getattr(self, "segmentationSelector", None):
+            return False
+        node = self.segmentationSelector.currentNode()
+        if node is None:
+            return False
+        scene = slicer.mrmlScene
+        return scene is not None and scene.GetNodeByID(node.GetID()) is not None
+
+    def _hasOntology(self) -> bool:
+        return self._ontology_document is not None
+
+    def _projectAssetsComplete(self) -> bool:
+        return self._hasVolume() and self._hasSegmentation() and self._hasOntology()
+
+    def _missingProjectAssets(self) -> list[str]:
+        missing = []
+        if not self._hasVolume():
+            missing.append("3D Volume")
+        if not self._hasSegmentation():
+            missing.append("Segmentation")
+        if not self._hasOntology():
+            missing.append("Ontology map")
+        return missing
+
+    def _onProjectAssetsChanged(self, *_args) -> None:
+        if not self._connected or self._suppress_asset_ui_updates > 0:
+            return
+        if not _qt_widget_is_valid(getattr(self, "pullButton", None)):
+            return
+        qt.QTimer.singleShot(0, self._refreshProjectAssetUi)
+
+    def _canPush(self) -> bool:
+        if not self._connected or not self._currentVersionId:
+            return False
+        if self._isLocalProjectMode():
+            return self._projectAssetsComplete()
+        return self._server_pulled
+
+    def _pushDisabledReason(self) -> str:
+        if not self._connected:
+            return "Connect to the server first."
+        if not self._currentVersionId:
+            return "Create or select a version first."
+        if self._isLocalProjectMode():
+            missing = ", ".join(self._missingProjectAssets())
+            if missing:
+                return "Fill project data first: %s." % missing
+            return ""
+        if not self._server_pulled:
+            return "Pull the server project first."
+        return ""
+
+    def _updateVersionActionButtons(self) -> None:
+        if not self._connected or self._suppress_asset_ui_updates > 0:
+            return
+        if not _qt_widget_is_valid(getattr(self, "pushButton", None)):
+            return
+        self.createButton.setStyleSheet(BTN_CREATE)
+        self.createButton.setEnabled(True)
+        self.createButton.setToolTip("")
+        push_ok = self._canPush()
+        self.pushButton.setStyleSheet(BTN_PUSH)
+        self.pushButton.setEnabled(push_ok)
+        self.pushButton.setToolTip("" if push_ok else self._pushDisabledReason())
+        if self._isLocalProjectMode():
+            self.pullButton.setEnabled(False)
+            return
+        self.pullButton.setEnabled(True)
+
     def _selectLocalProject(self) -> None:
         local_index = self.projectCombo.findText(LOCAL_PROJECT_NAME)
         if local_index >= 0:
             self.projectCombo.setCurrentIndex(local_index)
 
-    def _ensureLocalDefaultOntology(self) -> None:
-        if self._isServerProjectMode():
-            return
-        if self._ontology_document is None:
-            self._initOntologyFromPreset(0)
-
     def _updateProjectModeUi(self) -> None:
+        if not self._connected:
+            return
         if self._isServerProjectMode():
             if self._active_server_project != self._currentProjectName():
                 self._server_files_loaded = False
                 self._server_pulled = False
+                self._project_history_bundle = None
                 self._active_server_project = self._currentProjectName()
             if not self._server_files_loaded:
                 self._clearProjectAssetFields()
@@ -505,9 +909,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         else:
             self._server_files_loaded = False
             self._server_pulled = False
+            self._project_history_bundle = None
             self._active_server_project = None
+            self._local_project_created = False
+            self._local_project_name = None
+            self._local_project_description = None
             self._setProjectAssetFieldsEnabled(True)
         self._updateCommitHistoryPanel()
+        if self._connected:
+            self._updateVersionActionButtons()
+        self._updateRightDockAvailability()
 
     def _shouldShowCommitHistory(self) -> bool:
         return self._isServerProjectMode() and self._server_pulled
@@ -518,15 +929,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if self._shouldShowCommitHistory():
             self.historyPlaceholder.setVisible(False)
             self.historyTableWidget.setVisible(True)
-            self.refreshHistoryButton.setVisible(True)
             self._refreshHistoryTable()
             return
 
         self.historyPlaceholder.setVisible(True)
         self.historyTableWidget.setVisible(False)
-        self.refreshHistoryButton.setVisible(False)
         self.historyTableWidget.setRowCount(0)
-        if self._isServerProjectMode():
+        if getattr(self, "checkedOutLabel", None):
+            self.checkedOutLabel.setVisible(False)
+        if not self._connected:
+            self.historyPlaceholder.setText("Connect to the server to begin.")
+        elif self._isServerProjectMode():
             self.historyPlaceholder.setText("Pull to load commit history from the server.")
         else:
             self.historyPlaceholder.setText(
@@ -534,19 +947,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
 
     def _simulateServerPull(self, version_id=None) -> None:
-        project_name = self._currentProjectName()
-        meta = DEMO_SERVER_PROJECTS.get(project_name)
-        if not meta:
-            return
-
-        version_id = version_id or meta["main_version"]
-        self._currentVersionId = version_id
-        self._server_pulled = True
-        # E2: back-end not wired — Pull does not load assets yet.
-        self._server_files_loaded = False
-        self._clearProjectAssetFields()
-        self._setProjectAssetFieldsEnabled(False)
-        self._updateCommitHistoryPanel()
+        apply_server_pull(self, version_id)
 
     def _initOntologyFromPreset(self, preset_index: int) -> None:
         if preset_index < 0 or preset_index >= len(self._ontology_preset_ids):
@@ -568,21 +969,34 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self.logic._dependencyCanvas.set_specs(
                 document_to_graph_specs(document),
                 graph_title=document.get("name"),
-                graph_description=document.get("description"),
             )
+        self._updateRightDockAvailability()
+        self._updateVersionActionButtons()
 
     def getOntologyGraphPayload(self):
+        if not self._connected:
+            return {
+                "specs": [],
+                "title": "Ontology",
+                "description": "Connect to the server to begin.",
+            }
+        if self._isServerProjectMode() and not self._server_pulled:
+            return {
+                "specs": [],
+                "title": "Ontology",
+                "description": "Dependency graph is not available — Pull a server project first.",
+            }
         if not self._ontology_document:
             return {
                 "specs": [],
                 "title": "Ontology",
-                "description": "No ontology loaded.",
+                "description": "No ontology loaded — choose a preset or load JSON.",
             }
         document = self._ontology_document
         return {
             "specs": document_to_graph_specs(document),
             "title": document.get("name", "Ontology"),
-            "description": document.get("description", ""),
+            "description": "",
         }
 
     def onProjectChanged(self, _index: int) -> None:
@@ -596,19 +1010,60 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if self._isServerProjectMode():
             self._server_files_loaded = False
             self._server_pulled = False
-            self._updateProjectModeUi()
+            self._project_history_bundle = None
+            self._local_project_created = False
+            self._local_project_name = None
+            self._refreshUiState()
             self._appendFeed("Server project selected: %s — Pull to load data" % self._currentProjectName())
-        else:
-            self._updateProjectModeUi()
-            self._ensureLocalDefaultOntology()
-            self._appendFeed("Local project — using current 3D Slicer scene.")
+            return
+
+        self._local_project_created = False
+        self._local_project_name = None
+        self._local_project_description = None
+        self._currentVersionId = None
+        self._refreshUiState()
+        self._appendFeed("Local — new project: use Create to configure and start.")
+
+    def _versionDisplayTag(self, version_id: str) -> str:
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        return format_version_display_plain(version_id, bundle.get("tags_by_id"))
+
+    def getVersionTreePayload(self):
+        if not self._connected:
+            return {
+                "specs": [],
+                "title": "Version tree",
+                "description": "Connect to the server to begin.",
+            }
+        if self._isLocalProjectMode():
+            return {
+                "specs": [],
+                "title": "Version tree",
+                "description": "Version tree is not available — no server project selected.",
+            }
+        if not self._server_pulled:
+            return {
+                "specs": [],
+                "title": "Version tree",
+                "description": "Version tree is not available — Pull a server project first.",
+            }
+        return {
+            "specs": list((getattr(self, "_project_history_bundle", None) or {}).get("version_specs", [])),
+            "title": self._currentProjectName() or "Version tree",
+            "description": "",
+        }
 
     def onOntologyPresetChanged(self, index: int) -> None:
         if self._serverAwaitingPull():
             return
         if index == ONTOLOGY_COMBO_NONE_INDEX:
             self._clearOntologyDocument()
+            self._removeServerOntologyComboEntry()
+            self._updateRightDockAvailability()
             return
+        if index == self._ontology_server_combo_index:
+            return
+        self._removeServerOntologyComboEntry()
         preset_index = index - 1
         if preset_index < 0 or preset_index >= len(self._ontology_preset_ids):
             return
@@ -621,6 +1076,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._applyOntologyDocument(document)
         self._appendFeed("Ontology loaded: %s" % document.get("name"))
 
+    def onOntologyJsonHelp(self) -> None:
+        dialog = OntologyJsonHelpDialog(slicer.util.mainWindow())
+        dialog.exec_()
+
     def onLoadOntologyJson(self) -> None:
         if self._serverAwaitingPull():
             self._appendFeed("Pull required before loading ontology from server project.", error=True)
@@ -629,7 +1088,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             None,
             "Load ontology JSON",
             os.path.expanduser("~"),
-            "JSON (*.json)",
+            ONTOLOGY_JSON_FILE_FILTER,
         )
         if isinstance(path, tuple):
             path = path[0]
@@ -641,6 +1100,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Invalid ontology JSON: %s" % error, error=True)
             return
         self._applyOntologyDocument(document)
+        self._setOntologyComboLoadedFilename(document=document)
         self._appendFeed("Ontology imported: %s (%d node(s))" % (document["name"], len(document["nodes"])))
 
     def onEditOntology(self) -> None:
@@ -648,12 +1108,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Pull required before editing ontology.", error=True)
             return
         if not self._ontology_document:
-            self._initOntologyFromPreset(0)
-        dialog = OntologyEditorDialog(self._ontology_document, slicer.util.mainWindow())
-        if dialog.exec_() != qt.QDialog.Accepted:
+            self._appendFeed("No ontology loaded — choose a preset or load JSON first.", error=True)
             return
-        self._applyOntologyDocument(dialog.result_document())
-        self._appendFeed("Ontology edited: %s (UI)" % self._ontology_document["name"])
+        try:
+            dialog = OntologyEditorDialog(self._ontology_document, slicer.util.mainWindow())
+            if dialog.exec_() != qt.QDialog.Accepted:
+                return
+            self._applyOntologyDocument(dialog.result_document())
+            self._appendFeed("Ontology edited: %s (UI)" % self._ontology_document["name"])
+        except Exception as exc:
+            logging.exception("Ontology editor failed")
+            self._appendFeed("Ontology editor failed: %s" % exc, error=True)
 
     def onExportOntologyJson(self) -> None:
         if not self._ontology_document:
@@ -664,7 +1129,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             None,
             "Export ontology JSON",
             os.path.join(os.path.expanduser("~"), default_name),
-            "JSON (*.json)",
+            ONTOLOGY_JSON_FILE_FILTER,
         )
         if isinstance(path, tuple):
             path = path[0]
@@ -685,10 +1150,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def cleanup(self) -> None:
         self._closeLogicDialogs()
+        self._disconnectProjectAssetSignals()
+        self._teardownRightDock()
         if self._rightDock and slicer.util.mainWindow():
             slicer.util.mainWindow().removeDockWidget(self._rightDock)
             self._rightDock.deleteLater()
-            self._rightDock = None
+        self._rightDock = None
         self.removeObservers()
 
     def onConnect(self) -> None:
@@ -710,24 +1177,98 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.connectionStatusLabel.text = "Connected — %s" % user_id
         self.connectionStatusLabel.setStyleSheet(STATUS_OK)
         self._populateProjectCombo()
-        self._updateProjectModeUi()
+        self._refreshUiState()
         self._appendFeed("Simulated connection: %s@%s (E2)." % (user_id, server_url))
 
-    def _nextCommitOrder(self) -> str:
-        max_order = 0
-        for row in range(self.historyTableWidget.rowCount):
-            order_item = self.historyTableWidget.item(row, 0)
-            if not order_item:
+    def _promptNewProjectConfig(self) -> dict | None:
+        dialog = ProjectConfigDialog(slicer.util.mainWindow())
+        if dialog.exec_() != qt.QDialog.Accepted:
+            return None
+        values = dialog.values()
+        if not values["name"]:
+            self._appendFeed("Project name is required.", error=True)
+            return None
+        return values
+
+    def _formatMainVersion(self, revision: int) -> str:
+        return "main/%d" % revision
+
+    def _parseMainRevision(self, version_id: str) -> int | None:
+        if not version_id.startswith("main/"):
+            return None
+        try:
+            return int(version_id.split("/", 1)[1])
+        except ValueError:
+            return None
+
+    def _nextMainVersionId(self) -> str:
+        max_revision = 0
+        for row in range(_qt_table_row_count(self.historyTableWidget)):
+            version_item = self.historyTableWidget.item(row, 0)
+            if not version_item:
                 continue
-            try:
-                max_order = max(max_order, int(order_item.text()))
-            except ValueError:
-                continue
-        return str(max_order + 1)
+            revision = self._parseMainRevision(self._historyVersionIdFromItem(version_item))
+            if revision is not None:
+                max_revision = max(max_revision, revision)
+        if max_revision == 0 and self._currentVersionId:
+            revision = self._parseMainRevision(self._currentVersionId)
+            if revision is not None:
+                max_revision = revision
+        return self._formatMainVersion(max_revision + 1)
 
     def onCreateVersion(self) -> None:
-        if self._isServerProjectMode() and not self._connected:
+        if not self._connected:
             self._appendFeed("Connect to the server first.", error=True)
+            return
+        if not self._projectAssetsComplete():
+            missing = ", ".join(self._missingProjectAssets())
+            slicer.util.warningDisplay(
+                "Cannot create a project yet.\n\n"
+                "Fill in all project data first:\n"
+                "• 3D Volume\n"
+                "• Segmentation\n"
+                "• Ontology map\n\n"
+                "Missing: %s" % missing
+            )
+            self._appendFeed(
+                "Create blocked — missing project data: %s." % missing,
+                error=True,
+            )
+            return
+
+        if self._isLocalProjectMode():
+            if not self._local_project_created:
+                config = self._promptNewProjectConfig()
+                if config is None:
+                    return
+                self._local_project_name = config["name"]
+                self._local_project_description = config["description"]
+                self._local_project_created = True
+                version_id = self._formatMainVersion(1)
+                message = config["message"]
+                self._currentVersionId = version_id
+                self._appendFeed(
+                    "Project created: « %s » — %s (%s)"
+                    % (self._local_project_name, version_id, message)
+                )
+                if self._local_project_description:
+                    self._appendFeed("Description: %s" % self._local_project_description)
+                self._updateVersionActionButtons()
+                self._updateRightDockAvailability()
+                return
+
+            message = self._promptCommitMessage(
+                "New version",
+                "Commit message:",
+                "New version on main",
+            )
+            if message is None:
+                return
+            author = self.userIdEdit.text.strip() or "annotator"
+            version_id = self._nextMainVersionId()
+            self._currentVersionId = version_id
+            self._appendFeed("Version created: %s — %s" % (version_id, message))
+            self._updateVersionActionButtons()
             return
 
         default_message = "Initial commit" if not self._currentVersionId else "New version"
@@ -740,22 +1281,28 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
 
         author = self.userIdEdit.text.strip() or "annotator"
-        commit_order = self._nextCommitOrder()
-        self._currentVersionId = commit_order
+        version_id = self._nextMainVersionId()
+        self._currentVersionId = version_id
 
         if self._shouldShowCommitHistory():
             self._prependHistoryRow(
-                commit_order,
+                version_id,
                 datetime.now().strftime("%Y-%m-%d %H:%M"),
                 author,
                 message,
                 "local",
             )
-        self._appendFeed("Create simulated: #%s — %s" % (commit_order, message))
+        self._appendFeed("Create simulated: %s — %s" % (version_id, message))
+        self._updateVersionActionButtons()
 
     def onPush(self) -> None:
-        if self._isServerProjectMode() and not self._connected:
+        if not self._connected:
             self._appendFeed("Connect to the server first.", error=True)
+            return
+        if not self._canPush():
+            reason = self._pushDisabledReason()
+            if reason:
+                self._appendFeed(reason, error=True)
             return
         if not self._currentVersionId:
             self._appendFeed("Create or select a version first.", error=True)
@@ -797,14 +1344,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not self._connected:
                 self._appendFeed("Connect to the server first.", error=True)
                 return
-            commit_order = self._selectedVersionId() or DEMO_SERVER_PROJECTS.get(
-                self._currentProjectName(), {}
-            ).get("main_version")
+            bundle = getattr(self, "_project_history_bundle", None) or {}
+            commit_order = self._selectedVersionId() or bundle.get("head_version")
             self._simulateServerPull(commit_order)
-            self._appendFeed(
-                "Pull simulated (server): #%s — commit history loaded; assets not wired yet (E2)."
-                % (commit_order or "latest")
-            )
             return
 
         self._appendFeed(
@@ -813,14 +1355,85 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         )
 
     def onHistorySelectionChanged(self) -> None:
+        if getattr(self, "_suppress_history_selection_signal", False):
+            return
         selected_version_id = self._selectedVersionId()
         if selected_version_id:
-            self._currentVersionId = selected_version_id
+            self._setCheckedOutVersion(selected_version_id, notify=True, sync_table=False)
+
+    def _setCheckedOutVersion(
+        self,
+        version_id: str,
+        notify: bool = False,
+        sync_table: bool = True,
+    ) -> None:
+        if not version_id:
+            return
+        changed = version_id != self._currentVersionId
+        self._currentVersionId = version_id
+        self._updateActiveVersionIndicators()
+        if sync_table:
+            self._selectHistoryRowForVersion(version_id)
+        if notify and changed:
+            self._appendFeed(
+                "Checked out %s (simulation — assets unchanged)."
+                % self._versionDisplayTag(version_id)
+            )
+        self._updateVersionActionButtons()
+
+    def _selectHistoryRowForVersion(self, version_id: str) -> None:
+        table = self.historyTableWidget
+        if not _qt_widget_is_valid(table):
+            return
+        self._suppress_history_selection_signal = True
+        table.blockSignals(True)
+        try:
+            for row in range(_qt_table_row_count(table)):
+                id_item = table.item(row, 0)
+                if id_item and self._historyVersionIdFromItem(id_item) == version_id:
+                    table.selectRow(row)
+                    break
+        finally:
+            table.blockSignals(False)
+            self._suppress_history_selection_signal = False
+
+    def _updateActiveVersionIndicators(self) -> None:
+        active = self._currentVersionId
+        table = self.historyTableWidget
+        if _qt_widget_is_valid(table) and table.isVisible():
+            for row in range(_qt_table_row_count(table)):
+                id_item = table.item(row, 0)
+                if not id_item:
+                    continue
+                version_id = self._historyVersionIdFromItem(id_item)
+                display = self._versionDisplayTag(version_id)
+                if version_id == active:
+                    display = "▸ " + display
+                id_item.setText(display)
+        if _qt_widget_is_valid(getattr(self, "checkedOutLabel", None)):
+            if active and self._shouldShowCommitHistory():
+                self.checkedOutLabel.setText("Checked out: %s" % self._versionDisplayTag(active))
+                self.checkedOutLabel.setVisible(True)
+            else:
+                self.checkedOutLabel.setVisible(False)
+        canvas = getattr(self.logic, "_historyCanvas", None) if self.logic else None
+        if canvas and _qt_widget_is_valid(canvas) and hasattr(canvas, "set_active_version_id"):
+            canvas.set_active_version_id(active)
 
     def onOpenDependencyGraph(self) -> None:
+        if not self._canOpenDependencyGraph():
+            self._appendFeed(
+                self.getOntologyGraphPayload()["description"],
+                error=True,
+            )
+            return
         self.logic.openDependencyGraph()
 
     def onOpenHistoryGraph(self) -> None:
+        if not self._canOpenVersionTree():
+            payload = self.getVersionTreePayload()
+            self._appendFeed(payload["description"], error=True)
+            return
         self.logic.openVersionHistoryGraph()
 
     def _selectedVersionId(self) -> str | None:
@@ -829,11 +1442,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return None
         row = selected_items[0].row()
         id_item = self.historyTableWidget.item(row, 0)
+        if not id_item:
+            return None
+        version_id = id_item.data(qt.Qt.UserRole)
+        if version_id:
+            return str(version_id)
         return id_item.text() if id_item else None
 
-    def _styleHistoryCell(self, item: qt.QTableWidgetItem, column: int, status: str = "") -> None:
+    def _historyVersionIdFromItem(self, item: qt.QTableWidgetItem) -> str:
+        version_id = item.data(qt.Qt.UserRole)
+        return str(version_id) if version_id else item.text()
+
+    def _styleHistoryCell(self, item: qt.QTableWidgetItem, column: int, status: str = "", version_id: str = "") -> None:
         if column == 0:
-            item.setForeground(qt.QColor(TEXT_MUTED))
+            branch = (version_id or item.data(qt.Qt.UserRole) or item.text() or "").split("/", 1)[0]
+            if branch == "main":
+                item.setForeground(qt.QColor(ACCENT_MINT))
+            elif branch:
+                item.setForeground(qt.QColor(ACCENT_INDIGO))
+            else:
+                item.setForeground(qt.QColor(TEXT_MUTED))
             font = item.font()
             font.setBold(True)
             item.setFont(font)
@@ -847,36 +1475,52 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             item.setFont(font)
 
     def _refreshHistoryTable(self) -> None:
-        self.historyTableWidget.setRowCount(len(DEMO_COMMIT_HISTORY))
-        for row_index, row_values in enumerate(DEMO_COMMIT_HISTORY):
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        commit_history = bundle.get("commit_history", [])
+        self.historyTableWidget.setRowCount(len(commit_history))
+        for row_index, row_values in enumerate(commit_history):
             status = row_values[4] if len(row_values) > 4 else ""
+            version_id = row_values[0]
             for column_index, value in enumerate(row_values):
-                item = qt.QTableWidgetItem(str(value))
-                self._styleHistoryCell(item, column_index, status)
+                if column_index == 0:
+                    display = self._versionDisplayTag(version_id)
+                    item = qt.QTableWidgetItem(display)
+                    item.setData(qt.Qt.UserRole, version_id)
+                else:
+                    item = qt.QTableWidgetItem(str(value))
+                self._styleHistoryCell(item, column_index, status, version_id=version_id)
                 self.historyTableWidget.setItem(row_index, column_index, item)
         self.historyTableWidget.resizeColumnsToContents()
+        if self._currentVersionId:
+            self._selectHistoryRowForVersion(self._currentVersionId)
+        self._updateActiveVersionIndicators()
 
     def _prependHistoryRow(self, version_id, date_display, author, message, status) -> None:
         self.historyTableWidget.insertRow(0)
-        for column_index, value in enumerate([version_id, date_display, author, message, status]):
-            item = qt.QTableWidgetItem(str(value))
-            self._styleHistoryCell(item, column_index, status)
+        row_values = [version_id, date_display, author, message, status]
+        for column_index, value in enumerate(row_values):
+            if column_index == 0:
+                item = qt.QTableWidgetItem(self._versionDisplayTag(version_id))
+                item.setData(qt.Qt.UserRole, version_id)
+            else:
+                item = qt.QTableWidgetItem(str(value))
+            self._styleHistoryCell(item, column_index, status, version_id=version_id)
             self.historyTableWidget.setItem(0, column_index, item)
         self.historyTableWidget.resizeColumnsToContents()
 
     def _updateHistoryStatus(self, version_id, status) -> None:
-        for row in range(self.historyTableWidget.rowCount):
+        for row in range(_qt_table_row_count(self.historyTableWidget)):
             id_item = self.historyTableWidget.item(row, 0)
-            if id_item and id_item.text() == version_id:
+            if id_item and self._historyVersionIdFromItem(id_item) == version_id:
                 status_item = qt.QTableWidgetItem(status)
-                self._styleHistoryCell(status_item, 4, status)
+                self._styleHistoryCell(status_item, 4, status, version_id=version_id)
                 self.historyTableWidget.setItem(row, 4, status_item)
                 break
 
     def _updateHistoryMessage(self, version_id, message) -> None:
-        for row in range(self.historyTableWidget.rowCount):
+        for row in range(_qt_table_row_count(self.historyTableWidget)):
             id_item = self.historyTableWidget.item(row, 0)
-            if id_item and id_item.text() == version_id:
+            if id_item and self._historyVersionIdFromItem(id_item) == version_id:
                 self.historyTableWidget.setItem(row, 3, qt.QTableWidgetItem(message))
                 break
 
@@ -905,6 +1549,12 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
     def setWidget(self, widget) -> None:
         self.widget = widget
 
+    def onVersionCheckedOut(self, version_id: str) -> None:
+        widget = self.widget
+        if not widget or self._pending_import_project:
+            return
+        widget._setCheckedOutVersion(version_id, notify=True, sync_table=True)
+
     def onVersionNodeSelected(self, version_id: str) -> None:
         if not self._pending_import_project:
             return
@@ -918,7 +1568,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             slicer.util.mainWindow(),
             "Import version",
             "Import version %s\n(project: %s) ?\n\n(UI only — simulated Pull on server)"
-            % (version_id, project_name),
+            % (format_version_display_plain(version_id, (getattr(widget, "_project_history_bundle", None) or {}).get("tags_by_id")), project_name),
             qt.QMessageBox.Yes | qt.QMessageBox.No,
             qt.QMessageBox.Yes,
         )
@@ -929,7 +1579,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             widget._simulateServerPull(version_id)
         widget._currentVersionId = version_id
         widget._appendFeed(
-            "Import / Pull simulated: %s for « %s » — no data loaded (E2)."
+            "Import / Pull simulated: %s for « %s »."
             % (version_id, project_name)
         )
 
@@ -962,9 +1612,9 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
         layout.setContentsMargins(12, 12, 12, 12)
 
         payload = widget.getOntologyGraphPayload() if widget else {
-            "specs": graph_module.MOUSE_BRAIN_SPECS,
+            "specs": [],
             "title": "Ontology",
-            "description": "",
+            "description": "No ontology loaded.",
         }
 
         hint = qt.QLabel(
@@ -996,7 +1646,27 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             self.historyDialog.deleteLater()
             self.historyDialog = None
 
-        version_specs = graph_module.VERSION_SPECS
+        widget = self.widget
+        version_specs = []
+        graph_title = "Version tree"
+        graph_description = ""
+        commit_history_by_id = {}
+        if widget and not for_import:
+            payload = widget.getVersionTreePayload()
+            version_specs = payload["specs"]
+            graph_title = payload["title"]
+            graph_description = payload["description"]
+            commit_history_by_id = graph_module.commit_history_lookup(
+                (getattr(widget, "_project_history_bundle", None) or {}).get("commit_history", [])
+            )
+        elif widget and for_import:
+            try:
+                bundle = load_project_history_bundle(project_name or widget._currentProjectName())
+                version_specs = bundle["version_specs"]
+                graph_title = project_name or widget._currentProjectName() or "Version tree"
+                commit_history_by_id = graph_module.commit_history_lookup(bundle.get("commit_history", []))
+            except (OSError, ValueError):
+                version_specs = []
         self._pending_import_project = project_name if for_import else None
 
         self.historyDialog = qt.QDialog(slicer.util.mainWindow())
@@ -1009,18 +1679,22 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
         layout.setContentsMargins(12, 12, 12, 12)
 
         if for_import:
-            header_text = "Project: %s — click a node (simulated Pull in server mode)" % (project_name or "—")
+            hint_text = "Project: %s — click a node (simulated Pull in server mode)" % (project_name or "—")
         else:
-            header_text = "Version tree — main branch centered + feature branches (UI demo)"
-        header = qt.QLabel(header_text)
-        header.setStyleSheet(DIALOG_HEADER_STYLE)
-        header.setWordWrap(True)
-        layout.addWidget(header)
+            hint_text = graph_description or "Version tree built from the project commit history."
+        hint = qt.QLabel(hint_text)
+        hint.setStyleSheet(DIALOG_HINT_STYLE)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         canvas = graph_module.VersionHistoryCanvas(
             self,
             version_specs=version_specs,
             selection_mode=for_import,
+            graph_title=graph_title,
+            graph_description=graph_description,
+            active_version_id=getattr(widget, "_currentVersionId", None) if widget and not for_import else None,
+            commit_history_by_id=commit_history_by_id,
         )
         self._historyCanvas = canvas
         layout.addWidget(canvas.create_toolbar())
@@ -1046,5 +1720,5 @@ class CollaborativeVersioningTest(ScriptedLoadableModuleTest):
         self.test_WidgetBuildTagPresent()
 
     def test_WidgetBuildTagPresent(self):
-        self.assertTrue(_UI_BUILD_TAG.startswith("2026-07-17-ui-layout"))
+        self.assertTrue(_UI_BUILD_TAG.startswith("2026-07-"))
         self.delayDisplay("CollaborativeVersioning UI layout tests passed")

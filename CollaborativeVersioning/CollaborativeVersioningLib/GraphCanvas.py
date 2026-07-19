@@ -1,167 +1,184 @@
-"""Canvas 2D pour graphes de dépendances et d'historique de versions."""
+"""2D canvas for dependency and version history graphs."""
 
 import qt
 from collections import defaultdict
 
-GRAPH_BUILD_TAG = "2026-07-17-ice-clinic-v18"
+from CollaborativeVersioningLib.simulation.DemoData import (
+    VERSION_BRANCH_COLORS,
+    VERSION_LANE_CENTERS,
+)
+
+GRAPH_BUILD_TAG = "2026-07-19-graph-version-v48-en"
+
+CHECKOUT_POINTER_COLOR = "#5b9fd4"
 
 MAIN_COLOR = "#818cf8"
-VERSION_BRANCH_COLORS = {
-    "main": MAIN_COLOR,
-    "feature/mesencephale": "#5b9fd4",
-    "feature/striatum": "#fbbf24",
-    "feature/cervelet": "#fb923c",
-    "feature/forebrain": "#6ee7b7",
-}
-HEAD_COLOR = "#6ee7b7"
-GRAPH_BG = "#161920"
-VERSION_LANE_CENTERS = {
-    "feature/striatum": 95,
-    "feature/forebrain": 265,
-    "main": 435,
-    "feature/mesencephale": 615,
-    "feature/cervelet": 795,
-}
+GRAPH_BG = "#2a2a2a"
 VERSION_NODE_W = 155
 VERSION_ROW_H = 82
 VERSION_Y0 = 52
 VERSION_ROW_GAP = 14
 
-VERSION_SPECS = [
-    {"id": "v1", "label": "v1.0 Import IRM Allen", "parent": None, "branch": "main"},
-    {"id": "v2", "label": "v1.1 Masque cerebral", "parent": "v1", "branch": "main"},
-    {"id": "v3", "label": "v1.2 Tronc cerebral", "parent": "v2", "branch": "main"},
-    {"id": "v4", "label": "v1.2.1 Noyau rouge", "parent": "v3", "branch": "main"},
-    {"id": "v5", "label": "v1.2.2 Substance noire", "parent": "v4", "branch": "main"},
-    {"id": "v6", "label": "v1.2.f1 Colliculus sup.", "parent": "v3", "branch": "feature/mesencephale"},
-    {"id": "v7", "label": "v1.2.f2 Colliculus inf.", "parent": "v6", "branch": "feature/mesencephale"},
-    {"id": "v8", "label": "v2.0 Merge mesencephale", "parent": "v5", "branch": "main", "merge": True, "merge_from": ["v7"]},
-    {"id": "v9", "label": "v1.3.f1 Striatum", "parent": "v2", "branch": "feature/striatum"},
-    {"id": "v10", "label": "v1.3.f2 Affinage striatum", "parent": "v9", "branch": "feature/striatum"},
-    {"id": "v11", "label": "v1.4.f1 Cervelet vermis", "parent": "v2", "branch": "feature/cervelet"},
-    {"id": "v12", "label": "v1.4.f2 Hemispheres CB", "parent": "v11", "branch": "feature/cervelet"},
-    {"id": "v13", "label": "v2.5.f1 Hippocampe CA1", "parent": "v2", "branch": "feature/forebrain"},
-    {"id": "v14", "label": "v3.0 Merge global", "parent": "v8", "branch": "main", "merge": True, "merge_from": ["v10", "v12"]},
-    {"id": "v15", "label": "v3.1 Review expert", "parent": "v14", "branch": "main"},
-    {"id": "v16", "label": "v4.0 HEAD Release", "parent": "v15", "branch": "main", "head": True},
-]
-
-
-def version_specs_from_records(versions):
-    """Construit le graphe a partir des versions reelles (depot / serveur)."""
-    if not versions:
-        return []
-
-    sorted_versions = sorted(versions, key=lambda item: item.created_at)
-    known_ids = {version.version_id for version in sorted_versions}
-    branch_names = [
-        "main",
-        "feature/mesencephale",
-        "feature/striatum",
-        "feature/cervelet",
-        "feature/forebrain",
-    ]
-    children_map = defaultdict(list)
-
-    for version in sorted_versions:
-        parent_id = version.parent_id if version.parent_id in known_ids else None
-        if parent_id:
-            children_map[parent_id].append(version.version_id)
-
-    node_branch = {}
-    for version in sorted_versions:
-        if not version.parent_id or version.parent_id not in known_ids:
-            node_branch.setdefault(version.version_id, "main")
-
-    for parent_id, child_ids in children_map.items():
-        for index, child_id in enumerate(child_ids):
-            node_branch[child_id] = branch_names[min(index, len(branch_names) - 1)]
-
-    newest_id = max(sorted_versions, key=lambda item: item.created_at).version_id
-    specs = []
-    previous_id = None
-
-    for version in sorted_versions:
-        parent_id = version.parent_id if version.parent_id in known_ids else previous_id
-        message = (version.message or "sans message").strip()
-        if len(message) > 18:
-            message = message[:15] + "..."
-        specs.append({
-            "id": version.version_id,
-            "label": "%s %s" % (version.version_id[:8], message),
-            "parent": parent_id,
-            "branch": node_branch.get(version.version_id, "main"),
-            "head": version.version_id == newest_id,
-        })
-        previous_id = version.version_id
-
-    if specs:
-        specs[0]["parent"] = None
-
-    return specs
-
 
 H_GAP = 18
 V_GAP = 52
+DEPENDENCY_H_GAP = 28
+DEPENDENCY_V_GAP = 78
 MARGIN = 24
 
-# Atlas Allen CCF v3 — hiérarchie d'annotation cerveau souris C57BL/6
-MOUSE_BRAIN_SPECS = [
-    {"id": "vol", "label": "Volume IRM Allen CCF v3", "parent": None, "color": "#0078d4"},
-    {"id": "mask", "label": "Masque cerebral global", "parent": "vol", "color": "#1a8cff"},
-    {"id": "brainstem", "label": "Tronc cerebral", "parent": "mask", "color": "#6f42c1"},
-    {"id": "cerebellum", "label": "Cervelet", "parent": "mask", "color": "#e67e22"},
-    {"id": "dienceph", "label": "Diencephale", "parent": "mask", "color": "#9b59b6"},
-    {"id": "telenceph", "label": "Telencephale", "parent": "mask", "color": "#16a085"},
-    {"id": "mesen", "label": "Mesencephale", "parent": "brainstem", "color": "#8e44ad"},
-    {"id": "myel", "label": "Myelencephale", "parent": "brainstem", "color": "#7d3c98"},
-    {"id": "col_sup", "label": "Colliculus superieur", "parent": "mesen", "color": "#00ff88"},
-    {"id": "col_inf", "label": "Colliculus inferieur", "parent": "mesen", "color": "#00cc6a"},
-    {"id": "sn", "label": "Substance noire (SNc)", "parent": "mesen", "color": "#ffcd38"},
-    {"id": "rn", "label": "Noyau rouge", "parent": "mesen", "color": "#ff6b6b"},
-    {"id": "rf", "label": "Formation reticulee", "parent": "myel", "color": "#c0392b"},
-    {"id": "nv", "label": "Noyau n. vague", "parent": "myel", "color": "#e74c3c"},
-    {"id": "vermis", "label": "Vermis cerebelleux", "parent": "cerebellum", "color": "#d35400"},
-    {"id": "hemi", "label": "Hemispheres cerebelleux", "parent": "cerebellum", "color": "#f39c12"},
-    {"id": "thal", "label": "Thalamus", "parent": "dienceph", "color": "#bb8fce"},
-    {"id": "hypo", "label": "Hypothalamus", "parent": "dienceph", "color": "#a569bd"},
-    {"id": "cortex_m1", "label": "Cortex moteur (M1)", "parent": "telenceph", "color": "#1abc9c"},
-    {"id": "hippo", "label": "Hippocampe CA1", "parent": "telenceph", "color": "#48c9b0"},
-    {"id": "striatum", "label": "Striatum", "parent": "telenceph", "color": "#76d7c4"},
-]
-
 NODE_H = 34
+NODE_FONT_SIZE = 7
+NODE_PADDING_X = 16
+NODE_PADDING_Y = 10
+GRAPH_NAME_MAX_LEN = 22
 
 
-def _estimate_node_width(label):
-    return max(108, min(155, len(label) * 6 + 24))
+def _node_font(font_size=NODE_FONT_SIZE):
+    font = qt.QFont("Arial", font_size)
+    font.setBold(True)
+    return font
 
 
-def _layout_hierarchy(specs):
-    """Calcule les positions x/y d'un arbre hierarchique."""
-    specs_by_id = {spec["id"]: dict(spec) for spec in specs}
+def _font_metrics(font_size=NODE_FONT_SIZE):
+    return qt.QFontMetrics(_node_font(font_size))
+
+
+def _measure_text_width(text, font_size=NODE_FONT_SIZE):
+    metrics = _font_metrics(font_size)
+    if hasattr(metrics, "horizontalAdvance"):
+        advance = metrics.horizontalAdvance(text)
+        if not callable(metrics.horizontalAdvance):
+            return float(advance)
+    width_fn = metrics.width
+    return float(width_fn(text) if callable(width_fn) else width_fn)
+
+
+def _measure_text_height(font_size=NODE_FONT_SIZE):
+    metrics = _font_metrics(font_size)
+    height = metrics.height if hasattr(metrics, "height") and not callable(metrics.height) else metrics.height()
+    if callable(height):
+        height = height()
+    return float(height)
+
+
+def _measure_node_size(caption, font_size=NODE_FONT_SIZE):
+    text_width = _measure_text_width(caption, font_size)
+    text_height = _measure_text_height(font_size)
+    width = max(56, text_width + NODE_PADDING_X)
+    height = max(NODE_H, text_height + NODE_PADDING_Y)
+    return width, height
+
+
+def _fit_caption_to_width(caption, max_inner_width, font_size=NODE_FONT_SIZE):
+    if _measure_text_width(caption, font_size) <= max_inner_width:
+        return caption
+    metrics = _font_metrics(font_size)
+    if hasattr(metrics, "elidedText"):
+        elided = metrics.elidedText(caption, qt.Qt.ElideRight, int(max_inner_width))
+        return str(elided)
+    while caption and _measure_text_width(caption + "…", font_size) > max_inner_width:
+        caption = caption[:-1]
+    return (caption + "…") if caption else "…"
+
+
+def _graph_display_label(spec):
+    """Show full name when short enough; otherwise truncate with ellipsis."""
+    name = str(spec.get("label", "")).strip()
+    node_id = str(spec.get("id", "")).strip()
+    if not name:
+        return node_id or "?"
+    if len(name) <= GRAPH_NAME_MAX_LEN:
+        return name
+    return name[: GRAPH_NAME_MAX_LEN - 3] + "..."
+
+
+def _build_children_map(specs):
     children_map = defaultdict(list)
-    roots = []
     for spec in specs:
-        parent = spec.get("parent")
-        if parent is None:
-            roots.append(spec["id"])
-        else:
-            children_map[parent].append(spec["id"])
+        parent_id = spec.get("parent")
+        if parent_id is not None:
+            children_map[parent_id].append(spec["id"])
+    return children_map
+
+
+def _root_ids(specs):
+    return [spec["id"] for spec in specs if spec.get("parent") is None]
+
+
+def _default_expanded_ids(specs):
+    """Start with root expanded → root and its direct children are visible."""
+    return set(_root_ids(specs))
+
+
+def _descendant_count(node_id, children_map):
+    total = 0
+    for child_id in children_map.get(node_id, []):
+        total += 1 + _descendant_count(child_id, children_map)
+    return total
+
+
+def _visible_specs_from_expansion(specs, expanded_ids):
+    specs_by_id = {spec["id"]: spec for spec in specs}
+    children_map = _build_children_map(specs)
+    visible = []
+
+    def walk(node_id):
+        spec = specs_by_id.get(node_id)
+        if spec is None:
+            return
+        visible.append(spec)
+        if node_id in expanded_ids:
+            for child_id in children_map.get(node_id, []):
+                walk(child_id)
+
+    for root_id in _root_ids(specs):
+        walk(root_id)
+    return visible, children_map
+
+
+def _collapsible_node_caption(spec, expanded_ids, children_map):
+    label = _graph_display_label(spec)
+    node_id = spec["id"]
+    child_ids = children_map.get(node_id, [])
+    if not child_ids:
+        return label, False, False, 0
+
+    expanded = node_id in expanded_ids
+    hidden = 0 if expanded else _descendant_count(node_id, children_map)
+    marker = "▼ " if expanded else "▶ "
+    caption = marker + label
+    if hidden:
+        caption += " (+%d)" % hidden
+    return caption, True, expanded, hidden
+
+
+def _layout_hierarchy(specs, expanded_ids=None, full_children_map=None, h_gap=H_GAP, v_gap=V_GAP):
+    """Compute x/y positions for a hierarchical tree."""
+    specs_by_id = {spec["id"]: dict(spec) for spec in specs}
+    children_map = _build_children_map(specs)
+    if full_children_map is None:
+        full_children_map = children_map
+    if expanded_ids is None:
+        expanded_ids = set(specs_by_id.keys())
+    roots = _root_ids(specs)
 
     def subtree_width(node_id):
         children = children_map.get(node_id, [])
         if not children:
-            return _estimate_node_width(specs_by_id[node_id]["label"]) + H_GAP
+            caption, _, _, _ = _collapsible_node_caption(
+                specs_by_id[node_id], expanded_ids, full_children_map
+            )
+            return _measure_node_size(caption)[0] + h_gap
         return sum(subtree_width(child_id) for child_id in children)
 
     positions = {}
 
     def assign(node_id, x_left, depth):
         spec = specs_by_id[node_id]
-        label = spec["label"]
-        width = _estimate_node_width(label)
-        height = NODE_H
+        caption, has_children, expanded, hidden_children = _collapsible_node_caption(
+            spec, expanded_ids, full_children_map
+        )
+        width, height = _measure_node_size(caption)
         children = children_map.get(node_id, [])
 
         if not children:
@@ -178,12 +195,15 @@ def _layout_hierarchy(specs):
 
         positions[node_id] = {
             "id": node_id,
-            "label": label,
+            "label": caption,
             "color": spec["color"],
             "x": x,
-            "y": MARGIN + depth * (NODE_H + V_GAP),
+            "y": MARGIN + depth * (NODE_H + v_gap),
             "w": width,
             "h": height,
+            "has_children": has_children,
+            "expanded": expanded,
+            "hidden_children": hidden_children,
         }
 
     x_cursor = MARGIN
@@ -204,7 +224,7 @@ def _node_center(node):
     return node["x"] + node["w"] / 2.0, node["y"] + node["h"] / 2.0
 
 
-def _draw_box_node(scene, node, font_size=7):
+def _draw_box_node(scene, node, font_size=NODE_FONT_SIZE):
     x, y, w, h = node["x"], node["y"], node["w"], node["h"]
     color = node["color"]
     scene.addRect(
@@ -212,18 +232,22 @@ def _draw_box_node(scene, node, font_size=7):
         qt.QPen(qt.QColor(color), 2),
         qt.QBrush(qt.QColor("#252525")),
     )
-    label = scene.addText(node["label"])
-    label.setFont(qt.QFont("Arial", font_size, qt.QFont.Bold))
+    inner_w = max(8, w - NODE_PADDING_X)
+    text = _fit_caption_to_width(node["label"], inner_w, font_size)
+    label = scene.addText(text)
+    label.setFont(_node_font(font_size))
     label.setDefaultTextColor(qt.QColor("#eeeeee"))
     bounds = label.boundingRect()
     label.setPos(x + (w - bounds.width()) / 2.0, y + (h - bounds.height()) / 2.0)
 
 
-def _draw_tree_edge(scene, parent, child, color="#555555", width=2):
+def _draw_tree_edge(scene, parent, child, color="#555555", width=2, dashed=False):
     px, _ = _node_center(parent)
     cx, _ = _node_center(child)
     mid_y = parent["y"] + parent["h"] + (child["y"] - parent["y"] - parent["h"]) / 2.0
     pen = qt.QPen(qt.QColor(color), width)
+    if dashed:
+        pen.setStyle(qt.Qt.DashLine)
     scene.addLine(px, parent["y"] + parent["h"], px, mid_y, pen)
     scene.addLine(px, mid_y, cx, mid_y, pen)
     scene.addLine(cx, mid_y, cx, child["y"], pen)
@@ -282,6 +306,25 @@ def _resolve_vertical_overlaps(positions):
     return positions
 
 
+def _version_graph_edges(specs):
+    specs_by_id = {spec["id"]: spec for spec in specs}
+    edges = []
+    merge_edge_pairs = set()
+    for spec in specs:
+        node_id = spec["id"]
+        if spec.get("parent"):
+            edges.append((spec["parent"], node_id, spec.get("branch", "main")))
+        if spec.get("merge"):
+            merge_target = spec.get("merge_into") or spec.get("parent")
+            for merge_id in spec.get("merge_from", []):
+                if not merge_target:
+                    continue
+                branch = specs_by_id.get(merge_id, {}).get("branch", "main")
+                edges.append((merge_id, merge_target, branch))
+                merge_edge_pairs.add((merge_id, merge_target))
+    return edges, merge_edge_pairs
+
+
 def _layout_version_graph(specs):
     """Layout : colonnes fixes par branche, lignes sans chevauchement."""
     specs_by_id = {spec["id"]: dict(spec) for spec in specs}
@@ -290,7 +333,7 @@ def _layout_version_graph(specs):
     positions = {}
     for node_id, spec in specs_by_id.items():
         branch = spec.get("branch", "main")
-        label = spec["label"]
+        label = spec.get("tag") or spec["id"]
         y = VERSION_Y0 + rows[node_id] * VERSION_ROW_H
         x = _version_lane_x(branch)
         color = VERSION_BRANCH_COLORS.get(branch, MAIN_COLOR)
@@ -310,15 +353,8 @@ def _layout_version_graph(specs):
 
     _resolve_vertical_overlaps(positions)
 
-    edges = []
-    for spec in specs:
-        node_id = spec["id"]
-        if spec.get("parent"):
-            edges.append((spec["parent"], node_id, spec.get("branch", "main")))
-        for merge_id in spec.get("merge_from", []):
-            edges.append((merge_id, node_id, specs_by_id[merge_id].get("branch", "main")))
-
-    return positions, edges
+    edges, merge_edge_pairs = _version_graph_edges(specs)
+    return positions, edges, merge_edge_pairs
 
 
 def _main_trunk_order(specs):
@@ -361,12 +397,8 @@ def _draw_main_trunk(scene, positions, trunk_order):
 
 def _draw_version_box_node(scene, node, font_size=7):
     x, y, w, h = node["x"], node["y"], node["w"], node["h"]
-    if node.get("head"):
-        color = HEAD_COLOR
-        border = 3
-    else:
-        color = node["color"]
-        border = 3 if node.get("merge") else 2
+    color = node["color"]
+    border = 3 if node.get("merge") else 2
     scene.addRect(
         x, y, w, h,
         qt.QPen(qt.QColor(color), border),
@@ -382,6 +414,22 @@ def _draw_version_box_node(scene, node, font_size=7):
     label.setPos(x + (w - bounds.width()) / 2.0, y + (h - bounds.height()) / 2.0)
 
 
+def _draw_checkout_pointer(scene, node):
+    x, y, h = node["x"], node["y"], node["h"]
+    tip_x = x - 6
+    mid_y = y + h / 2.0
+    points = [
+        qt.QPointF(tip_x, mid_y),
+        qt.QPointF(tip_x - 10, mid_y - 7),
+        qt.QPointF(tip_x - 10, mid_y + 7),
+    ]
+    scene.addPolygon(
+        qt.QPolygonF(points),
+        qt.QPen(qt.QColor(CHECKOUT_POINTER_COLOR), 1),
+        qt.QBrush(qt.QColor(CHECKOUT_POINTER_COLOR)),
+    )
+
+
 def _wheel_delta(event):
     if hasattr(event, "angleDelta"):
         return event.angleDelta().y()
@@ -389,7 +437,7 @@ def _wheel_delta(event):
 
 
 class InteractiveGraphView(qt.QGraphicsView):
-    """Vue graphique avec zoom (molette), pan (glisser) et barre d'outils."""
+    """Graphics view with mouse-wheel zoom, drag-to-pan, and a small toolbar."""
 
     ZOOM_MIN = 0.2
     ZOOM_MAX = 6.0
@@ -445,29 +493,29 @@ class InteractiveGraphView(qt.QGraphicsView):
             self.zoom_out()
         event.accept()
 
-    def create_toolbar(self):
+    def create_toolbar(self, leading_widgets=None):
         bar = qt.QWidget()
         layout = qt.QHBoxLayout(bar)
         layout.setContentsMargins(0, 0, 0, 4)
         layout.setSpacing(6)
 
-        nav_hint = qt.QLabel("Molette = zoom  |  Clic gauche + glisser = deplacer")
-        nav_hint.setStyleSheet("color: #6b7789; font-size: 10px;")
-        layout.addWidget(nav_hint)
+        if leading_widgets:
+            for widget in leading_widgets:
+                layout.addWidget(widget)
         layout.addStretch(1)
 
         btn_style_hover = (
             "QPushButton {"
-            "  background-color: #242933; color: #eef2f7; border: 1px solid #353d4d;"
+            "  background-color: #383838; color: #eef2f7; border: 1px solid #505050;"
             "  padding: 5px 12px; border-radius: 4px; font-size: 11px; font-weight: 600;"
             "}"
             "QPushButton:hover {"
             "  background-color: #5b9fd4; color: #161920; border-color: #5b9fd4;"
             "}"
         )
-        btn_zoom_in = qt.QPushButton("Zoom +")
-        btn_zoom_out = qt.QPushButton("Zoom -")
-        btn_reset = qt.QPushButton("Reinitialiser")
+        btn_zoom_in = qt.QPushButton("Zoom in")
+        btn_zoom_out = qt.QPushButton("Zoom out")
+        btn_reset = qt.QPushButton("Reset view")
         for btn in (btn_zoom_in, btn_zoom_out, btn_reset):
             btn.setStyleSheet(btn_style_hover)
 
@@ -480,15 +528,50 @@ class InteractiveGraphView(qt.QGraphicsView):
         return bar
 
 
+def commit_history_lookup(commit_history):
+    lookup = {}
+    for row in commit_history or []:
+        if not row:
+            continue
+        version_id = str(row[0])
+        lookup[version_id] = {
+            "date": str(row[1]) if len(row) > 1 else "",
+            "author": str(row[2]) if len(row) > 2 else "",
+            "message": str(row[3]) if len(row) > 3 else "",
+            "status": str(row[4]) if len(row) > 4 else "",
+        }
+    return lookup
+
+
 class VersionHistoryCanvas(InteractiveGraphView):
     """Graphe de versions — noeuds cliquables en mode import."""
 
-    def __init__(self, logic, version_specs=None, selection_mode=False, parent=None):
+    def __init__(
+        self,
+        logic,
+        version_specs=None,
+        selection_mode=False,
+        graph_title=None,
+        graph_description=None,
+        active_version_id=None,
+        commit_history_by_id=None,
+        parent=None,
+    ):
         InteractiveGraphView.__init__(self, parent)
         self.logic = logic
-        self.version_specs = version_specs if version_specs is not None else VERSION_SPECS
+        self.version_specs = version_specs if version_specs is not None else []
         self.selection_mode = selection_mode
+        self.graph_title = graph_title or "Version tree"
+        self.graph_description = graph_description or ""
+        self.active_version_id = active_version_id
+        self.commit_history_by_id = dict(commit_history_by_id or {})
+        self._specs_by_id = {spec["id"]: spec for spec in self.version_specs}
         self._nodes_by_id = {}
+        self._pending_node_id = None
+        self._click_timer = qt.QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(220)
+        self._click_timer.connect("timeout()", self._on_single_click_timeout)
         graphe_scene = qt.QGraphicsScene()
         self.setScene(graphe_scene)
         self._graphe_scene = graphe_scene
@@ -503,40 +586,83 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self._pad_scene_rect()
         self.reset_view()
 
+    def set_active_version_id(self, version_id):
+        if version_id == self.active_version_id:
+            return
+        self.active_version_id = version_id
+        self.draw()
+        self._pad_scene_rect()
+
+    def create_toolbar(self):
+        if self.selection_mode:
+            hint = qt.QLabel("Click a node to import · Double-click for details")
+        else:
+            hint = qt.QLabel(
+                "Click a node to check out (simulation) · Double-click for details"
+            )
+        hint.setStyleSheet("color: #6b7789; font-size: 10px;")
+        return InteractiveGraphView.create_toolbar(self, leading_widgets=[hint])
+
+    def _show_version_info(self, node_id):
+        spec = self._specs_by_id.get(node_id)
+        if not spec:
+            return
+        history = self.commit_history_by_id.get(node_id, {})
+        checked_out = node_id == self.active_version_id
+        dialog = _VersionInfoDialog(self, spec, history, checked_out=checked_out)
+        dialog.exec_()
+
+    def _on_single_click_timeout(self):
+        node_id = self._pending_node_id
+        self._pending_node_id = None
+        if not node_id:
+            return
+        if self.selection_mode and hasattr(self.logic, "onVersionNodeSelected"):
+            self.logic.onVersionNodeSelected(node_id)
+        elif not self.selection_mode and hasattr(self.logic, "onVersionCheckedOut"):
+            self.logic.onVersionCheckedOut(node_id)
+
     def showEvent(self, event):
         qt.QGraphicsView.showEvent(self, event)
         self.reset_view()
 
     def _node_at_scene_pos(self, scene_pos):
-        for node_id, node in self._nodes_by_id.items():
-            if (
-                node["x"] <= scene_pos.x() <= node["x"] + node["w"]
-                and node["y"] <= scene_pos.y() <= node["y"] + node["h"]
-            ):
-                return node_id
-        return None
+        return _node_id_at_scene_pos(self._nodes_by_id, scene_pos)
 
     def mousePressEvent(self, event):
-        if self.selection_mode and event.button() == qt.Qt.LeftButton:
-            scene_pos = self.mapToScene(event.pos())
+        if event.button() == qt.Qt.LeftButton:
+            scene_pos = self.mapToScene(_qt_event_pos(event))
             node_id = self._node_at_scene_pos(scene_pos)
-            if node_id and hasattr(self.logic, "onVersionNodeSelected"):
-                self.logic.onVersionNodeSelected(node_id)
+            if node_id:
+                self._pending_node_id = node_id
+                self._click_timer.start()
                 event.accept()
                 return
         qt.QGraphicsView.mousePressEvent(self, event)
 
+    def mouseDoubleClickEvent(self, event):
+        self._click_timer.stop()
+        self._pending_node_id = None
+        if event.button() == qt.Qt.LeftButton:
+            scene_pos = self.mapToScene(_qt_event_pos(event))
+            node_id = self._node_at_scene_pos(scene_pos)
+            if node_id:
+                self._show_version_info(node_id)
+                event.accept()
+                return
+        qt.QGraphicsView.mouseDoubleClickEvent(self, event)
+
     def draw(self):
         self._graphe_scene.clear()
         if not self.version_specs:
-            hint = self._graphe_scene.addText("Aucune version a afficher")
+            hint = self._graphe_scene.addText("No versions to display.")
             hint.setDefaultTextColor(qt.QColor("#888888"))
             hint.setPos(MARGIN, MARGIN)
             self._graphe_scene.setSceneRect(0, 0, 400, 200)
             self._nodes_by_id = {}
             return
 
-        positions, edges = _layout_version_graph(self.version_specs)
+        positions, edges, _ = _layout_version_graph(self.version_specs)
         self._nodes_by_id = positions
         nodes_by_id = positions
         trunk_order = _main_trunk_order(self.version_specs)
@@ -556,44 +682,40 @@ class VersionHistoryCanvas(InteractiveGraphView):
                 nodes_by_id[parent_id],
                 nodes_by_id[child_id],
                 color=edge_color,
+                width=2,
+                dashed=False,
             )
 
         for node in nodes_by_id.values():
             _draw_version_box_node(self._graphe_scene, node, font_size=7)
+            if self.active_version_id and node["id"] == self.active_version_id:
+                _draw_checkout_pointer(self._graphe_scene, node)
 
         max_y = max(node["y"] for node in nodes_by_id.values())
         scene_w = 940
-        scene_h = max_y + NODE_H + 60
-        self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h)
+        scene_h = max_y + NODE_H + 40
+        self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + 28)
 
         if self.selection_mode:
-            title_text = "Cliquez sur un noeud pour importer cette version"
+            title_text = "Click a node to import that version"
         else:
-            title_text = "%d versions — branche main centree (demo ou depot)" % len(nodes_by_id)
+            title_text = "%s — %d version(s) · main branch centered" % (
+                self.graph_title,
+                len(nodes_by_id),
+            )
+            if self.active_version_id:
+                active_label = self.active_version_id
+                for spec in self.version_specs:
+                    if spec.get("id") == self.active_version_id:
+                        active_label = spec.get("tag") or active_label
+                        break
+                title_text += " · checked out: %s" % active_label
+            if self.graph_description:
+                title_text += " — " + self.graph_description
         title = self._graphe_scene.addText(title_text)
         title.setFont(qt.QFont("Arial", 8))
-        title.setDefaultTextColor(qt.QColor(MAIN_COLOR))
-        title.setPos(MARGIN, scene_h - 22)
-
-        if not self.selection_mode:
-            legend_y = 8
-            for text, color in [
-                ("main (centre)", MAIN_COLOR),
-                ("feature/mesencephale", VERSION_BRANCH_COLORS["feature/mesencephale"]),
-                ("feature/striatum (gauche)", VERSION_BRANCH_COLORS["feature/striatum"]),
-                ("feature/cervelet (droite)", VERSION_BRANCH_COLORS["feature/cervelet"]),
-                ("feature/forebrain (ouvert)", VERSION_BRANCH_COLORS["feature/forebrain"]),
-                ("HEAD", HEAD_COLOR),
-            ]:
-                self._graphe_scene.addRect(
-                    MARGIN, legend_y, 10, 10,
-                    qt.QPen(qt.QColor(color)), qt.QBrush(qt.QColor(color)),
-                )
-                lbl = self._graphe_scene.addText(text)
-                lbl.setFont(qt.QFont("Arial", 7))
-                lbl.setDefaultTextColor(qt.QColor("#888888"))
-                lbl.setPos(MARGIN + 14, legend_y - 2)
-                legend_y += 14
+        title.setDefaultTextColor(qt.QColor("#777777"))
+        title.setPos(MARGIN, scene_h + 4)
 
 
 def _compute_scene_bounds(nodes, padding=30):
@@ -602,8 +724,107 @@ def _compute_scene_bounds(nodes, padding=30):
     return max(640, max_x), max(320, max_y)
 
 
+def _qt_event_pos(event):
+    pos = event.pos if hasattr(event, "pos") and not callable(event.pos) else event.pos()
+    if callable(pos):
+        pos = pos()
+    return pos
+
+
+def _node_id_at_scene_pos(nodes_by_id, scene_pos):
+    for node_id, node in nodes_by_id.items():
+        if (
+            node["x"] <= scene_pos.x() <= node["x"] + node["w"]
+            and node["y"] <= scene_pos.y() <= node["y"] + node["h"]
+        ):
+            return node_id
+    return None
+
+
+class _VersionInfoDialog(qt.QDialog):
+    """Read-only details for a version graph node."""
+
+    def __init__(self, parent, spec, history=None, checked_out=False):
+        qt.QDialog.__init__(self, parent)
+        self.setWindowTitle("Version details")
+        self.setMinimumWidth(440)
+        layout = qt.QVBoxLayout(self)
+        form = qt.QFormLayout()
+
+        def add_row(title, value):
+            label = qt.QLabel(value or "—")
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
+            form.addRow(title, label)
+
+        history = history or {}
+        message = history.get("message") or spec.get("label", "")
+        roles = []
+        if spec.get("head"):
+            roles.append("HEAD")
+        if checked_out:
+            roles.append("Checked out")
+        if spec.get("merge"):
+            roles.append("Merge commit")
+
+        add_row("Version:", str(spec.get("tag", "")))
+        add_row("Internal id:", str(spec.get("id", "")))
+        add_row("Branch:", str(spec.get("branch", "")))
+        add_row("Title:", str(spec.get("label", "")))
+        add_row("Message:", message)
+        add_row("Date:", history.get("date", ""))
+        add_row("Author:", history.get("author", ""))
+        add_row("Status:", history.get("status", ""))
+        add_row("Parent:", str(spec.get("parent") or "—"))
+        if spec.get("merge"):
+            merge_from = spec.get("merge_from") or []
+            add_row("Merge from:", ", ".join(merge_from) if merge_from else "—")
+            merge_into = spec.get("merge_into") or spec.get("parent") or "—"
+            add_row("Merge into:", str(merge_into))
+        add_row("Role:", ", ".join(roles) if roles else "—")
+
+        layout.addLayout(form)
+
+        footer = qt.QHBoxLayout()
+        footer.addStretch(1)
+        close_btn = qt.QPushButton("Close")
+        close_btn.connect("clicked()", self.accept)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+
+
+class _StructureInfoDialog(qt.QDialog):
+    """Read-only details for a dependency graph node."""
+
+    def __init__(self, parent, spec):
+        qt.QDialog.__init__(self, parent)
+        self.setWindowTitle("Structure details")
+        self.setMinimumWidth(420)
+        layout = qt.QVBoxLayout(self)
+        form = qt.QFormLayout()
+
+        def add_row(title, value):
+            label = qt.QLabel(value or "—")
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
+            form.addRow(title, label)
+
+        add_row("Id:", str(spec.get("id", "")))
+        add_row("Name:", str(spec.get("label", "")))
+        acronym = str(spec.get("symbol", "")).strip()
+        add_row("Acronym:", acronym if acronym else "—")
+        layout.addLayout(form)
+
+        footer = qt.QHBoxLayout()
+        footer.addStretch(1)
+        close_btn = qt.QPushButton("Close")
+        close_btn.connect("clicked()", self.accept)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+
+
 class DependencyGraphCanvas(InteractiveGraphView):
-    """Graphe de dependances anatomiques — charge depuis JSON / preset."""
+    """Anatomical dependency graph with expand/collapse navigation."""
 
     def __init__(
         self,
@@ -615,9 +836,19 @@ class DependencyGraphCanvas(InteractiveGraphView):
     ):
         InteractiveGraphView.__init__(self, parent)
         self.logic = logic
-        self.dependency_specs = dependency_specs if dependency_specs is not None else MOUSE_BRAIN_SPECS
-        self.graph_title = graph_title or "Ontologie du projet"
+        self._all_specs = list(dependency_specs or [])
+        self.dependency_specs = self._all_specs
+        self.graph_title = graph_title or "Project ontology"
         self.graph_description = graph_description or ""
+        self._full_children_map = _build_children_map(self._all_specs)
+        self._expanded_ids = _default_expanded_ids(self._all_specs)
+        self._nodes_by_id = {}
+        self._specs_by_id = {}
+        self._pending_node_id = None
+        self._click_timer = qt.QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(220)
+        self._click_timer.connect("timeout()", self._on_single_click_timeout)
         graphe_scene = qt.QGraphicsScene()
         self.setScene(graphe_scene)
         self._graphe_scene = graphe_scene
@@ -630,7 +861,10 @@ class DependencyGraphCanvas(InteractiveGraphView):
         self.reset_view()
 
     def set_specs(self, dependency_specs, graph_title=None, graph_description=None):
-        self.dependency_specs = dependency_specs
+        self._all_specs = list(dependency_specs or [])
+        self.dependency_specs = self._all_specs
+        self._full_children_map = _build_children_map(self._all_specs)
+        self._expanded_ids = _default_expanded_ids(self._all_specs)
         if graph_title is not None:
             self.graph_title = graph_title
         if graph_description is not None:
@@ -639,21 +873,114 @@ class DependencyGraphCanvas(InteractiveGraphView):
         self._pad_scene_rect()
         self.reset_view()
 
+    def create_toolbar(self):
+        hint = qt.QLabel("Click parent to expand/collapse · Double-click for details")
+        hint.setStyleSheet("color: #6b7789; font-size: 10px;")
+        btn_collapse = qt.QPushButton("Collapse all")
+        btn_collapse.setToolTip("Show only the root level again.")
+        btn_collapse.connect("clicked()", self._collapse_all)
+        return InteractiveGraphView.create_toolbar(
+            self,
+            leading_widgets=[hint, btn_collapse],
+        )
+
+    def _collapse_all(self):
+        self._expanded_ids = _default_expanded_ids(self._all_specs)
+        self.draw()
+        self._pad_scene_rect()
+        self.reset_view()
+
+    def _has_children(self, node_id):
+        return bool(self._full_children_map.get(node_id))
+
+    def _toggle_node_expanded(self, node_id):
+        if not self._has_children(node_id):
+            return False
+        if node_id in self._expanded_ids:
+            self._expanded_ids.discard(node_id)
+        else:
+            self._expanded_ids.add(node_id)
+        self.draw()
+        self._pad_scene_rect()
+        self.reset_view()
+        return True
+
     def showEvent(self, event):
         qt.QGraphicsView.showEvent(self, event)
         self.reset_view()
 
+    def _node_at_scene_pos(self, scene_pos):
+        return _node_id_at_scene_pos(self._nodes_by_id, scene_pos)
+
+    def _show_structure_info(self, node_id):
+        spec = next((item for item in self._all_specs if item["id"] == node_id), None)
+        if not spec:
+            return
+        dialog = _StructureInfoDialog(self, spec)
+        dialog.exec_()
+
+    def _on_single_click_timeout(self):
+        node_id = self._pending_node_id
+        self._pending_node_id = None
+        if node_id:
+            self._toggle_node_expanded(node_id)
+
+    def mousePressEvent(self, event):
+        if event.button() == qt.Qt.LeftButton:
+            scene_pos = self.mapToScene(_qt_event_pos(event))
+            node_id = self._node_at_scene_pos(scene_pos)
+            if node_id and self._has_children(node_id):
+                self._pending_node_id = node_id
+                self._click_timer.start()
+                event.accept()
+                return
+        qt.QGraphicsView.mousePressEvent(self, event)
+
+    def mouseDoubleClickEvent(self, event):
+        self._click_timer.stop()
+        self._pending_node_id = None
+        if event.button() == qt.Qt.LeftButton:
+            scene_pos = self.mapToScene(_qt_event_pos(event))
+            node_id = self._node_at_scene_pos(scene_pos)
+            if node_id:
+                self._show_structure_info(node_id)
+                event.accept()
+                return
+        qt.QGraphicsView.mouseDoubleClickEvent(self, event)
+
     def draw(self):
         self._graphe_scene.clear()
-        if not self.dependency_specs:
-            hint = self._graphe_scene.addText("Aucune ontologie chargee")
+        if not self._all_specs:
+            hint = self._graphe_scene.addText("No ontology loaded.")
+            hint.setDefaultTextColor(qt.QColor("#888888"))
+            hint.setPos(MARGIN, MARGIN)
+            self._graphe_scene.setSceneRect(0, 0, 400, 200)
+            self._nodes_by_id = {}
+            self._specs_by_id = {}
+            return
+
+        visible_specs, _children_map = _visible_specs_from_expansion(
+            self._all_specs,
+            self._expanded_ids,
+        )
+        self.dependency_specs = visible_specs
+        if not visible_specs:
+            hint = self._graphe_scene.addText("No structures to display.")
             hint.setDefaultTextColor(qt.QColor("#888888"))
             hint.setPos(MARGIN, MARGIN)
             self._graphe_scene.setSceneRect(0, 0, 400, 200)
             return
 
-        positions, edges = _layout_hierarchy(self.dependency_specs)
+        positions, edges = _layout_hierarchy(
+            visible_specs,
+            expanded_ids=self._expanded_ids,
+            full_children_map=self._full_children_map,
+            h_gap=DEPENDENCY_H_GAP,
+            v_gap=DEPENDENCY_V_GAP,
+        )
         nodes_by_id = positions
+        self._nodes_by_id = nodes_by_id
+        self._specs_by_id = {spec["id"]: spec for spec in visible_specs}
 
         for parent_id, child_id in edges:
             if parent_id in nodes_by_id and child_id in nodes_by_id:
@@ -663,30 +990,18 @@ class DependencyGraphCanvas(InteractiveGraphView):
             _draw_box_node(self._graphe_scene, node)
 
         scene_w, scene_h = _compute_scene_bounds(list(nodes_by_id.values()), padding=40)
-        self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + 20)
+        self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + 28)
 
-        title_text = "%s — %d structure(s)" % (self.graph_title, len(nodes_by_id))
+        expanded_count = len(self._expanded_ids)
+        title_text = "%s — showing %d of %d structure(s) · %d branch(es) expanded" % (
+            self.graph_title,
+            len(nodes_by_id),
+            len(self._all_specs),
+            expanded_count,
+        )
         if self.graph_description:
             title_text += " — " + self.graph_description
         title = self._graphe_scene.addText(title_text)
         title.setFont(qt.QFont("Arial", 8))
         title.setDefaultTextColor(qt.QColor("#777777"))
-        title.setPos(MARGIN, scene_h - 6)
-
-        legend_y = 8
-        seen_colors = []
-        for node in self.dependency_specs:
-            color = node.get("color", "#0078d4")
-            if color not in seen_colors:
-                seen_colors.append(color)
-        for color in seen_colors[:6]:
-            self._graphe_scene.addRect(
-                MARGIN, legend_y, 10, 10,
-                qt.QPen(qt.QColor(color)), qt.QBrush(qt.QColor(color)),
-            )
-            lbl = self._graphe_scene.addText(color)
-            lbl.setFont(qt.QFont("Arial", 7))
-            lbl.setDefaultTextColor(qt.QColor("#888888"))
-            lbl.setPos(MARGIN + 14, legend_y - 2)
-            legend_y += 14
-
+        title.setPos(MARGIN, scene_h + 4)

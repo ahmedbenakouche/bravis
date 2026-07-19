@@ -76,6 +76,14 @@ class DataManager:
             if fmt != DataFormat.UNKNOWN
         ]
 
+    @staticmethod
+    def _basename_without_extension(path: str) -> str:
+        name = os.path.basename(path)
+        for extension in (".nii.gz", ".seg.nrrd", ".seg.nhdr", ".nii", ".nrrd", ".nhdr"):
+            if name.lower().endswith(extension):
+                return name[: -len(extension)]
+        return os.path.splitext(name)[0]
+
     def load_volume(self, path: str, properties: dict[str, Any] | None = None) -> Any:
         data_format = self.detect_format(path)
         if data_format == DataFormat.DICOM:
@@ -83,9 +91,11 @@ class DataManager:
         if data_format not in (DataFormat.NIFTI, DataFormat.NRRD):
             raise ValueError(f"Unsupported volume format for: {path}")
 
-        node = slicer.util.loadVolume(path, properties or {})
+        load_properties = dict(properties or {})
+        node = slicer.util.loadVolume(path, load_properties)
         if not node:
             raise RuntimeError(f"Failed to load volume: {path}")
+        node.SetName(self._basename_without_extension(path))
         logging.info("Loaded volume %s from %s", node.GetName(), path)
         return node
 
@@ -114,17 +124,33 @@ class DataManager:
 
     def load_segmentation(self, path: str) -> Any:
         data_format = self.detect_format(path)
-        if data_format == DataFormat.SEGMENTATION:
-            node = slicer.util.loadSegmentation(path)
-        elif data_format in (DataFormat.NIFTI, DataFormat.NRRD):
-            node = slicer.util.loadVolume(path, {"labelmap": True})
-        else:
+        if data_format not in (DataFormat.SEGMENTATION, DataFormat.NIFTI, DataFormat.NRRD):
             raise ValueError(f"Unsupported segmentation format for: {path}")
 
+        segmentation_name = self._basename_without_extension(path)
+        node = slicer.util.loadSegmentation(
+            path,
+            {"name": segmentation_name, "singleFile": True},
+        )
         if not node:
             raise RuntimeError(f"Failed to load segmentation: {path}")
+        node.SetName(segmentation_name)
         logging.info("Loaded segmentation %s from %s", node.GetName(), path)
         return node
+
+    def remove_scene_nodes_by_names(self, names: set[str]) -> None:
+        if not names:
+            return
+        scene = slicer.mrmlScene
+        for class_name in (
+            "vtkMRMLScalarVolumeNode",
+            "vtkMRMLLabelMapVolumeNode",
+            "vtkMRMLSegmentationNode",
+        ):
+            for index in range(scene.GetNumberOfNodesByClass(class_name) - 1, -1, -1):
+                node = scene.GetNthNodeByClass(index, class_name)
+                if node and node.GetName() in names:
+                    scene.RemoveNode(node)
 
     def save_volume(self, node: Any, path: str) -> str:
         data_format = self.detect_format(path)
