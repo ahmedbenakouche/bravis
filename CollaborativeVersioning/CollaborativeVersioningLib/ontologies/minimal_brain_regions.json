@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "name": "Exemple minimal — regions cerebrales",
+  "description": "Petit arbre demo pour tester un JSON personnalise.",
+  "nodes": [
+    {"id": "vol", "label": "Volume IRM", "parent": null, "color": "#0078d4"},
+    {"id": "mask", "label": "Masque cerebral", "parent": "vol", "color": "#1a8cff"},
+    {"id": "brainstem", "label": "Tronc cerebral", "parent": "mask", "color": "#6f42c1"},
+    {"id": "cerebellum", "label": "Cervelet", "parent": "mask", "color": "#e67e22"},
+    {"id": "forebrain", "label": "Forebrain", "parent": "mask", "color": "#16a085"},
+    {"id": "striatum", "label": "Striatum", "parent": "forebrain", "color": "#48c9b0", "xref": {"UBERON": "0000367"}}
+  ]
+}
