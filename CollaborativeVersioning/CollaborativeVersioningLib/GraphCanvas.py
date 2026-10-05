@@ -403,8 +403,45 @@ def _draw_tree_edge(scene, parent, child, color=None, width=2):
     scene.addLine(cx, mid_y, cx, child["y"], pen)
 
 
-def _version_lane_x(branch):
-    center = VERSION_LANE_CENTERS.get(branch, VERSION_LANE_CENTERS["main"])
+def _branch_color(branch):
+    if branch == "main":
+        return MAIN_COLOR
+    palette = [
+        _ui.ACCENT_ICE,
+        _ui.ACCENT_AMBER,
+        _ui.ACCENT_MINT,
+        "#ea580c" if not _ui.IS_DARK else "#fb923c",
+        "#a78bfa" if not _ui.IS_DARK else "#c4b5fd",
+        "#ec4899" if not _ui.IS_DARK else "#f9a8d4",
+    ]
+    acc = 0
+    for char in str(branch or ""):
+        acc = (acc * 33 + ord(char)) % 2147483647
+    return palette[acc % len(palette)]
+
+
+def _lane_centers_for(specs):
+    branches = []
+    seen = set()
+    for spec in specs or []:
+        branch = spec.get("branch") or "main"
+        if branch in seen:
+            continue
+        seen.add(branch)
+        branches.append(branch)
+    sides = sorted(branch for branch in branches if branch != "main")
+    centers = {"main": VERSION_LANE_CENTERS["main"]}
+    spacing = 190
+    main_x = VERSION_LANE_CENTERS["main"]
+    for index, branch in enumerate(sides):
+        centers[branch] = main_x + (index + 1) * spacing
+    return centers
+
+
+def _version_lane_x(branch, centers=None):
+    if not centers:
+        centers = VERSION_LANE_CENTERS
+    center = centers.get(branch, centers.get("main", VERSION_LANE_CENTERS["main"]))
     return center - VERSION_NODE_W / 2.0
 
 
@@ -464,9 +501,9 @@ def _version_graph_edges(specs):
         if spec.get("parent"):
             edges.append((spec["parent"], node_id, spec.get("branch", "main")))
         if spec.get("merge"):
-            merge_target = spec.get("merge_into") or spec.get("parent")
+            merge_target = spec.get("id")
             for merge_id in spec.get("merge_from", []):
-                if not merge_target:
+                if merge_id == merge_target:
                     continue
                 branch = specs_by_id.get(merge_id, {}).get("branch", "main")
                 edges.append((merge_id, merge_target, branch))
@@ -474,17 +511,18 @@ def _version_graph_edges(specs):
 
 
 def _layout_version_graph(specs):
-    """Layout : colonnes fixes par branche, lignes sans chevauchement."""
+    """Layout : colonnes par ligne de versions, lignes sans chevauchement."""
     specs_by_id = {spec["id"]: dict(spec) for spec in specs}
     rows = _compute_version_rows(specs)
+    centers = _lane_centers_for(specs)
 
     positions = {}
     for node_id, spec in specs_by_id.items():
         branch = spec.get("branch", "main")
         label = spec.get("tag") or spec["id"]
         y = VERSION_Y0 + rows[node_id] * VERSION_ROW_H
-        x = _version_lane_x(branch)
-        color = VERSION_BRANCH_COLORS.get(branch, MAIN_COLOR)
+        x = _version_lane_x(branch, centers)
+        color = _branch_color(branch)
 
         positions[node_id] = {
             "id": node_id,
@@ -816,7 +854,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
                 continue
             if (parent_id, child_id) in trunk_pairs:
                 continue
-            edge_color = VERSION_BRANCH_COLORS.get(branch, _ui.GRAPH_EDGE)
+            edge_color = _branch_color(branch)
             _draw_tree_edge(
                 self._graphe_scene,
                 nodes_by_id[parent_id],
@@ -830,12 +868,13 @@ class VersionHistoryCanvas(InteractiveGraphView):
             if self.active_version_id and node["id"] == self.active_version_id:
                 _draw_checkout_pointer(self._graphe_scene, node)
 
+        max_x = max(node["x"] + node["w"] for node in nodes_by_id.values())
         max_y = max(node["y"] for node in nodes_by_id.values())
-        scene_w = 940
+        scene_w = max(940, max_x + MARGIN + 40)
         scene_h = max_y + NODE_H + 40
         self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + 28)
 
-        title_text = "%s — %d version(s) · main branch centered" % (
+        title_text = "%s — %d version(s)" % (
             self.graph_title,
             len(nodes_by_id),
         )
@@ -904,8 +943,10 @@ class _VersionInfoDialog(qt.QDialog):
             roles.append("Merge commit")
 
         add_row("Version:", str(spec.get("tag", "")))
-        add_row("Internal id:", str(spec.get("id", "")))
-        add_row("Branch:", str(spec.get("branch", "")))
+        line = spec.get("branch") or ""
+        if line == "main":
+            line = "Shared project"
+        add_row("Line:", str(line))
         add_row("Title:", str(spec.get("label", "")))
         add_row("Message:", message)
         add_row("Date:", history.get("date", ""))

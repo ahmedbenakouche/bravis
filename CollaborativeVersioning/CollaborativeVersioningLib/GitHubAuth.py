@@ -696,6 +696,7 @@ def submit_share_request(repo_dir: str, full_name: str) -> str:
         )
     if push.returncode != 0:
         raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+    _run_git(["update-ref", "refs/remotes/origin/%s" % branch, "HEAD"], cwd=repo_dir, timeout=20)
     title = "Share request from %s" % login
     body = "A colleague sent a version for the owner to review in 3D Slicer."
     created = _run_gh(
@@ -797,36 +798,166 @@ def fetch_share_request_sha(full_name: str, branch: str) -> tuple[str, str]:
     return dest, value
 
 
+def _review_login_from_ref(ref: str) -> str:
+    text = (ref or "").replace("\\", "/").strip()
+    marker = "cv-review/"
+    if marker not in text:
+        return ""
+    login = text.split(marker, 1)[-1].strip().strip("/")
+    return normalize_github_username(login.split("/")[0] if login else "")
+
+
+def _history_lane_slug(login: str) -> str:
+    name = normalize_github_username(login) or "colleague"
+    if name.lower() == "main":
+        return "reviewer-main"
+    return name
+
+
+def _git_rev_parse(repo_dir: str, ref: str) -> str:
+    if not ref:
+        return ""
+    result = _run_git(["rev-parse", "--verify", "--quiet", ref], cwd=repo_dir, timeout=30)
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _ensure_github_branch(full_name: str, branch: str, sha: str) -> None:
+    """Recreate a review line on GitHub if Accept/Decline removed the name."""
+    if not full_name or not branch or not sha:
+        return
+    owner, repo = _split_project_name(full_name)
+    existing = _run_gh(
+        ["api", "repos/%s/%s/git/ref/heads/%s" % (owner, repo, branch)],
+        timeout=30,
+    )
+    if existing.returncode == 0:
+        return
+    created = _run_gh(
+        [
+            "api",
+            "-X",
+            "POST",
+            "repos/%s/%s/git/refs" % (owner, repo),
+            "-f",
+            "ref=refs/heads/%s" % branch,
+            "-f",
+            "sha=%s" % sha,
+        ],
+        timeout=40,
+    )
+    if created.returncode == 0:
+        return
+    detail = (created.stderr or created.stdout or "").strip().lower()
+    if "already exists" in detail or "reference already exists" in detail:
+        return
+
+
+def _share_request_head(full_name: str, number) -> tuple[str, str]:
+    result = _run_gh(
+        [
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            full_name,
+            "--json",
+            "headRefName,headRefOid",
+        ],
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return "", ""
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    branch = str(payload.get("headRefName") or "").strip()
+    sha = str(payload.get("headRefOid") or "").strip()
+    return branch, sha
+
+
 def accept_share_request(full_name: str, branch: str, number) -> str:
-    """Fast-forward the project line with the reviewed version."""
-    dest, _sha = fetch_share_request_sha(full_name, branch)
-    push = _run_git(
-        ["push", "origin", "origin/%s:refs/heads/main" % branch],
-        cwd=dest,
+    """Merge the reviewed line into the shared project. Keep that line's versions."""
+    dest, sha = fetch_share_request_sha(full_name, branch)
+    login = _review_login_from_ref(branch) or "colleague"
+    result = _run_gh(
+        [
+            "pr",
+            "merge",
+            str(number),
+            "--repo",
+            full_name,
+            "--merge",
+            "--subject",
+            "Accept version from %s" % login,
+        ],
         timeout=180,
     )
-    if push.returncode != 0:
-        raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
-    _run_git(["fetch", "origin", "main"], cwd=dest, timeout=180)
-    _run_git(["reset", "--hard", "origin/main"], cwd=dest, timeout=60)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        lower = detail.lower()
+        if "conflict" in lower or "not mergeable" in lower or "dirty" in lower:
+            raise GitHubAuthError(
+                "Could not accept this version. It does not combine with the shared project."
+            )
+        raise GitHubAuthError("Could not accept the version.\n%s" % detail[:400])
     try:
-        _run_gh_blocking(
-            [
-                "pr",
-                "close",
-                str(number),
-                "--repo",
-                full_name,
-                "--delete-branch",
-            ],
-            timeout=15,
-        )
-    except GitHubAuthError:
+        _ensure_github_branch(full_name, branch, sha)
+    except (GitHubAuthError, OSError, ValueError):
         pass
+    _run_git(["fetch", "origin"], cwd=dest, timeout=180)
+    _run_git(["reset", "--hard", "origin/main"], cwd=dest, timeout=60)
     return dest
 
 
-def decline_share_request(full_name: str, number) -> None:
+def _declined_shas_path(repo_dir: str) -> str:
+    return os.path.join(repo_dir, ".git", "cv-declined-shas")
+
+
+def _load_declined_shas(repo_dir: str) -> set[str]:
+    try:
+        with open(_declined_shas_path(repo_dir), encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    return {str(item).strip() for item in raw if str(item).strip()}
+
+
+def _remember_declined_shas(repo_dir: str, shas) -> None:
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return
+    current = _load_declined_shas(repo_dir)
+    current.update(str(sha).strip() for sha in (shas or []) if str(sha).strip())
+    try:
+        with open(_declined_shas_path(repo_dir), "w", encoding="utf-8") as handle:
+            json.dump(sorted(current), handle)
+    except OSError:
+        return
+
+
+def _unique_commits_not_on_main(repo_dir: str, tip: str) -> set[str]:
+    if not tip:
+        return set()
+    result = _run_git(
+        ["log", "--format=%H", tip, "--not", "origin/main"],
+        cwd=repo_dir,
+        timeout=60,
+    )
+    shas = {line.strip() for line in (result.stdout or "").splitlines() if line.strip()}
+    shas.add(tip)
+    return shas
+
+
+def decline_share_request(full_name: str, number, branch: str = "") -> None:
+    """Close the review request but keep the colleague's versions."""
+    head_branch, head_sha = _share_request_head(full_name, number)
+    keep_branch = (branch or head_branch or "").strip()
     result = _run_gh(
         [
             "pr",
@@ -834,16 +965,24 @@ def decline_share_request(full_name: str, number) -> None:
             str(number),
             "--repo",
             full_name,
-            "--delete-branch",
         ],
         timeout=40,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         lower = detail.lower()
-        if "already" in lower or "not found" in lower:
-            return
-        raise GitHubAuthError("Could not decline the version.\n%s" % detail[:400])
+        if "already" not in lower and "not found" not in lower:
+            raise GitHubAuthError("Could not decline the version.\n%s" % detail[:400])
+    if keep_branch and head_sha:
+        try:
+            _ensure_github_branch(full_name, keep_branch, head_sha)
+        except (GitHubAuthError, OSError, ValueError):
+            pass
+    dest = local_project_dir(full_name)
+    remembered = {head_sha} if head_sha else set()
+    if os.path.isdir(os.path.join(dest, ".git")) and head_sha:
+        remembered.update(_unique_commits_not_on_main(dest, head_sha))
+    _remember_declined_shas(dest, remembered)
 
 
 def commit_and_push(repo_dir: str, message: str) -> None:
@@ -919,63 +1058,354 @@ def open_or_update_local_project(full_name: str, mode: str = "update") -> str:
     return dest
 
 
+def _history_refs(repo_dir: str) -> list[str]:
+    result = _run_git(
+        ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin"],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return []
+    refs = []
+    for line in (result.stdout or "").splitlines():
+        ref = line.strip()
+        if not ref:
+            continue
+        lower = ref.replace("\\", "/").lower()
+        if lower.endswith("/project-info") or lower.endswith("/heads/project-info"):
+            continue
+        refs.append(ref)
+    return refs
+
+
+def _review_tips(repo_dir: str) -> dict[str, str]:
+    tips = {}
+    for ref in _history_refs(repo_dir):
+        login = _review_login_from_ref(ref)
+        if not login:
+            continue
+        sha = _git_rev_parse(repo_dir, ref)
+        if sha:
+            tips[login.lower()] = sha
+    return tips
+
+
+def _first_parent_chain(commit_by_sha: dict[str, dict], tip: str) -> list[str]:
+    chain = []
+    seen = set()
+    current = tip
+    while current and current not in seen:
+        seen.add(current)
+        chain.append(current)
+        parents = (commit_by_sha.get(current) or {}).get("parents") or []
+        current = parents[0] if parents else ""
+    return chain
+
+
+def _unique_side_chain(commit_by_sha: dict[str, dict], tip: str, stop: set[str]) -> list[str]:
+    chain = []
+    seen = set()
+    current = tip
+    while current and current not in seen and current not in stop:
+        seen.add(current)
+        chain.append(current)
+        parents = (commit_by_sha.get(current) or {}).get("parents") or []
+        current = parents[0] if parents else ""
+    chain.reverse()
+    return chain
+
+
+def _history_log_refs(repo_dir: str) -> list[str]:
+    refs = []
+    seen = set()
+    for ref in ("HEAD", "refs/heads/main", "refs/remotes/origin/main"):
+        if not _git_rev_parse(repo_dir, ref):
+            continue
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    for ref in _history_refs(repo_dir):
+        if "cv-review/" not in ref.replace("\\", "/"):
+            continue
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    return refs
+
+
+def _slug_from_merge(
+    commit_by_sha: dict[str, dict],
+    merge_sha: str,
+    extra_sha: str,
+    review_tips: dict[str, str],
+) -> str:
+    message = str((commit_by_sha.get(merge_sha) or {}).get("message") or "")
+    found = re.search(r"Accept version from\s+(\S+)", message, re.I)
+    if found:
+        return _history_lane_slug(found.group(1))
+    found = re.search(r"cv-review/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)", message)
+    if found:
+        return _history_lane_slug(found.group(1))
+    extra_chain = set(_first_parent_chain(commit_by_sha, extra_sha))
+    for login, tip in review_tips.items():
+        if extra_sha in set(_first_parent_chain(commit_by_sha, tip)) or extra_chain.intersection(
+            _first_parent_chain(commit_by_sha, tip)
+        ):
+            return _history_lane_slug(login)
+    author = str((commit_by_sha.get(extra_sha) or {}).get("author") or "colleague")
+    return _history_lane_slug(re.sub(r"[^A-Za-z0-9]+", "-", author).strip("-") or "colleague")
+
+
+def _lane_status(
+    branch: str,
+    sha: str,
+    unpushed: set[str],
+    accepted_ids: set[str],
+    declined_shas: set[str],
+    version_id: str,
+) -> str:
+    if branch == "main":
+        return "local" if sha in unpushed else "pushed"
+    if version_id in accepted_ids:
+        return "Accepted"
+    if sha in declined_shas:
+        return "Declined"
+    return "To review"
+
+
+def build_project_history_model(
+    commit_by_sha: dict[str, dict[str, Any]],
+    main_tip: str,
+    head_sha: str,
+    review_tips: dict[str, str],
+    unpushed: set[str],
+    declined_shas: set[str] | None = None,
+) -> dict[str, Any]:
+    """Turn Git commits + review tips into version specs (DAG)."""
+    empty = {
+        "commit_history": [],
+        "version_specs": [],
+        "tags_by_id": {},
+        "sha_by_id": {},
+        "head_id": None,
+    }
+    if not commit_by_sha:
+        return empty
+    id_by_sha: dict[str, str] = {}
+    specs_by_id: dict[str, dict[str, Any]] = {}
+    tags: dict[str, str] = {}
+    sha_by_id: dict[str, str] = {}
+
+    def add_spec(version_id: str, sha: str, parent_id, branch: str, merge_from=None) -> None:
+        if sha in id_by_sha:
+            return
+        record = commit_by_sha.get(sha) or {}
+        parents = record.get("parents") or []
+        is_merge = branch == "main" and len(parents) > 1
+        spec = {
+            "id": version_id,
+            "parent": parent_id,
+            "branch": branch,
+            "tag": version_id,
+            "head": False,
+            "merge": is_merge,
+        }
+        if is_merge and merge_from:
+            spec["merge_from"] = list(merge_from)
+        id_by_sha[sha] = version_id
+        specs_by_id[version_id] = spec
+        tags[version_id] = version_id
+        sha_by_id[version_id] = sha
+
+    main_chain = _first_parent_chain(commit_by_sha, main_tip) if main_tip else []
+    main_set = set(main_chain)
+    for index, sha in enumerate(reversed(main_chain), start=1):
+        record = commit_by_sha.get(sha) or {}
+        parents = record.get("parents") or []
+        first = parents[0] if parents else ""
+        parent_id = id_by_sha.get(first)
+        merge_from = []
+        if len(parents) > 1:
+            for extra in parents[1:]:
+                other_id = id_by_sha.get(extra)
+                if other_id:
+                    merge_from.append(other_id)
+        add_spec("main/%d" % index, sha, parent_id, "main", merge_from)
+
+    lane_shas: dict[str, list[str]] = {}
+
+    def remember_side(slug: str, tip: str) -> None:
+        if not slug or not tip:
+            return
+        lane_shas.setdefault(slug, []).extend(_unique_side_chain(commit_by_sha, tip, main_set))
+
+    for login, tip in sorted(review_tips.items(), key=lambda item: item[0]):
+        remember_side(_history_lane_slug(login), tip)
+    for merge_sha in main_chain:
+        parents = (commit_by_sha.get(merge_sha) or {}).get("parents") or []
+        for extra in parents[1:]:
+            remember_side(_slug_from_merge(commit_by_sha, merge_sha, extra, review_tips), extra)
+
+    for slug, shas in sorted(lane_shas.items()):
+        unique = []
+        seen = set()
+        for sha in shas:
+            if not sha or sha in seen or sha in id_by_sha:
+                continue
+            seen.add(sha)
+            unique.append(sha)
+        unique.sort(key=lambda item: str((commit_by_sha.get(item) or {}).get("date") or ""))
+        for index, sha in enumerate(unique, start=1):
+            record = commit_by_sha.get(sha) or {}
+            parents = record.get("parents") or []
+            first = parents[0] if parents else ""
+            parent_id = id_by_sha.get(first)
+            add_spec("%s/%d" % (slug, index), sha, parent_id, slug)
+
+    for extra_id in list(id_by_sha.values()):
+        spec = specs_by_id.get(extra_id) or {}
+        if not spec.get("merge"):
+            continue
+        sha = sha_by_id.get(extra_id) or ""
+        parents = (commit_by_sha.get(sha) or {}).get("parents") or []
+        merge_from = []
+        for extra in parents[1:]:
+            other_id = id_by_sha.get(extra)
+            if other_id:
+                merge_from.append(other_id)
+        if merge_from:
+            spec["merge_from"] = merge_from
+
+    leftover = []
+    if head_sha:
+        for sha in reversed(_first_parent_chain(commit_by_sha, head_sha)):
+            if sha not in id_by_sha:
+                leftover.append(sha)
+    main_count = sum(1 for version_id in specs_by_id if version_id.startswith("main/"))
+    for sha in leftover:
+        record = commit_by_sha.get(sha) or {}
+        parents = record.get("parents") or []
+        first = parents[0] if parents else ""
+        parent_id = id_by_sha.get(first)
+        main_count += 1
+        add_spec("main/%d" % main_count, sha, parent_id, "main")
+
+    for extra_id, spec in specs_by_id.items():
+        sha = sha_by_id.get(extra_id) or ""
+        if spec.get("merge") and spec.get("merge_from"):
+            continue
+        if spec.get("merge"):
+            parents = (commit_by_sha.get(sha) or {}).get("parents") or []
+            merge_from = [id_by_sha[p] for p in parents[1:] if p in id_by_sha]
+            if merge_from:
+                spec["merge_from"] = merge_from
+
+    if main_tip and main_tip in id_by_sha:
+        specs_by_id[id_by_sha[main_tip]]["head"] = True
+
+    accepted_ids = set()
+    for spec in specs_by_id.values():
+        if spec.get("merge"):
+            accepted_ids.update(spec.get("merge_from") or [])
+
+    history_rows = []
+    for sha, version_id in id_by_sha.items():
+        spec = specs_by_id[version_id]
+        record = commit_by_sha.get(sha) or {}
+        status = _lane_status(
+            str(spec.get("branch") or "main"),
+            sha,
+            unpushed,
+            accepted_ids,
+            set(declined_shas or ()),
+            version_id,
+        )
+        history_rows.append(
+            (
+                record.get("date") or "",
+                version_id,
+                [
+                    version_id,
+                    _format_git_date(str(record.get("date") or "")),
+                    str(record.get("author") or ""),
+                    str(record.get("message") or ""),
+                    status,
+                ],
+            )
+        )
+    history_rows.sort(key=lambda item: item[0], reverse=True)
+    specs = []
+    seen_specs = set()
+    for sha in reversed(main_chain):
+        version_id = id_by_sha.get(sha)
+        if version_id and version_id not in seen_specs:
+            specs.append(specs_by_id[version_id])
+            seen_specs.add(version_id)
+    for spec in specs_by_id.values():
+        if spec["id"] not in seen_specs:
+            specs.append(spec)
+            seen_specs.add(spec["id"])
+    head_id = id_by_sha.get(head_sha) or id_by_sha.get(main_tip)
+    return {
+        "commit_history": [row for _date, _vid, row in history_rows],
+        "version_specs": specs,
+        "tags_by_id": tags,
+        "sha_by_id": sha_by_id,
+        "head_id": head_id,
+    }
+
+
 def read_project_history(repo_dir: str) -> dict[str, Any]:
-    """Read saved versions from the local project folder (oldest = main/1)."""
-    empty = {"commit_history": [], "version_specs": [], "tags_by_id": {}, "sha_by_id": {}}
+    """Read saved versions, including review lines, as a DAG."""
+    empty = {
+        "commit_history": [],
+        "version_specs": [],
+        "tags_by_id": {},
+        "sha_by_id": {},
+        "head_id": None,
+    }
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return empty
+    refs = _history_log_refs(repo_dir)
+    if not refs:
+        return empty
     result = _run_git(
-        ["log", "--reverse", "--format=%H%x1f%cI%x1f%an%x1f%s"],
+        ["log", "--parents", "--reverse", "--format=%H%x1f%P%x1f%cI%x1f%an%x1f%s", *refs],
         cwd=repo_dir,
         timeout=60,
     )
     if result.returncode != 0:
         return empty
-    commits = []
+    commit_by_sha: dict[str, dict[str, Any]] = {}
     for line in (result.stdout or "").splitlines():
         if not line.strip():
             continue
         parts = line.split("\x1f")
-        if len(parts) < 4:
+        if len(parts) < 5:
             continue
-        commits.append((parts[0], parts[1], parts[2], parts[3]))
+        sha, parent_text, iso, author, message = parts[0], parts[1], parts[2], parts[3], parts[4]
+        parents = [item for item in parent_text.split() if item]
+        commit_by_sha[sha] = {
+            "parents": parents,
+            "date": iso,
+            "author": author,
+            "message": message,
+        }
+    main_tip = _git_rev_parse(repo_dir, "origin/main") or _git_rev_parse(repo_dir, "main")
+    head_sha = _git_rev_parse(repo_dir, "HEAD")
+    review_tips = _review_tips(repo_dir)
     unpushed = _unpushed_commit_shas(repo_dir)
-    specs = []
-    history_newest_first = []
-    tags = {}
-    sha_by_id = {}
-    parent = None
-    total = len(commits)
-    for index, (sha, iso, author, message) in enumerate(commits, start=1):
-        version_id = "main/%d" % index
-        tags[version_id] = version_id
-        sha_by_id[version_id] = sha
-        specs.append(
-            {
-                "id": version_id,
-                "parent": parent,
-                "branch": "main",
-                "tag": version_id,
-                "head": index == total,
-            }
-        )
-        history_newest_first.append(
-            [
-                version_id,
-                _format_git_date(iso),
-                author,
-                message,
-                "local" if sha in unpushed else "pushed",
-            ]
-        )
-        parent = version_id
-    history_newest_first.reverse()
-    return {
-        "commit_history": history_newest_first,
-        "version_specs": specs,
-        "tags_by_id": tags,
-        "sha_by_id": sha_by_id,
-    }
+    model = build_project_history_model(
+        commit_by_sha,
+        main_tip,
+        head_sha,
+        review_tips,
+        unpushed,
+        declined_shas=_load_declined_shas(repo_dir),
+    )
+    if not model.get("version_specs"):
+        return empty
+    return model
 
 
 def delete_owned_repository(full_name: str) -> None:

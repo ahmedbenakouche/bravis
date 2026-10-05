@@ -22,7 +22,7 @@ import CollaborativeVersioningLib.GraphCanvas
 import CollaborativeVersioningLib.UiStyles
 
 # Change this string to verify that Reload picked up your edits.
-_UI_BUILD_TAG = "2026-10-05-people-task-title"
+_UI_BUILD_TAG = "2026-10-05-keep-accepted-lane"
 
 _LIB_MODULE_NAMES = (
     "CollaborativeVersioningLib.UiStyles",
@@ -211,6 +211,20 @@ def _bindIceClinicTheme() -> None:
     module_globals = globals()
     for name in _STYLE_EXPORTS:
         module_globals[name] = getattr(UiStyles, name)
+
+
+def _qt_combo_index(combo) -> int:
+    value = combo.currentIndex
+    if callable(value):
+        value = value()
+    return int(value)
+
+
+def _qt_combo_count(combo) -> int:
+    value = combo.count
+    if callable(value):
+        value = value()
+    return int(value)
 
 
 def _qt_combo_text(combo) -> str:
@@ -1233,7 +1247,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._project_ontology_document = None
             return
         combo.blockSignals(True)
-        if 0 <= self._ontology_server_combo_index < combo.count:
+        if 0 <= self._ontology_server_combo_index < _qt_combo_count(combo):
             combo.removeItem(self._ontology_server_combo_index)
         self._ontology_server_combo_index = -1
         self._project_ontology_path = None
@@ -1265,12 +1279,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._project_ontology_document = self._ontology_document
         combo = self.ontologyPresetCombo
         combo.blockSignals(True)
-        if 0 <= self._ontology_server_combo_index < combo.count:
+        if 0 <= self._ontology_server_combo_index < _qt_combo_count(combo):
             combo.setItemText(self._ontology_server_combo_index, label)
             combo.setCurrentIndex(self._ontology_server_combo_index)
         else:
             combo.addItem(label)
-            self._ontology_server_combo_index = combo.count - 1
+            self._ontology_server_combo_index = _qt_combo_count(combo) - 1
             combo.setCurrentIndex(self._ontology_server_combo_index)
         combo.blockSignals(False)
 
@@ -1773,7 +1787,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if combo is None or not _qt_widget_is_valid(combo):
             return False
         try:
-            if int(combo.currentIndex) <= ONTOLOGY_COMBO_NONE_INDEX:
+            if _qt_combo_index(combo) <= ONTOLOGY_COMBO_NONE_INDEX:
                 return False
             text = str(combo.currentText or "").strip()
             return bool(text) and text != ONTOLOGY_COMBO_NONE_LABEL
@@ -1787,7 +1801,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         combo = getattr(self, "ontologyPresetCombo", None)
         if combo is None:
             return
-        index = combo.currentIndex()
+        index = _qt_combo_index(combo)
         if index <= ONTOLOGY_COMBO_NONE_INDEX:
             return
         if index == self._ontology_server_combo_index:
@@ -2189,12 +2203,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.projectCombo.blockSignals(False)
 
     def _applyProjectHistoryBundle(self, history: dict | None) -> str | None:
+        previous_id = getattr(self, "_currentVersionId", None)
+        previous_sha = (
+            ((getattr(self, "_project_history_bundle", None) or {}).get("sha_by_id") or {}).get(
+                previous_id
+            )
+            if previous_id
+            else None
+        )
         bundle = history or {}
         self._project_history_bundle = bundle
-        specs = bundle.get("version_specs") or []
-        latest = specs[-1].get("id") if specs else None
-        self._currentVersionId = latest
-        return latest
+        sha_by_id = bundle.get("sha_by_id") or {}
+        id_by_sha = {sha: version_id for version_id, sha in sha_by_id.items()}
+        if previous_sha and previous_sha in id_by_sha:
+            self._currentVersionId = id_by_sha[previous_sha]
+        else:
+            self._currentVersionId = bundle.get("head_id")
+            if not self._currentVersionId:
+                specs = bundle.get("version_specs") or []
+                self._currentVersionId = specs[-1].get("id") if specs else None
+        return self._currentVersionId
 
     def _historyHasUnsharedVersion(self, history: dict | None = None) -> bool:
         bundle = history if history is not None else getattr(self, "_project_history_bundle", None)
@@ -2235,7 +2263,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if (
             combo is not None
             and self._ontology_server_combo_index >= 0
-            and combo.currentIndex() == self._ontology_server_combo_index
+            and _qt_combo_index(combo) == self._ontology_server_combo_index
         ):
             self._project_ontology_document = document
         progress = getattr(self, "_progressDialog", None)
@@ -4460,13 +4488,30 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._openProgress("Review version", "Declining the version…")
         try:
             self._updateProgress("Declining the version…")
-            decline_share_request(request.get("full_name") or "", request.get("number"))
+            decline_share_request(
+                request.get("full_name") or "",
+                request.get("number"),
+                branch=request.get("branch") or "",
+            )
+            local_path = getattr(self, "_local_project_path", None) or ""
+            if (
+                local_path
+                and (request.get("full_name") or "") == (self._currentProjectName() or "")
+            ):
+                self._updateProgress("Updating version history…")
+                history = read_project_history(local_path)
+                previous_unshared = self._unshared_version
+                self._applyProjectHistoryBundle(history)
+                self._unshared_version = previous_unshared or self._historyHasUnsharedVersion(history)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
         self._closeProgress()
-        self._appendFeed("Declined the version from %s." % author)
+        self._appendFeed(
+            "Declined the version from %s. Their versions stay in the version tree." % author
+        )
+        self._refreshUiState()
         self._runNotificationChecks(announce=False)
 
     def onDeleteProject(self) -> None:

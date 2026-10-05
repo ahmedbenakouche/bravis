@@ -274,6 +274,9 @@ def apply_theme(force_dark=None) -> bool:
     globals()["COMMIT_STATUS_COLORS"] = {
         "pushed": palette["ACCENT_MINT"],
         "merged": palette["ACCENT_INDIGO"],
+        "accepted": palette["ACCENT_INDIGO"],
+        "to review": palette["ACCENT_AMBER"],
+        "declined": palette["TEXT_MUTED"],
         "local": palette["TEXT_MUTED"],
     }
     _rebuild_styles(dark)
