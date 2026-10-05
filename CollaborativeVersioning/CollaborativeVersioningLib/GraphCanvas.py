@@ -6,22 +6,7 @@ from collections import defaultdict
 from CollaborativeVersioningLib import UiStyles as _ui
 
 MAIN_COLOR = _ui.ACCENT_INDIGO
-
-VERSION_BRANCH_COLORS = {
-    "main": _ui.ACCENT_INDIGO,
-    "mid": _ui.ACCENT_ICE,
-    "limb": _ui.ACCENT_AMBER,
-    "cb": "#ea580c" if not _ui.IS_DARK else "#fb923c",
-    "fore": _ui.ACCENT_MINT,
-}
-
-VERSION_LANE_CENTERS = {
-    "limb": 95,
-    "fore": 265,
-    "main": 435,
-    "mid": 615,
-    "cb": 795,
-}
+MAIN_LANE_X = 435
 VERSION_NODE_W = 155
 VERSION_ROW_H = 82
 VERSION_Y0 = 52
@@ -430,9 +415,9 @@ def _lane_centers_for(specs):
         seen.add(branch)
         branches.append(branch)
     sides = sorted(branch for branch in branches if branch != "main")
-    centers = {"main": VERSION_LANE_CENTERS["main"]}
+    centers = {"main": MAIN_LANE_X}
     spacing = 190
-    main_x = VERSION_LANE_CENTERS["main"]
+    main_x = MAIN_LANE_X
     for index, branch in enumerate(sides):
         centers[branch] = main_x + (index + 1) * spacing
     return centers
@@ -440,8 +425,8 @@ def _lane_centers_for(specs):
 
 def _version_lane_x(branch, centers=None):
     if not centers:
-        centers = VERSION_LANE_CENTERS
-    center = centers.get(branch, centers.get("main", VERSION_LANE_CENTERS["main"]))
+        centers = {"main": MAIN_LANE_X}
+    center = centers.get(branch, centers.get("main", MAIN_LANE_X))
     return center - VERSION_NODE_W / 2.0
 
 
@@ -534,7 +519,6 @@ def _layout_version_graph(specs):
             "color": color,
             "branch": branch,
             "merge": spec.get("merge", False),
-            "head": spec.get("head", False),
         }
 
     _resolve_vertical_overlaps(positions)
@@ -935,8 +919,6 @@ class _VersionInfoDialog(qt.QDialog):
         history = history or {}
         message = history.get("message") or spec.get("label", "")
         roles = []
-        if spec.get("head"):
-            roles.append("HEAD")
         if checked_out:
             roles.append("Checked out")
         if spec.get("merge"):
@@ -956,8 +938,7 @@ class _VersionInfoDialog(qt.QDialog):
         if spec.get("merge"):
             merge_from = spec.get("merge_from") or []
             add_row("Merge from:", ", ".join(merge_from) if merge_from else "—")
-            merge_into = spec.get("merge_into") or spec.get("parent") or "—"
-            add_row("Merge into:", str(merge_into))
+            add_row("Merge into:", str(spec.get("parent") or "—"))
         add_row("Role:", ", ".join(roles) if roles else "—")
 
         layout.addLayout(form)

@@ -22,7 +22,7 @@ import CollaborativeVersioningLib.GraphCanvas
 import CollaborativeVersioningLib.UiStyles
 
 # Change this string to verify that Reload picked up your edits.
-_UI_BUILD_TAG = "2026-10-05-keep-accepted-lane"
+_UI_BUILD_TAG = "2026-10-05-remove-dead-code"
 
 _LIB_MODULE_NAMES = (
     "CollaborativeVersioningLib.UiStyles",
@@ -787,10 +787,6 @@ class PeopleDialog(qt.QDialog):
         person = self.selected_person()
         can_remove = bool(person) and person.get("role") != "owner"
         self.removeButton.setEnabled(can_remove)
-
-    def clear_username(self) -> None:
-        self.usernameEdit.setText("")
-        self.usernameEdit.setFocus()
 
     def set_status(self, message: str, error: bool = False) -> None:
         text = (message or "").strip()
@@ -2179,8 +2175,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _peopleDisabledReason(self) -> str:
         if not self._connected:
             return "Connect with GitHub first."
-        if not self._hasSelectedProject():
-            return "Select a project first."
         return "Select a project first."
 
     def _canDeleteProject(self) -> bool:
@@ -5281,7 +5275,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
 
 class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
-    """UI MVP — graph rendering. Back-end to be wired later."""
+    """Opens the anatomy tree and version tree dialogs."""
 
     def __init__(self) -> None:
         ScriptedLoadableModuleLogic.__init__(self)

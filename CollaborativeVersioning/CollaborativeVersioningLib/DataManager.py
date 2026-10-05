@@ -1,9 +1,4 @@
-"""
-E3 - Gestionnaire de données pour formats 3D (NIfTI, NRRD, DICOM).
-
-Encapsule les API Slicer pour charger/exporter volumes et segmentations
-utilisés dans le workflow de versioning collaboratif.
-"""
+"""Load and export 3D volumes and segmentations (NIfTI, NRRD, DICOM) for collaborative versioning."""
 
 from __future__ import annotations
 

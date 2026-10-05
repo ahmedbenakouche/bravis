@@ -1060,7 +1060,12 @@ def open_or_update_local_project(full_name: str, mode: str = "update") -> str:
 
 def _history_refs(repo_dir: str) -> list[str]:
     result = _run_git(
-        ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin"],
+        [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/cv-review",
+            "refs/remotes/origin/cv-review",
+        ],
         cwd=repo_dir,
         timeout=30,
     )
@@ -1069,12 +1074,8 @@ def _history_refs(repo_dir: str) -> list[str]:
     refs = []
     for line in (result.stdout or "").splitlines():
         ref = line.strip()
-        if not ref:
-            continue
-        lower = ref.replace("\\", "/").lower()
-        if lower.endswith("/project-info") or lower.endswith("/heads/project-info"):
-            continue
-        refs.append(ref)
+        if ref:
+            refs.append(ref)
     return refs
 
 
@@ -1125,8 +1126,6 @@ def _history_log_refs(repo_dir: str) -> list[str]:
             seen.add(ref)
             refs.append(ref)
     for ref in _history_refs(repo_dir):
-        if "cv-review/" not in ref.replace("\\", "/"):
-            continue
         if ref not in seen:
             seen.add(ref)
             refs.append(ref)
@@ -1196,7 +1195,7 @@ def build_project_history_model(
     tags: dict[str, str] = {}
     sha_by_id: dict[str, str] = {}
 
-    def add_spec(version_id: str, sha: str, parent_id, branch: str, merge_from=None) -> None:
+    def add_spec(version_id: str, sha: str, parent_id, branch: str) -> None:
         if sha in id_by_sha:
             return
         record = commit_by_sha.get(sha) or {}
@@ -1207,11 +1206,8 @@ def build_project_history_model(
             "parent": parent_id,
             "branch": branch,
             "tag": version_id,
-            "head": False,
             "merge": is_merge,
         }
-        if is_merge and merge_from:
-            spec["merge_from"] = list(merge_from)
         id_by_sha[sha] = version_id
         specs_by_id[version_id] = spec
         tags[version_id] = version_id
@@ -1224,13 +1220,7 @@ def build_project_history_model(
         parents = record.get("parents") or []
         first = parents[0] if parents else ""
         parent_id = id_by_sha.get(first)
-        merge_from = []
-        if len(parents) > 1:
-            for extra in parents[1:]:
-                other_id = id_by_sha.get(extra)
-                if other_id:
-                    merge_from.append(other_id)
-        add_spec("main/%d" % index, sha, parent_id, "main", merge_from)
+        add_spec("main/%d" % index, sha, parent_id, "main")
 
     lane_shas: dict[str, list[str]] = {}
 
@@ -1262,20 +1252,6 @@ def build_project_history_model(
             parent_id = id_by_sha.get(first)
             add_spec("%s/%d" % (slug, index), sha, parent_id, slug)
 
-    for extra_id in list(id_by_sha.values()):
-        spec = specs_by_id.get(extra_id) or {}
-        if not spec.get("merge"):
-            continue
-        sha = sha_by_id.get(extra_id) or ""
-        parents = (commit_by_sha.get(sha) or {}).get("parents") or []
-        merge_from = []
-        for extra in parents[1:]:
-            other_id = id_by_sha.get(extra)
-            if other_id:
-                merge_from.append(other_id)
-        if merge_from:
-            spec["merge_from"] = merge_from
-
     leftover = []
     if head_sha:
         for sha in reversed(_first_parent_chain(commit_by_sha, head_sha)):
@@ -1290,18 +1266,15 @@ def build_project_history_model(
         main_count += 1
         add_spec("main/%d" % main_count, sha, parent_id, "main")
 
-    for extra_id, spec in specs_by_id.items():
-        sha = sha_by_id.get(extra_id) or ""
-        if spec.get("merge") and spec.get("merge_from"):
+    for extra_id in list(id_by_sha.values()):
+        spec = specs_by_id.get(extra_id) or {}
+        if not spec.get("merge"):
             continue
-        if spec.get("merge"):
-            parents = (commit_by_sha.get(sha) or {}).get("parents") or []
-            merge_from = [id_by_sha[p] for p in parents[1:] if p in id_by_sha]
-            if merge_from:
-                spec["merge_from"] = merge_from
-
-    if main_tip and main_tip in id_by_sha:
-        specs_by_id[id_by_sha[main_tip]]["head"] = True
+        sha = sha_by_id.get(extra_id) or ""
+        parents = (commit_by_sha.get(sha) or {}).get("parents") or []
+        merge_from = [id_by_sha[p] for p in parents[1:] if p in id_by_sha]
+        if merge_from:
+            spec["merge_from"] = merge_from
 
     accepted_ids = set()
     for spec in specs_by_id.values():
