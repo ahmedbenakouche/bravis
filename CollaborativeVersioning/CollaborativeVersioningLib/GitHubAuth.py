@@ -1075,6 +1075,7 @@ _PEOPLE_RIGHTS_PATH = ".collaborative-versioning/people.json"
 _MESSAGES_PATH = ".collaborative-versioning/messages.json"
 _PROJECT_INFO_BRANCH = "project-info"
 _MESSAGE_MAX_LEN = 2000
+_TASK_TITLE_MAX_LEN = 80
 
 
 def normalize_people_access(value: str | None) -> str:
@@ -1082,6 +1083,28 @@ def normalize_people_access(value: str | None) -> str:
     if text in ("approval", "needs approval", "propose", "review"):
         return PEOPLE_ACCESS_APPROVAL
     return PEOPLE_ACCESS_SHARE
+
+
+def normalize_task_title(value: str | None) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) > _TASK_TITLE_MAX_LEN:
+        text = text[:_TASK_TITLE_MAX_LEN].rstrip()
+    return text
+
+
+def _normalize_people_record(login: str, value) -> dict[str, str]:
+    name = normalize_github_username(login)
+    if isinstance(value, dict):
+        access = value.get("access") or value.get("right") or ""
+        task = value.get("task") or value.get("title") or ""
+    else:
+        access = value
+        task = ""
+    return {
+        "login": name,
+        "access": normalize_people_access(str(access) if access is not None else ""),
+        "task": normalize_task_title(task),
+    }
 
 
 def _decode_github_file_content(payload) -> str:
@@ -1112,7 +1135,7 @@ def _github_contents_payload(owner: str, repo: str, path: str, branch: str):
     return payload
 
 
-def _people_access_map(full_name: str) -> dict[str, str]:
+def _people_records_map(full_name: str) -> dict[str, dict[str, str]]:
     owner, repo = _split_project_name(full_name)
     payload = _github_contents_payload(owner, repo, _PEOPLE_RIGHTS_PATH, _PROJECT_INFO_BRANCH)
     if payload is None:
@@ -1124,13 +1147,20 @@ def _people_access_map(full_name: str) -> dict[str, str]:
     colleagues = document.get("colleagues") if isinstance(document, dict) else None
     if not isinstance(colleagues, dict):
         return {}
-    access_map = {}
-    for login, access in colleagues.items():
+    records = {}
+    for login, value in colleagues.items():
         name = normalize_github_username(str(login))
         if not name:
             continue
-        access_map[name.lower()] = normalize_people_access(str(access))
-    return access_map
+        records[name.lower()] = _normalize_people_record(name, value)
+    return records
+
+
+def _people_access_map(full_name: str) -> dict[str, str]:
+    return {
+        key: str(record.get("access") or PEOPLE_ACCESS_SHARE)
+        for key, record in _people_records_map(full_name).items()
+    }
 
 
 def _people_rights_file_sha(owner: str, repo: str) -> str:
@@ -1186,14 +1216,19 @@ def ensure_project_info_branch(full_name: str) -> None:
     _ensure_people_rights_branch(owner, repo)
 
 
-def _write_people_access_map(full_name: str, access_map: dict[str, str]) -> None:
+def _write_people_records_map(full_name: str, records: dict[str, dict[str, str]]) -> None:
     owner, repo = _split_project_name(full_name)
     colleagues = {}
-    for login, access in (access_map or {}).items():
-        name = normalize_github_username(str(login))
+    for login, record in (records or {}).items():
+        stored = record if isinstance(record, dict) else {}
+        name = normalize_github_username(str(stored.get("login") or login))
         if not name:
             continue
-        colleagues[name] = normalize_people_access(access)
+        entry: dict[str, str] = {"access": normalize_people_access(stored.get("access"))}
+        task = normalize_task_title(stored.get("task"))
+        if task:
+            entry["task"] = task
+        colleagues[name] = entry
     document = json.dumps({"colleagues": colleagues}, separators=(",", ":"), sort_keys=True)
     encoded = base64.b64encode(document.encode("utf-8")).decode("ascii")
     args = [
@@ -1217,17 +1252,22 @@ def _write_people_access_map(full_name: str, access_map: dict[str, str]) -> None
         raise GitHubAuthError("Could not record colleague access.\n%s" % detail[:400])
 
 
-def set_people_access(full_name: str, username: str, access: str) -> None:
+def set_people_access(full_name: str, username: str, access: str, task: str | None = None) -> None:
     name = normalize_github_username(username)
     if not name:
         raise GitHubAuthError("Enter a GitHub username.")
-    access_map = {
-        login: value
-        for login, value in _people_access_map(full_name).items()
-        if login.lower() != name.lower()
+    current = _people_records_map(full_name)
+    previous = current.get(name.lower()) or {}
+    kept_task = previous.get("task") or ""
+    if task is not None:
+        kept_task = normalize_task_title(task)
+    records = {key: value for key, value in current.items() if key != name.lower()}
+    records[name.lower()] = {
+        "login": name,
+        "access": normalize_people_access(access),
+        "task": kept_task,
     }
-    access_map[name] = normalize_people_access(access)
-    _write_people_access_map(full_name, access_map)
+    _write_people_records_map(full_name, records)
 
 
 def _is_github_missing(result) -> bool:
@@ -1359,23 +1399,28 @@ def forget_people_access(full_name: str, username: str) -> None:
     if not name:
         return
     try:
-        access_map = _people_access_map(full_name)
-        cleaned = {
-            login: value
-            for login, value in access_map.items()
-            if login.lower() != name.lower()
-        }
-        if cleaned == access_map:
+        records = _people_records_map(full_name)
+        cleaned = {key: value for key, value in records.items() if key != name.lower()}
+        if cleaned == records:
             return
-        _write_people_access_map(full_name, cleaned)
+        _write_people_records_map(full_name, cleaned)
     except (GitHubAuthError, OSError, ValueError):
         return
+
+
+def _person_task_fields(records: dict[str, dict[str, str]], login: str) -> dict[str, str]:
+    record = records.get(login.lower()) or {}
+    task = normalize_task_title(record.get("task"))
+    fields = {"access": record.get("access") or PEOPLE_ACCESS_SHARE}
+    if task:
+        fields["task"] = task
+    return fields
 
 
 def list_project_people(full_name: str) -> list[dict[str, str]]:
     """Owner, colleagues, and pending invitations for a project."""
     owner, repo = _split_project_name(full_name)
-    access_map = _people_access_map(full_name)
+    records = _people_records_map(full_name)
     people: list[dict[str, str]] = [{"login": owner, "role": "owner"}]
     seen = {owner.lower()}
     collab = _run_gh(
@@ -1392,13 +1437,9 @@ def list_project_people(full_name: str) -> list[dict[str, str]]:
             if not login or login.lower() in seen:
                 continue
             seen.add(login.lower())
-            colleagues.append(
-                {
-                    "login": login,
-                    "role": "colleague",
-                    "access": access_map.get(login.lower()) or PEOPLE_ACCESS_SHARE,
-                }
-            )
+            person = {"login": login, "role": "colleague"}
+            person.update(_person_task_fields(records, login))
+            colleagues.append(person)
         colleagues.sort(key=lambda item: item["login"].lower())
         people.extend(colleagues)
     invites = _run_gh(
@@ -1426,20 +1467,24 @@ def list_project_people(full_name: str) -> list[dict[str, str]]:
             if not login or login.lower() in seen:
                 continue
             seen.add(login.lower())
-            pending.append(
-                {
-                    "login": login,
-                    "role": "pending",
-                    "invitation_id": item.get("id"),
-                    "access": access_map.get(login.lower()) or PEOPLE_ACCESS_SHARE,
-                }
-            )
+            person = {
+                "login": login,
+                "role": "pending",
+                "invitation_id": item.get("id"),
+            }
+            person.update(_person_task_fields(records, login))
+            pending.append(person)
         pending.sort(key=lambda item: item["login"].lower())
         people.extend(pending)
     return people
 
 
-def invite_project_colleague(full_name: str, username: str, access: str = PEOPLE_ACCESS_SHARE) -> str:
+def invite_project_colleague(
+    full_name: str,
+    username: str,
+    access: str = PEOPLE_ACCESS_SHARE,
+    task: str = "",
+) -> str:
     """Invite a GitHub user with write access. Returns invited or already."""
     owner, repo = _split_project_name(full_name)
     name = normalize_github_username(username)
@@ -1467,7 +1512,7 @@ def invite_project_colleague(full_name: str, username: str, access: str = PEOPLE
         if "not found" in lower or "404" in lower:
             raise GitHubAuthError("GitHub user not found: %s." % name)
         raise GitHubAuthError("Could not send the invitation.\n%s" % detail[:400])
-    set_people_access(full_name, name, chosen)
+    set_people_access(full_name, name, chosen, task=task)
     if not (result.stdout or "").strip():
         return "already"
     return "invited"

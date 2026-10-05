@@ -22,7 +22,7 @@ import CollaborativeVersioningLib.GraphCanvas
 import CollaborativeVersioningLib.UiStyles
 
 # Change this string to verify that Reload picked up your edits.
-_UI_BUILD_TAG = "2026-09-29-switch-keep-views"
+_UI_BUILD_TAG = "2026-10-05-people-task-title"
 
 _LIB_MODULE_NAMES = (
     "CollaborativeVersioningLib.UiStyles",
@@ -71,6 +71,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     parse_share_request_search_output,
     list_project_people,
     parse_project_messages_output,
+    normalize_task_title,
     project_messages_fetch_args,
     project_messages_put_args,
     build_project_message,
@@ -363,7 +364,7 @@ class PeopleDialog(qt.QDialog):
     def __init__(self, parent=None, people=None, can_add=False) -> None:
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("People")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(460)
         self.setModal(True)
         self._people = []
         self._can_add = bool(can_add)
@@ -378,8 +379,12 @@ class PeopleDialog(qt.QDialog):
         layout.addWidget(people_label)
 
         self.peopleList = qt.QListWidget()
-        self.peopleList.setMinimumHeight(96)
-        self.peopleList.setMaximumHeight(140)
+        self.peopleList.setMinimumHeight(110)
+        self.peopleList.setMaximumHeight(170)
+        try:
+            self.peopleList.setWordWrap(True)
+        except (TypeError, AttributeError, RuntimeError):
+            pass
         if self._can_add:
             self.peopleList.setSelectionMode(qt.QAbstractItemView.SingleSelection)
         else:
@@ -402,6 +407,11 @@ class PeopleDialog(qt.QDialog):
         self.accessCombo.addItem("Can share")
         self.accessCombo.addItem("Needs approval")
         form.addRow("Access:", self.accessCombo)
+        self.taskTitleEdit = qt.QLineEdit()
+        self.taskTitleEdit.setPlaceholderText("Optional — what they should work on")
+        self.taskTitleEdit.setMaxLength(80)
+        self.taskTitleEdit.setStyleSheet(FIELD_STYLE)
+        form.addRow("Task title:", self.taskTitleEdit)
         add_layout.addLayout(form)
         self.suggestionList = qt.QListWidget()
         self.suggestionList.setMaximumHeight(120)
@@ -421,7 +431,8 @@ class PeopleDialog(qt.QDialog):
         add_layout.addWidget(self.suggestionList)
         owner_hint = qt.QLabel(
             "They will receive a GitHub invitation. After they accept, this project appears in their list.\n"
-            "Can share: they publish versions themselves. Needs approval: they send a request for you to review."
+            "Can share: they publish versions themselves. Needs approval: they send a request for you to review.\n"
+            "Task title is optional. Everyone on People can see it."
         )
         owner_hint.setWordWrap(True)
         owner_hint.setStyleSheet(DIALOG_HINT_STYLE)
@@ -513,7 +524,7 @@ class PeopleDialog(qt.QDialog):
     def _restoreIdleSize(self) -> None:
         try:
             self.setMinimumHeight(0)
-            self.setMinimumWidth(420)
+            self.setMinimumWidth(460)
         except RuntimeError:
             pass
         idle = getattr(self, "_idleSize", None)
@@ -696,6 +707,15 @@ class PeopleDialog(qt.QDialog):
             text = ""
         return str(text or "").strip().lstrip("@")
 
+    def task_title(self) -> str:
+        try:
+            text = self.taskTitleEdit.text
+            if callable(text):
+                text = text()
+        except (TypeError, AttributeError, RuntimeError):
+            text = ""
+        return normalize_task_title(text)
+
     def people(self) -> list:
         return list(self._people)
 
@@ -710,6 +730,7 @@ class PeopleDialog(qt.QDialog):
             login = str(person.get("login") or "").strip()
             role = str(person.get("role") or "")
             access = str(person.get("access") or "share")
+            task = str(person.get("task") or "").strip()
             access_label = "Needs approval" if access == "approval" else "Can share"
             if role == "owner":
                 label = "%s (owner)" % login
@@ -717,7 +738,19 @@ class PeopleDialog(qt.QDialog):
                 label = "%s (invitation pending · %s)" % (login, access_label)
             else:
                 label = "%s (%s)" % (login, access_label)
+            if task:
+                label = "%s — %s" % (label, task)
             self.peopleList.addItem(label)
+            if task:
+                try:
+                    count = self.peopleList.count
+                    if callable(count):
+                        count = count()
+                    item = self.peopleList.item(int(count) - 1)
+                    if item is not None:
+                        item.setToolTip(task)
+                except (TypeError, RuntimeError, AttributeError, ValueError):
+                    pass
         self._updateRemoveEnabled()
 
     def selected_person(self):
@@ -3311,7 +3344,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             else:
                 dialog.set_status("%s is already on this project." % login, error=True)
             return
-        self._pending_people_action = ("add", {"username": username, "access": dialog.selected_access()})
+        self._pending_people_action = ("add", {
+            "username": username,
+            "access": dialog.selected_access(),
+            "task": dialog.task_title(),
+        })
         self._closePeopleDialog(dialog)
 
     def _queueRemoveColleague(self, full_name: str, dialog) -> None:
@@ -3342,14 +3379,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if isinstance(payload, dict):
             username = str(payload.get("username") or "").strip()
             access = str(payload.get("access") or "share")
+            task = str(payload.get("task") or "").strip()
         else:
             username = str(payload or "").strip()
             access = "share"
+            task = ""
         access_label = "Needs approval" if access == "approval" else "Can share"
         self._openProgress("People", "Adding colleague…")
         try:
             self._updateProgress("Adding colleague…")
-            outcome = invite_project_colleague(full_name, username, access)
+            outcome = invite_project_colleague(full_name, username, access, task=task)
             self._updateProgress("Updating the people list…")
             people = list_project_people(full_name)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
@@ -3364,6 +3403,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "Invitation sent to %s (%s). They can join from 3D Slicer after they Connect."
                 % (username, access_label)
             )
+            if task:
+                message = "%s Task: %s." % (message, task)
         self._appendFeed(message)
         return people
 
