@@ -4,9 +4,9 @@ project(CollaborativeVersioning)
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
-set(EXTENSION_HOMEPAGE "https://www.isir.upmc.fr")
-set(EXTENSION_CONTRIBUTORS "Ahmed Ben Akouche (ISIR); Julien Gori (CNRS); Sinan Haliyo (Sorbonne Université)")
-set(EXTENSION_DESCRIPTION "Collaborative versioning for 3D image annotations — E2 UI MVP and E3 data manager (NIfTI, NRRD, DICOM)")
+set(EXTENSION_HOMEPAGE "")
+set(EXTENSION_CONTRIBUTORS "Ahmed Ben Akouche (ISIR)")
+set(EXTENSION_DESCRIPTION "Collaborative versioning for 3D image annotations ...")
 set(EXTENSION_ICONURL "https://www.example.com/Slicer/Extensions/CollaborativeVersioning.png")
 set(EXTENSION_SCREENSHOTURLS "https://www.example.com/Slicer/Extensions/CollaborativeVersioning/Screenshots/1.png")
 set(EXTENSION_DEPENDS "NA")

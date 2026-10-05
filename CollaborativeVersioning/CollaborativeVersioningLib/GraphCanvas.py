@@ -3,25 +3,31 @@
 import qt
 from collections import defaultdict
 
-from CollaborativeVersioningLib.simulation.DemoData import (
-    VERSION_BRANCH_COLORS,
-    VERSION_LANE_CENTERS,
-)
+from CollaborativeVersioningLib import UiStyles as _ui
 
-GRAPH_BUILD_TAG = "2026-07-19-graph-version-v48-en"
+MAIN_COLOR = _ui.ACCENT_INDIGO
 
-CHECKOUT_POINTER_COLOR = "#5b9fd4"
+VERSION_BRANCH_COLORS = {
+    "main": _ui.ACCENT_INDIGO,
+    "mid": _ui.ACCENT_ICE,
+    "limb": _ui.ACCENT_AMBER,
+    "cb": "#ea580c" if not _ui.IS_DARK else "#fb923c",
+    "fore": _ui.ACCENT_MINT,
+}
 
-MAIN_COLOR = "#818cf8"
-GRAPH_BG = "#2a2a2a"
+VERSION_LANE_CENTERS = {
+    "limb": 95,
+    "fore": 265,
+    "main": 435,
+    "mid": 615,
+    "cb": 795,
+}
 VERSION_NODE_W = 155
 VERSION_ROW_H = 82
 VERSION_Y0 = 52
 VERSION_ROW_GAP = 14
 
 
-H_GAP = 18
-V_GAP = 52
 DEPENDENCY_H_GAP = 28
 DEPENDENCY_V_GAP = 78
 MARGIN = 24
@@ -31,6 +37,9 @@ NODE_FONT_SIZE = 7
 NODE_PADDING_X = 16
 NODE_PADDING_Y = 10
 GRAPH_NAME_MAX_LEN = 22
+COVERAGE_BADGE_RADIUS = 4.5
+COVERAGE_BADGE_INSET = 9
+COVERAGE_BADGE_RESERVE = 18
 
 
 def _node_font(font_size=NODE_FONT_SIZE):
@@ -79,6 +88,97 @@ def _fit_caption_to_width(caption, max_inner_width, font_size=NODE_FONT_SIZE):
     while caption and _measure_text_width(caption + "…", font_size) > max_inner_width:
         caption = caption[:-1]
     return (caption + "…") if caption else "…"
+
+
+def _ontology_id_key(value):
+    text = str(value).strip()
+    if text.isdigit():
+        return str(int(text))
+    return text
+
+
+def _coverage_self_color(added):
+    return _ui.ACCENT_MINT if added else _ui.TEXT_MUTED
+
+
+def _coverage_children_color(status):
+    if status == "all":
+        return _ui.ACCENT_INDIGO
+    if status == "some":
+        return _ui.ACCENT_AMBER
+    return _ui.TEXT_MUTED
+
+
+def _coverage_self_label(added):
+    return "Has an annotation" if added else "No annotation"
+
+
+def _coverage_children_label(status):
+    if status == "all":
+        return "All children have an annotation"
+    if status == "some":
+        return "Some children have an annotation"
+    if status == "none":
+        return "No children have an annotation"
+    return "—"
+
+
+def _coverage_by_id(specs, painted_ids):
+    """Per node: this structure added (bool) and children coverage (all/some/none/None)."""
+    painted = {_ontology_id_key(item) for item in (painted_ids or [])}
+    children_map = _build_children_map(specs)
+    self_added = {
+        spec["id"]: _ontology_id_key(spec["id"]) in painted for spec in specs
+    }
+    coverage = {}
+    leaf_cache = {}
+
+    def leaf_counts(node_id):
+        cached = leaf_cache.get(node_id)
+        if cached is not None:
+            return cached
+        child_ids = children_map.get(node_id, [])
+        if not child_ids:
+            result = (1 if self_added.get(node_id) else 0, 1)
+            leaf_cache[node_id] = result
+            return result
+        added = 0
+        total = 0
+        for child_id in child_ids:
+            child_added, child_total = leaf_counts(child_id)
+            added += child_added
+            total += child_total
+        result = (added, total)
+        leaf_cache[node_id] = result
+        return result
+
+    for spec in specs:
+        node_id = spec["id"]
+        child_ids = children_map.get(node_id, [])
+        if not child_ids:
+            coverage[node_id] = {"self": bool(self_added.get(node_id)), "children": None}
+            continue
+        added, total = leaf_counts(node_id)
+        if total <= 0 or added <= 0:
+            children_status = "none"
+        elif added >= total:
+            children_status = "all"
+        else:
+            children_status = "some"
+        coverage[node_id] = {
+            "self": bool(self_added.get(node_id)),
+            "children": children_status,
+        }
+    return coverage
+
+
+def _leaf_annotation_counts(specs, coverage_map):
+    children_map = _build_children_map(specs)
+    leaves = [spec["id"] for spec in specs if not children_map.get(spec["id"])]
+    added = sum(
+        1 for node_id in leaves if (coverage_map.get(node_id) or {}).get("self")
+    )
+    return added, len(leaves)
 
 
 def _graph_display_label(spec):
@@ -152,7 +252,7 @@ def _collapsible_node_caption(spec, expanded_ids, children_map):
     return caption, True, expanded, hidden
 
 
-def _layout_hierarchy(specs, expanded_ids=None, full_children_map=None, h_gap=H_GAP, v_gap=V_GAP):
+def _layout_hierarchy(specs, expanded_ids=None, full_children_map=None, h_gap=DEPENDENCY_H_GAP, v_gap=DEPENDENCY_V_GAP):
     """Compute x/y positions for a hierarchical tree."""
     specs_by_id = {spec["id"]: dict(spec) for spec in specs}
     children_map = _build_children_map(specs)
@@ -168,7 +268,7 @@ def _layout_hierarchy(specs, expanded_ids=None, full_children_map=None, h_gap=H_
             caption, _, _, _ = _collapsible_node_caption(
                 specs_by_id[node_id], expanded_ids, full_children_map
             )
-            return _measure_node_size(caption)[0] + h_gap
+            return _measure_node_size(caption)[0] + 2 * COVERAGE_BADGE_RESERVE + h_gap
         return sum(subtree_width(child_id) for child_id in children)
 
     positions = {}
@@ -179,6 +279,7 @@ def _layout_hierarchy(specs, expanded_ids=None, full_children_map=None, h_gap=H_
             spec, expanded_ids, full_children_map
         )
         width, height = _measure_node_size(caption)
+        width += 2 * COVERAGE_BADGE_RESERVE
         children = children_map.get(node_id, [])
 
         if not children:
@@ -224,30 +325,79 @@ def _node_center(node):
     return node["x"] + node["w"] / 2.0, node["y"] + node["h"] / 2.0
 
 
-def _draw_box_node(scene, node, font_size=NODE_FONT_SIZE):
+def _draw_box_node(scene, node, font_size=NODE_FONT_SIZE, coverage=None):
     x, y, w, h = node["x"], node["y"], node["w"], node["h"]
     color = node["color"]
     scene.addRect(
         x, y, w, h,
         qt.QPen(qt.QColor(color), 2),
-        qt.QBrush(qt.QColor("#252525")),
+        qt.QBrush(qt.QColor(_ui.GRAPH_NODE_FILL)),
     )
-    inner_w = max(8, w - NODE_PADDING_X)
+    inner_w = max(8, w - NODE_PADDING_X - 2 * COVERAGE_BADGE_RESERVE)
     text = _fit_caption_to_width(node["label"], inner_w, font_size)
     label = scene.addText(text)
     label.setFont(_node_font(font_size))
-    label.setDefaultTextColor(qt.QColor("#eeeeee"))
+    label.setDefaultTextColor(qt.QColor(_ui.GRAPH_NODE_TEXT))
     bounds = label.boundingRect()
     label.setPos(x + (w - bounds.width()) / 2.0, y + (h - bounds.height()) / 2.0)
+    if coverage is not None:
+        _draw_coverage_badges(scene, x, y, w, coverage)
 
 
-def _draw_tree_edge(scene, parent, child, color="#555555", width=2, dashed=False):
+def _draw_coverage_dot(scene, cx, cy, radius, filled, color_hex):
+    color = qt.QColor(color_hex)
+    if filled:
+        scene.addEllipse(
+            cx - radius,
+            cy - radius,
+            radius * 2,
+            radius * 2,
+            qt.QPen(color, 1),
+            qt.QBrush(color),
+        )
+        return
+    scene.addEllipse(
+        cx - radius,
+        cy - radius,
+        radius * 2,
+        radius * 2,
+        qt.QPen(color, 1.4),
+        qt.QBrush(qt.QColor(_ui.GRAPH_NODE_FILL)),
+    )
+
+
+def _draw_coverage_badges(scene, x, y, w, coverage):
+    radius = COVERAGE_BADGE_RADIUS
+    cy = y + COVERAGE_BADGE_INSET
+    self_added = bool(coverage.get("self"))
+    children_status = coverage.get("children")
+    _draw_coverage_dot(
+        scene,
+        x + COVERAGE_BADGE_INSET,
+        cy,
+        radius,
+        self_added,
+        _coverage_self_color(self_added),
+    )
+    if children_status is None:
+        return
+    _draw_coverage_dot(
+        scene,
+        x + w - COVERAGE_BADGE_INSET,
+        cy,
+        radius,
+        children_status != "none",
+        _coverage_children_color(children_status),
+    )
+
+
+def _draw_tree_edge(scene, parent, child, color=None, width=2):
+    if color is None:
+        color = _ui.GRAPH_EDGE
     px, _ = _node_center(parent)
     cx, _ = _node_center(child)
     mid_y = parent["y"] + parent["h"] + (child["y"] - parent["y"] - parent["h"]) / 2.0
     pen = qt.QPen(qt.QColor(color), width)
-    if dashed:
-        pen.setStyle(qt.Qt.DashLine)
     scene.addLine(px, parent["y"] + parent["h"], px, mid_y, pen)
     scene.addLine(px, mid_y, cx, mid_y, pen)
     scene.addLine(cx, mid_y, cx, child["y"], pen)
@@ -309,7 +459,6 @@ def _resolve_vertical_overlaps(positions):
 def _version_graph_edges(specs):
     specs_by_id = {spec["id"]: spec for spec in specs}
     edges = []
-    merge_edge_pairs = set()
     for spec in specs:
         node_id = spec["id"]
         if spec.get("parent"):
@@ -321,8 +470,7 @@ def _version_graph_edges(specs):
                     continue
                 branch = specs_by_id.get(merge_id, {}).get("branch", "main")
                 edges.append((merge_id, merge_target, branch))
-                merge_edge_pairs.add((merge_id, merge_target))
-    return edges, merge_edge_pairs
+    return edges
 
 
 def _layout_version_graph(specs):
@@ -353,8 +501,7 @@ def _layout_version_graph(specs):
 
     _resolve_vertical_overlaps(positions)
 
-    edges, merge_edge_pairs = _version_graph_edges(specs)
-    return positions, edges, merge_edge_pairs
+    return positions, _version_graph_edges(specs)
 
 
 def _main_trunk_order(specs):
@@ -386,7 +533,7 @@ def _main_trunk_order(specs):
 
 
 def _draw_main_trunk(scene, positions, trunk_order):
-    pen = qt.QPen(qt.QColor(MAIN_COLOR), 4)
+    pen = qt.QPen(qt.QColor(_ui.ACCENT_INDIGO), 4)
     for index in range(len(trunk_order) - 1):
         upper = positions[trunk_order[index + 1]]
         lower = positions[trunk_order[index]]
@@ -402,14 +549,14 @@ def _draw_version_box_node(scene, node, font_size=7):
     scene.addRect(
         x, y, w, h,
         qt.QPen(qt.QColor(color), border),
-        qt.QBrush(qt.QColor("#252525")),
+        qt.QBrush(qt.QColor(_ui.GRAPH_NODE_FILL)),
     )
     text = node["label"]
     if len(text) > 22:
         text = text[:19] + "..."
     label = scene.addText(text)
     label.setFont(qt.QFont("Arial", font_size, qt.QFont.Bold))
-    label.setDefaultTextColor(qt.QColor("#eeeeee"))
+    label.setDefaultTextColor(qt.QColor(_ui.GRAPH_NODE_TEXT))
     bounds = label.boundingRect()
     label.setPos(x + (w - bounds.width()) / 2.0, y + (h - bounds.height()) / 2.0)
 
@@ -425,8 +572,8 @@ def _draw_checkout_pointer(scene, node):
     ]
     scene.addPolygon(
         qt.QPolygonF(points),
-        qt.QPen(qt.QColor(CHECKOUT_POINTER_COLOR), 1),
-        qt.QBrush(qt.QColor(CHECKOUT_POINTER_COLOR)),
+        qt.QPen(qt.QColor(_ui.ACCENT_ICE), 1),
+        qt.QBrush(qt.QColor(_ui.ACCENT_ICE)),
     )
 
 
@@ -450,6 +597,18 @@ class InteractiveGraphView(qt.QGraphicsView):
         self.setHorizontalScrollBarPolicy(qt.Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(qt.Qt.ScrollBarAsNeeded)
         self._zoom_level = 1.0
+        self._sync_scene_background()
+
+    def _sync_scene_background(self):
+        scene = getattr(self, "_graphe_scene", None)
+        if scene is None:
+            return
+        try:
+            role = getattr(qt.QPalette, "Base", None) or getattr(qt.QPalette, "Window", None)
+            color = self.palette().color(role)
+            scene.setBackgroundBrush(qt.QBrush(color))
+        except Exception:
+            scene.setBackgroundBrush(qt.QBrush(qt.QColor(_ui.GRAPH_BG)))
 
     def _pad_scene_rect(self, margin=100):
         rect = self._graphe_scene.sceneRect
@@ -504,15 +663,7 @@ class InteractiveGraphView(qt.QGraphicsView):
                 layout.addWidget(widget)
         layout.addStretch(1)
 
-        btn_style_hover = (
-            "QPushButton {"
-            "  background-color: #383838; color: #eef2f7; border: 1px solid #505050;"
-            "  padding: 5px 12px; border-radius: 4px; font-size: 11px; font-weight: 600;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: #5b9fd4; color: #161920; border-color: #5b9fd4;"
-            "}"
-        )
+        btn_style_hover = _ui.BTN_SECONDARY
         btn_zoom_in = qt.QPushButton("Zoom in")
         btn_zoom_out = qt.QPushButton("Zoom out")
         btn_reset = qt.QPushButton("Reset view")
@@ -544,13 +695,12 @@ def commit_history_lookup(commit_history):
 
 
 class VersionHistoryCanvas(InteractiveGraphView):
-    """Graphe de versions — noeuds cliquables en mode import."""
+    """Graphe de versions — clic pour check-out, double-clic pour les details."""
 
     def __init__(
         self,
         logic,
         version_specs=None,
-        selection_mode=False,
         graph_title=None,
         graph_description=None,
         active_version_id=None,
@@ -560,7 +710,6 @@ class VersionHistoryCanvas(InteractiveGraphView):
         InteractiveGraphView.__init__(self, parent)
         self.logic = logic
         self.version_specs = version_specs if version_specs is not None else []
-        self.selection_mode = selection_mode
         self.graph_title = graph_title or "Version tree"
         self.graph_description = graph_description or ""
         self.active_version_id = active_version_id
@@ -576,12 +725,9 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.setScene(graphe_scene)
         self._graphe_scene = graphe_scene
         self.setRenderHints(qt.QPainter.Antialiasing | qt.QPainter.TextAntialiasing)
-        self.setStyleSheet(f"background-color: {GRAPH_BG}; border: none;")
+        self.setStyleSheet("background-color: palette(base); border: none;")
         self.setMinimumHeight(480)
         self._setup_interaction()
-        if self.selection_mode:
-            self.setDragMode(qt.QGraphicsView.NoDrag)
-            self.setCursor(qt.QCursor(qt.Qt.PointingHandCursor))
         self.draw()
         self._pad_scene_rect()
         self.reset_view()
@@ -594,13 +740,8 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self._pad_scene_rect()
 
     def create_toolbar(self):
-        if self.selection_mode:
-            hint = qt.QLabel("Click a node to import · Double-click for details")
-        else:
-            hint = qt.QLabel(
-                "Click a node to check out (simulation) · Double-click for details"
-            )
-        hint.setStyleSheet("color: #6b7789; font-size: 10px;")
+        hint = qt.QLabel("Click a node to check out · Double-click for details")
+        hint.setStyleSheet("color: %s; font-size: 10px;" % _ui.GRAPH_HINT)
         return InteractiveGraphView.create_toolbar(self, leading_widgets=[hint])
 
     def _show_version_info(self, node_id):
@@ -617,9 +758,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self._pending_node_id = None
         if not node_id:
             return
-        if self.selection_mode and hasattr(self.logic, "onVersionNodeSelected"):
-            self.logic.onVersionNodeSelected(node_id)
-        elif not self.selection_mode and hasattr(self.logic, "onVersionCheckedOut"):
+        if hasattr(self.logic, "onVersionCheckedOut"):
             self.logic.onVersionCheckedOut(node_id)
 
     def showEvent(self, event):
@@ -653,16 +792,17 @@ class VersionHistoryCanvas(InteractiveGraphView):
         qt.QGraphicsView.mouseDoubleClickEvent(self, event)
 
     def draw(self):
+        self._sync_scene_background()
         self._graphe_scene.clear()
         if not self.version_specs:
             hint = self._graphe_scene.addText("No versions to display.")
-            hint.setDefaultTextColor(qt.QColor("#888888"))
+            hint.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT))
             hint.setPos(MARGIN, MARGIN)
             self._graphe_scene.setSceneRect(0, 0, 400, 200)
             self._nodes_by_id = {}
             return
 
-        positions, edges, _ = _layout_version_graph(self.version_specs)
+        positions, edges = _layout_version_graph(self.version_specs)
         self._nodes_by_id = positions
         nodes_by_id = positions
         trunk_order = _main_trunk_order(self.version_specs)
@@ -676,14 +816,13 @@ class VersionHistoryCanvas(InteractiveGraphView):
                 continue
             if (parent_id, child_id) in trunk_pairs:
                 continue
-            edge_color = VERSION_BRANCH_COLORS.get(branch, "#555555")
+            edge_color = VERSION_BRANCH_COLORS.get(branch, _ui.GRAPH_EDGE)
             _draw_tree_edge(
                 self._graphe_scene,
                 nodes_by_id[parent_id],
                 nodes_by_id[child_id],
                 color=edge_color,
                 width=2,
-                dashed=False,
             )
 
         for node in nodes_by_id.values():
@@ -696,25 +835,22 @@ class VersionHistoryCanvas(InteractiveGraphView):
         scene_h = max_y + NODE_H + 40
         self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + 28)
 
-        if self.selection_mode:
-            title_text = "Click a node to import that version"
-        else:
-            title_text = "%s — %d version(s) · main branch centered" % (
-                self.graph_title,
-                len(nodes_by_id),
-            )
-            if self.active_version_id:
-                active_label = self.active_version_id
-                for spec in self.version_specs:
-                    if spec.get("id") == self.active_version_id:
-                        active_label = spec.get("tag") or active_label
-                        break
-                title_text += " · checked out: %s" % active_label
-            if self.graph_description:
-                title_text += " — " + self.graph_description
+        title_text = "%s — %d version(s) · main branch centered" % (
+            self.graph_title,
+            len(nodes_by_id),
+        )
+        if self.active_version_id:
+            active_label = self.active_version_id
+            for spec in self.version_specs:
+                if spec.get("id") == self.active_version_id:
+                    active_label = spec.get("tag") or active_label
+                    break
+            title_text += " · checked out: %s" % active_label
+        if self.graph_description:
+            title_text += " — " + self.graph_description
         title = self._graphe_scene.addText(title_text)
         title.setFont(qt.QFont("Arial", 8))
-        title.setDefaultTextColor(qt.QColor("#777777"))
+        title.setDefaultTextColor(qt.QColor(_ui.GRAPH_TITLE))
         title.setPos(MARGIN, scene_h + 4)
 
 
@@ -793,10 +929,46 @@ class _VersionInfoDialog(qt.QDialog):
         layout.addLayout(footer)
 
 
+COVERAGE_HELP_TEXT = """Left mark (top-left corner)
+A filled mint circle means this structure has an annotation in Slicer (a region named Segment_ID, for example Segment_64).
+The annotation may still be empty: the region exists, but nothing may have been painted yet.
+An empty circle means this structure has no annotation.
+
+Right mark (top-right corner)
+Shown on parent structures only. Lowest-level structures have no right mark.
+• Indigo, filled: every lowest-level structure under this one has an annotation.
+• Amber, filled: some, but not all, of those structures have an annotation.
+• Empty circle: none of the structures under this one have an annotation.
+
+The two marks are independent. A parent can have an annotation of its own (left filled) while only some children do (right amber).
+"""
+
+
+class _CoverageHelpDialog(qt.QDialog):
+    """Explains the left/right coverage marks on the anatomy tree."""
+
+    def __init__(self, parent=None):
+        qt.QDialog.__init__(self, parent)
+        self.setWindowTitle("Anatomy tree marks")
+        self.setMinimumSize(520, 380)
+        layout = qt.QVBoxLayout(self)
+        body = qt.QTextEdit()
+        body.setReadOnly(True)
+        body.setPlainText(COVERAGE_HELP_TEXT.strip())
+        body.setStyleSheet("font-size: 12px;")
+        layout.addWidget(body, 1)
+        close_btn = qt.QPushButton("Close")
+        close_btn.connect("clicked()", self.accept)
+        row = qt.QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+
 class _StructureInfoDialog(qt.QDialog):
     """Read-only details for a dependency graph node."""
 
-    def __init__(self, parent, spec):
+    def __init__(self, parent, spec, coverage=None):
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("Structure details")
         self.setMinimumWidth(420)
@@ -813,6 +985,9 @@ class _StructureInfoDialog(qt.QDialog):
         add_row("Name:", str(spec.get("label", "")))
         acronym = str(spec.get("symbol", "")).strip()
         add_row("Acronym:", acronym if acronym else "—")
+        coverage = coverage or {}
+        add_row("Left mark:", _coverage_self_label(bool(coverage.get("self"))) if coverage else "—")
+        add_row("Right mark:", _coverage_children_label(coverage.get("children")) if coverage else "—")
         layout.addLayout(form)
 
         footer = qt.QHBoxLayout()
@@ -832,6 +1007,7 @@ class DependencyGraphCanvas(InteractiveGraphView):
         dependency_specs=None,
         graph_title=None,
         graph_description=None,
+        painted_ids=None,
         parent=None,
     ):
         InteractiveGraphView.__init__(self, parent)
@@ -840,6 +1016,12 @@ class DependencyGraphCanvas(InteractiveGraphView):
         self.dependency_specs = self._all_specs
         self.graph_title = graph_title or "Project ontology"
         self.graph_description = graph_description or ""
+        self._painted_ids = {_ontology_id_key(item) for item in (painted_ids or [])}
+        self._coverage_ready = painted_ids is not None
+        self._coverage_map = {}
+        self._coverageLegendLeft = None
+        self._coverageLegendRight = None
+        self._coverageCount = None
         self._full_children_map = _build_children_map(self._all_specs)
         self._expanded_ids = _default_expanded_ids(self._all_specs)
         self._nodes_by_id = {}
@@ -853,29 +1035,48 @@ class DependencyGraphCanvas(InteractiveGraphView):
         self.setScene(graphe_scene)
         self._graphe_scene = graphe_scene
         self.setRenderHints(qt.QPainter.Antialiasing | qt.QPainter.TextAntialiasing)
-        self.setStyleSheet(f"background-color: {GRAPH_BG}; border: none;")
+        self.setStyleSheet("background-color: palette(base); border: none;")
         self.setMinimumHeight(480)
         self._setup_interaction()
         self.draw()
         self._pad_scene_rect()
         self.reset_view()
 
-    def set_specs(self, dependency_specs, graph_title=None, graph_description=None):
+    def set_specs(self, dependency_specs, graph_title=None, graph_description=None, painted_ids=None, preserve_expansion=False):
+        previous_expanded = set(getattr(self, "_expanded_ids", set()) or set())
         self._all_specs = list(dependency_specs or [])
         self.dependency_specs = self._all_specs
         self._full_children_map = _build_children_map(self._all_specs)
-        self._expanded_ids = _default_expanded_ids(self._all_specs)
+        if preserve_expansion and previous_expanded:
+            valid_ids = {spec["id"] for spec in self._all_specs}
+            kept = previous_expanded.intersection(valid_ids)
+            self._expanded_ids = kept or _default_expanded_ids(self._all_specs)
+        else:
+            self._expanded_ids = _default_expanded_ids(self._all_specs)
         if graph_title is not None:
             self.graph_title = graph_title
         if graph_description is not None:
             self.graph_description = graph_description
+        if painted_ids is not None:
+            self._painted_ids = {_ontology_id_key(item) for item in painted_ids}
+            self._coverage_ready = True
         self.draw()
         self._pad_scene_rect()
-        self.reset_view()
+        if not preserve_expansion:
+            self.reset_view()
+
+    def set_painted_ids(self, painted_ids):
+        normalized = {_ontology_id_key(item) for item in (painted_ids or [])}
+        if self._coverage_ready and normalized == self._painted_ids:
+            return
+        self._painted_ids = normalized
+        self._coverage_ready = True
+        self.draw()
+        self._pad_scene_rect()
 
     def create_toolbar(self):
         hint = qt.QLabel("Click parent to expand/collapse · Double-click for details")
-        hint.setStyleSheet("color: #6b7789; font-size: 10px;")
+        hint.setStyleSheet("color: %s; font-size: 10px;" % _ui.GRAPH_HINT)
         btn_collapse = qt.QPushButton("Collapse all")
         btn_collapse.setToolTip("Show only the root level again.")
         btn_collapse.connect("clicked()", self._collapse_all)
@@ -883,6 +1084,87 @@ class DependencyGraphCanvas(InteractiveGraphView):
             self,
             leading_widgets=[hint, btn_collapse],
         )
+
+    def create_legend_bar(self):
+        self._coverageLegendLeft = qt.QLabel()
+        self._coverageLegendLeft.setTextFormat(qt.Qt.RichText)
+        self._coverageLegendLeft.setWordWrap(True)
+        self._coverageLegendLeft.setStyleSheet("font-size: 10px;")
+        self._coverageLegendRight = qt.QLabel()
+        self._coverageLegendRight.setTextFormat(qt.Qt.RichText)
+        self._coverageLegendRight.setWordWrap(True)
+        self._coverageLegendRight.setStyleSheet("font-size: 10px;")
+        self._coverageCount = qt.QLabel()
+        self._coverageCount.setStyleSheet("color: %s; font-size: 10px;" % _ui.GRAPH_HINT)
+        self._coverageCount.setAlignment(qt.Qt.AlignRight | qt.Qt.AlignVCenter)
+        help_btn = qt.QPushButton("?")
+        help_btn.setToolTip("What the left and right marks mean")
+        help_btn.setStyleSheet(_ui.BTN_SECONDARY)
+        help_btn.setFixedSize(24, 24)
+        help_btn.connect("clicked()", self._show_coverage_help)
+        legend_row = qt.QWidget()
+        legend_layout = qt.QHBoxLayout(legend_row)
+        legend_layout.setContentsMargins(0, 8, 0, 0)
+        legend_layout.setSpacing(16)
+        legend_layout.addWidget(self._coverageLegendLeft, 1)
+        legend_layout.addWidget(self._coverageLegendRight, 1)
+        legend_layout.addWidget(help_btn, 0, qt.Qt.AlignTop)
+        legend_layout.addWidget(self._coverageCount, 0, qt.Qt.AlignTop)
+        self._refresh_coverage_legend()
+        return legend_row
+
+    def _show_coverage_help(self):
+        dialog = _CoverageHelpDialog(self)
+        dialog.exec_()
+
+    def _coverage_legend_html(self):
+        mint = _ui.ACCENT_MINT
+        indigo = _ui.ACCENT_INDIGO
+        amber = _ui.ACCENT_AMBER
+        muted = _ui.TEXT_MUTED
+        left = (
+            "<b>Left mark</b><br>"
+            '<span style="color:%s">●</span> Has an annotation&nbsp;&nbsp;'
+            '<span style="color:%s">○</span> No annotation'
+        ) % (mint, muted)
+        right = (
+            "<b>Right mark</b><br>"
+            '<span style="color:%s">●</span> All have an annotation&nbsp;&nbsp;'
+            '<span style="color:%s">●</span> Some have an annotation&nbsp;&nbsp;'
+            '<span style="color:%s">○</span> None have an annotation'
+        ) % (indigo, amber, muted)
+        return left, right
+
+    def _refresh_coverage_legend(self):
+        left_label = getattr(self, "_coverageLegendLeft", None)
+        right_label = getattr(self, "_coverageLegendRight", None)
+        count_label = getattr(self, "_coverageCount", None)
+        left_html, right_html = self._coverage_legend_html()
+        if left_label is not None:
+            try:
+                left_label.setText(left_html)
+            except (RuntimeError, ValueError):
+                pass
+        if right_label is not None:
+            try:
+                right_label.setText(right_html)
+            except (RuntimeError, ValueError):
+                pass
+        if count_label is None:
+            return
+        try:
+            if not self._coverage_ready:
+                count_label.setText("Reading annotation…")
+                return
+            annotated, total = _leaf_annotation_counts(self._all_specs, self._coverage_map)
+            if total:
+                count_label.setText(
+                    "Lowest-level structures: %d / %d with an annotation" % (annotated, total)
+                )
+            else:
+                count_label.setText("")
+        except (RuntimeError, ValueError):
+            pass
 
     def _collapse_all(self):
         self._expanded_ids = _default_expanded_ids(self._all_specs)
@@ -916,7 +1198,13 @@ class DependencyGraphCanvas(InteractiveGraphView):
         spec = next((item for item in self._all_specs if item["id"] == node_id), None)
         if not spec:
             return
-        dialog = _StructureInfoDialog(self, spec)
+        dialog = _StructureInfoDialog(
+            self,
+            spec,
+            coverage=(
+                self._coverage_map.get(node_id) if getattr(self, "_coverage_ready", False) else None
+            ),
+        )
         dialog.exec_()
 
     def _on_single_click_timeout(self):
@@ -949,14 +1237,17 @@ class DependencyGraphCanvas(InteractiveGraphView):
         qt.QGraphicsView.mouseDoubleClickEvent(self, event)
 
     def draw(self):
+        self._sync_scene_background()
         self._graphe_scene.clear()
         if not self._all_specs:
             hint = self._graphe_scene.addText("No ontology loaded.")
-            hint.setDefaultTextColor(qt.QColor("#888888"))
+            hint.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT))
             hint.setPos(MARGIN, MARGIN)
             self._graphe_scene.setSceneRect(0, 0, 400, 200)
             self._nodes_by_id = {}
             self._specs_by_id = {}
+            self._coverage_map = {}
+            self._refresh_coverage_legend()
             return
 
         visible_specs, _children_map = _visible_specs_from_expansion(
@@ -966,9 +1257,11 @@ class DependencyGraphCanvas(InteractiveGraphView):
         self.dependency_specs = visible_specs
         if not visible_specs:
             hint = self._graphe_scene.addText("No structures to display.")
-            hint.setDefaultTextColor(qt.QColor("#888888"))
+            hint.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT))
             hint.setPos(MARGIN, MARGIN)
             self._graphe_scene.setSceneRect(0, 0, 400, 200)
+            self._coverage_map = _coverage_by_id(self._all_specs, self._painted_ids)
+            self._refresh_coverage_legend()
             return
 
         positions, edges = _layout_hierarchy(
@@ -978,6 +1271,7 @@ class DependencyGraphCanvas(InteractiveGraphView):
             h_gap=DEPENDENCY_H_GAP,
             v_gap=DEPENDENCY_V_GAP,
         )
+        self._coverage_map = _coverage_by_id(self._all_specs, self._painted_ids)
         nodes_by_id = positions
         self._nodes_by_id = nodes_by_id
         self._specs_by_id = {spec["id"]: spec for spec in visible_specs}
@@ -987,7 +1281,10 @@ class DependencyGraphCanvas(InteractiveGraphView):
                 _draw_tree_edge(self._graphe_scene, nodes_by_id[parent_id], nodes_by_id[child_id])
 
         for node in nodes_by_id.values():
-            _draw_box_node(self._graphe_scene, node)
+            coverage = None
+            if self._coverage_ready:
+                coverage = self._coverage_map.get(node["id"])
+            _draw_box_node(self._graphe_scene, node, coverage=coverage)
 
         scene_w, scene_h = _compute_scene_bounds(list(nodes_by_id.values()), padding=40)
         self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + 28)
@@ -1003,5 +1300,6 @@ class DependencyGraphCanvas(InteractiveGraphView):
             title_text += " — " + self.graph_description
         title = self._graphe_scene.addText(title_text)
         title.setFont(qt.QFont("Arial", 8))
-        title.setDefaultTextColor(qt.QColor("#777777"))
+        title.setDefaultTextColor(qt.QColor(_ui.GRAPH_TITLE))
         title.setPos(MARGIN, scene_h + 4)
+        self._refresh_coverage_legend()

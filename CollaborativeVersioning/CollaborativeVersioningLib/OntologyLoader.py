@@ -513,7 +513,9 @@ class OntologyEditorDialog(qt.QDialog):
         layout.addLayout(form)
 
         self.hierarchyInfoLabel = qt.QLabel("")
-        self.hierarchyInfoLabel.setStyleSheet("color: #888888; font-size: 10px;")
+        from CollaborativeVersioningLib.UiStyles import TEXT_MUTED
+
+        self.hierarchyInfoLabel.setStyleSheet("color: %s; font-size: 10px;" % TEXT_MUTED)
         layout.addWidget(self.hierarchyInfoLabel)
 
         depthRow = qt.QHBoxLayout()
