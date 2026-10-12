@@ -908,100 +908,6 @@ def find_open_review_request(full_name: str, login: str) -> dict[str, Any] | Non
     return fallback
 
 
-def submit_share_request(repo_dir: str, full_name: str) -> str:
-    """Send saved versions for the owner to review. Returns sent or updated."""
-    publish_review_branch(repo_dir)
-    login = current_login()
-    if not login:
-        raise GitHubNotSignedInError(not_signed_in_message())
-    branch = review_branch_for(login)
-    title = "Share request from %s" % login
-    body = "A colleague sent a version for the owner to review in 3D Slicer."
-    created = _run_gh(
-        [
-            "pr",
-            "create",
-            "--repo",
-            full_name,
-            "--base",
-            "main",
-            "--head",
-            branch,
-            "--title",
-            title,
-            "--body",
-            body,
-        ],
-        timeout=60,
-    )
-    if created.returncode == 0:
-        return "sent"
-    detail = (created.stderr or created.stdout or "").strip()
-    lower = detail.lower()
-    if "already exists" in lower or "already a pull request" in lower:
-        return "updated"
-    raise GitHubAuthError("Could not send the version for review.\n%s" % detail[:400])
-
-
-def notification_review_fetch_args(owner: str) -> list[str]:
-    return ["api", "search/issues?q=is:pr+is:open+user:%s&per_page=20" % owner]
-
-
-def parse_share_request_search_output(
-    stdout: str, stderr: str = "", returncode: int = 0
-) -> list[dict[str, Any]]:
-    if returncode != 0:
-        detail = (stderr or stdout or "").strip()
-        raise GitHubAuthError("Could not check notifications.\n%s" % detail[:400])
-    try:
-        payload = json.loads(stdout or "{}")
-    except json.JSONDecodeError:
-        return []
-    items = payload.get("items") if isinstance(payload, dict) else None
-    if not isinstance(items, list):
-        return []
-    requests = []
-    seen = set()
-    for item in items:
-        parsed = _share_request_from_search_item(item)
-        if parsed is None:
-            continue
-        key = "%s#%s" % (parsed["full_name"], parsed["number"])
-        if key in seen:
-            continue
-        seen.add(key)
-        parsed["kind"] = "review"
-        requests.append(parsed)
-    return requests
-
-
-def _share_request_from_search_item(item: dict) -> dict[str, Any] | None:
-    if not isinstance(item, dict) or not item.get("pull_request"):
-        return None
-    title = str(item.get("title") or "")
-    repo_url = str(item.get("repository_url") or "")
-    full_name = repo_url.rsplit("/repos/", 1)[-1].strip("/") if "/repos/" in repo_url else ""
-    if not full_name or "/" not in full_name:
-        return None
-    user = item.get("user") if isinstance(item.get("user"), dict) else {}
-    author_login = str((user or {}).get("login") or "").strip()
-    branch = ""
-    if title.lower().startswith("share request"):
-        branch = review_branch_for(author_login)
-    if not branch:
-        return None
-    number = item.get("number")
-    if number is None:
-        return None
-    return {
-        "number": number,
-        "full_name": full_name,
-        "author": author_login,
-        "branch": branch,
-        "title": title,
-    }
-
-
 def fetch_share_request_sha(full_name: str, branch: str) -> tuple[str, str]:
     """Fetch a review line and return (local clone, commit sha). Does not change main."""
     dest = open_or_update_local_project(full_name, mode="update")
@@ -2330,32 +2236,6 @@ def is_project_messages_conflict(stdout: str = "", stderr: str = "") -> bool:
     return _is_contents_conflict("%s\n%s" % (stderr or "", stdout or ""))
 
 
-def _merge_read_cursor(
-    entry: dict,
-    activity_at: str = "",
-    messages_at: str = "",
-    activity_ids=None,
-) -> dict:
-    merged = dict(entry or {})
-    activity_stamp = str(activity_at or "").strip()
-    messages_stamp = str(messages_at or "").strip()
-    if activity_stamp and activity_stamp > str(merged.get("activity_at") or ""):
-        merged["activity_at"] = activity_stamp
-    if messages_stamp and messages_stamp > str(merged.get("messages_at") or ""):
-        merged["messages_at"] = messages_stamp
-    ids = _normalize_activity_read_ids(merged.get("activity_ids"))
-    seen = set(ids)
-    for aid in _normalize_activity_read_ids(activity_ids):
-        if aid not in seen:
-            seen.add(aid)
-            ids.append(aid)
-    if ids:
-        merged["activity_ids"] = ids[-_ACTIVITY_READ_IDS_MAX:]
-    elif "activity_ids" in merged:
-        del merged["activity_ids"]
-    return merged
-
-
 def publish_project_activity(full_name: str, kind: str, text: str) -> None:
     """Append one project activity event. Safe to call after Share / People / Join."""
     if not full_name:
@@ -2400,69 +2280,6 @@ def publish_project_activity(full_name: str, kind: str, text: str) -> None:
         break
     if last_error:
         raise GitHubAuthError("Could not record the notification.\n%s" % last_error[:400])
-
-
-def publish_project_reads(
-    full_name: str,
-    activity_at: str = "",
-    messages_at: str = "",
-    activity_ids=None,
-) -> None:
-    """Update this user's read cursor. Call only after a local read action."""
-    if not full_name:
-        return
-    activity_stamp = str(activity_at or "").strip()
-    messages_stamp = str(messages_at or "").strip()
-    ids = _normalize_activity_read_ids(activity_ids)
-    if not activity_stamp and not messages_stamp and not ids:
-        return
-    login = normalize_github_username(current_login() or "")
-    if not login:
-        return
-    try:
-        ensure_project_info_branch(full_name)
-    except (GitHubAuthError, OSError, ValueError):
-        pass
-    last_error = ""
-    for _attempt in range(4):
-        fetch = _run_gh(project_messages_fetch_args(full_name), timeout=40)
-        try:
-            messages, sha, tasks, activity, reads = parse_project_messages_output(
-                fetch.stdout or "",
-                fetch.stderr or "",
-                fetch.returncode,
-            )
-        except GitHubAuthError as error:
-            last_error = str(error)
-            break
-        merged_reads = dict(reads or {})
-        key = login.lower()
-        merged_reads[key] = _merge_read_cursor(
-            merged_reads.get(key) or {},
-            activity_at=activity_stamp,
-            messages_at=messages_stamp,
-            activity_ids=ids,
-        )
-        put = _run_gh(
-            project_messages_put_args(
-                full_name,
-                messages,
-                sha=sha,
-                tasks=tasks,
-                activity=activity,
-                reads=merged_reads,
-            ),
-            timeout=40,
-        )
-        if put.returncode == 0:
-            return
-        detail = "%s\n%s" % (put.stderr or "", put.stdout or "")
-        if is_project_messages_conflict(put.stdout or "", put.stderr or ""):
-            continue
-        last_error = detail.strip()
-        break
-    if last_error:
-        raise GitHubAuthError("Could not save the read position.\n%s" % last_error[:400])
 
 
 def forget_people_access(full_name: str, username: str) -> None:

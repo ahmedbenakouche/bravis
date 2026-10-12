@@ -3965,24 +3965,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._appendFeed(message)
         return people
 
-    def _promptJoinProject(self, invitation: dict) -> str:
-        full_name = invitation.get("full_name") or "this project"
-        box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Join project")
-        box.setText("You were invited to %s." % full_name)
-        box.setInformativeText("Join this project now? You can Open it afterwards.")
-        join_btn = box.addButton("Join", qt.QMessageBox.AcceptRole)
-        decline_btn = box.addButton("Decline", qt.QMessageBox.DestructiveRole)
-        box.addButton("Later", qt.QMessageBox.RejectRole)
-        box.setDefaultButton(join_btn)
-        box.exec_()
-        clicked = box.clickedButton()
-        if clicked == join_btn:
-            return "join"
-        if clicked == decline_btn:
-            return "decline"
-        return "later"
-
     def _joinIncomingInvitation(self, invitation: dict) -> None:
         full_name = invitation.get("full_name") or ""
         self._openProgress("Join project", "Joining %s…" % full_name)
@@ -4065,16 +4047,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             process.deleteLater()
         except (AttributeError, RuntimeError, TypeError, ValueError):
             pass
-
-    def _ownedProjectNames(self) -> list[str]:
-        names = []
-        for repo in ((self._github_session or {}).get("repos") or []):
-            if repo.get("role") != "owner":
-                continue
-            full_name = repo.get("full_name")
-            if full_name:
-                names.append(full_name)
-        return names
 
     def _accessibleProjectNames(self) -> list[str]:
         names = []
@@ -5642,10 +5614,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if self._connected:
                     self._runNotificationChecks(announce=False)
 
-    def _openInvitationNotification(self, invitation: dict) -> None:
-        self._markNotificationRead(invitation)
-        self._openNotificationDetail(invitation)
-
     def _taskRoleForLane(self, lane: str):
         lane_key = str(lane or "").strip().lower()
         if not lane_key or lane_key == "main":
@@ -5833,90 +5801,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         message["senior"] = str((task or {}).get("senior") or "")
         message["description"] = normalize_task_title(description)
         self._enqueueTaskMessage(message)
-
-    def _reviewShareRequest(self, request: dict) -> None:
-        full_name = request.get("full_name") or ""
-        author = request.get("author") or "a colleague"
-        branch = request.get("branch") or ""
-        number = request.get("number")
-        self._openProgress("Review version", "Opening the version from %s…" % author)
-        snapshot = None
-        try:
-            self._updateProgress("Opening the version from %s…" % author)
-            local_path, sha = fetch_share_request_sha(full_name, branch)
-            snapshot = extract_project_version(local_path, sha)
-            self._updateProgress("Loading segmentation and ontology…")
-            loaded = self._loadOpenedProjectAssets(snapshot, volume_folder=local_path)
-            self._updateProgress("Reading version history…")
-            history = read_project_history(local_path)
-        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            self._closeProgress()
-            self._deferRemoveSnapshot(snapshot)
-            self._appendFeed(str(error).split("\n")[0], error=True)
-            return
-        unshared = self._historyHasUnsharedVersion(history)
-        self._suppress_dirty += 1
-        self._suppress_asset_ui_updates += 1
-        try:
-            self._selectProjectName(full_name)
-            self._loaded_project_name = full_name
-            self._local_project_path = local_path
-            self._server_pulled = True
-            self._applyProjectHistoryBundle(history)
-            self._clearChangeFlags()
-            self._unshared_version = unshared
-            self._syncAssetDataObservers()
-            self._rememberPeopleAccess(full_name, PEOPLE_ACCESS_SENIOR)
-        finally:
-            self._suppress_asset_ui_updates -= 1
-            self._suppress_dirty -= 1
-        self._closeProgress()
-        self._refreshUiState()
-        self._clearChangeFlags()
-        self._unshared_version = unshared
-        self._updateVersionActionButtons()
-        self._armLoadSettle()
-        self._appendFeed("Reviewing a version from %s. It is not on the project yet." % author)
-        if loaded.get("volume"):
-            self._appendFeed("Volume loaded: %s" % loaded["volume"])
-        if loaded.get("segmentation"):
-            self._appendFeed("Segmentation loaded: %s" % loaded["segmentation"])
-        if loaded.get("ontology"):
-            self._appendFeed("Ontology loaded: %s" % loaded["ontology"])
-        decision = self._promptAcceptShareRequest(author)
-        if decision == "accept":
-            self._acceptReviewedShareRequest(request)
-        elif decision == "decline":
-            self._declineReviewedShareRequest(request)
-        self._deferRemoveSnapshot(snapshot)
-
-    def _promptAcceptShareRequest(self, author: str) -> str:
-        box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Review version")
-        box.setText("This is the version %s wants to share." % author)
-        box.setInformativeText("Accept adds it to the project. Decline discards it.")
-        accept_btn = box.addButton("Accept", qt.QMessageBox.AcceptRole)
-        decline_btn = box.addButton("Decline", qt.QMessageBox.DestructiveRole)
-        box.addButton("Later", qt.QMessageBox.RejectRole)
-        box.setDefaultButton(accept_btn)
-        box.exec_()
-        clicked = box.clickedButton()
-        if clicked == accept_btn:
-            return "accept"
-        if clicked == decline_btn:
-            return "decline"
-        return "later"
-
-    def _selectProjectName(self, full_name: str) -> None:
-        combo = getattr(self, "projectCombo", None)
-        if combo is None:
-            return
-        index = combo.findText(full_name)
-        if index < 0:
-            return
-        combo.blockSignals(True)
-        combo.setCurrentIndex(index)
-        combo.blockSignals(False)
 
     def _acceptReviewedShareRequest(self, request: dict) -> None:
         full_name = request.get("full_name") or ""
