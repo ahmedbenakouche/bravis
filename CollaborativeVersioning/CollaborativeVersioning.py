@@ -22,7 +22,7 @@ import CollaborativeVersioningLib.GraphCanvas
 import CollaborativeVersioningLib.UiStyles
 
 # Change this string to verify that Reload picked up your edits.
-_UI_BUILD_TAG = "2026-10-05-remove-dead-code"
+_UI_BUILD_TAG = "2026-10-12-notif-read-ids"
 
 _LIB_MODULE_NAMES = (
     "CollaborativeVersioningLib.UiStyles",
@@ -66,15 +66,15 @@ from CollaborativeVersioningLib.GitHubAuth import (
     invite_project_colleague,
     list_accessible_repos,
     incoming_invitations_fetch_args,
-    notification_review_fetch_args,
     parse_incoming_invitations_output,
-    parse_share_request_search_output,
     list_project_people,
     parse_project_messages_output,
-    normalize_task_title,
     project_messages_fetch_args,
     project_messages_put_args,
+    build_project_activity,
+    publish_project_activity,
     build_project_message,
+    normalize_task_title,
     is_project_messages_conflict,
     logout_github_cli,
     open_delete_permission_window,
@@ -86,12 +86,18 @@ from CollaborativeVersioningLib.GitHubAuth import (
     cancel_project_invitation,
     set_wait_callback,
     share_local_versions,
-    submit_share_request,
+    publish_review_branch,
     fetch_share_request_sha,
     accept_share_request,
     decline_share_request,
     suggest_github_usernames,
-    PEOPLE_ACCESS_APPROVAL,
+    work_is_on_review_branch,
+    review_lane_slug,
+    review_branch_for,
+    submit_review_line,
+    find_open_review_request,
+    PEOPLE_ACCESS_SENIOR,
+    PEOPLE_ACCESS_JUNIOR,
 )
 from CollaborativeVersioningLib.OntologyLoader import (
     _qt_input_text,
@@ -108,6 +114,8 @@ from CollaborativeVersioningLib.UiStyles import (
     ACCENT_ICE,
     ACCENT_INDIGO,
     ACCENT_MINT,
+    BG_ELEVATED,
+    BORDER,
     BTN_CONNECT,
     BTN_CREATE,
     BTN_DELETE,
@@ -163,6 +171,8 @@ _STYLE_EXPORTS = (
     "ACCENT_ICE",
     "ACCENT_INDIGO",
     "ACCENT_MINT",
+    "BG_ELEVATED",
+    "BORDER",
     "BTN_CONNECT",
     "BTN_CREATE",
     "BTN_DELETE",
@@ -319,48 +329,108 @@ class ProjectConfigDialog(qt.QDialog):
         }
 
 
-class NotificationsDialog(qt.QDialog):
-    """Bell popup: click a notification to open it."""
+def _notification_list_label(item: dict) -> str:
+    kind = str((item or {}).get("kind") or "")
+    project = str((item or {}).get("full_name") or "").strip()
+    when = str((item or {}).get("when") or (item or {}).get("at_label") or "").strip()
+    if kind == "invite":
+        label = "Invitation to %s" % (project or "a project")
+    else:
+        label = str((item or {}).get("text") or "Project update")
+    if when:
+        label = "%s · %s" % (label, when)
+    return label
 
-    def __init__(self, parent=None, items=None, empty_text="") -> None:
+
+class NotificationsDialog(qt.QDialog):
+    """Bell list: unread rows stand out; click opens the detail."""
+
+    def __init__(self, parent=None, items=None, empty_text="", unread_keys=None) -> None:
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("Notifications")
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(420)
+        self.setMaximumHeight(520)
         self.setModal(True)
         self.chosen = None
+        self.mark_all = False
         self._items = list(items or [])
+        unread = set(unread_keys or [])
         layout = qt.QVBoxLayout(self)
-        layout.setSpacing(10)
-        hint = qt.QLabel(empty_text if not self._items else "Click a notification to open it.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(DIALOG_HINT_STYLE)
-        layout.addWidget(hint)
-        if self._items:
+        layout.setSpacing(8)
+        if not self._items:
+            hint = qt.QLabel(empty_text or "No notifications.")
+            hint.setWordWrap(True)
+            hint.setStyleSheet(DIALOG_HINT_STYLE)
+            layout.addWidget(hint)
+        else:
+            scroll = qt.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(qt.QFrame.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(qt.Qt.ScrollBarAlwaysOff)
+            scroll.setMaximumHeight(360)
+            holder = qt.QWidget()
+            hold_layout = qt.QVBoxLayout(holder)
+            hold_layout.setContentsMargins(0, 0, 2, 0)
+            hold_layout.setSpacing(6)
             group = qt.QButtonGroup(self)
             for index, item in enumerate(self._items):
-                kind = item.get("kind") or "review"
-                project = item.get("full_name") or "a project"
-                if kind == "invite":
-                    label = "You were invited to %s" % project
-                    tip = "Join or decline this project"
-                else:
-                    author = item.get("author") or "A colleague"
-                    label = "%s sent a version to review on %s" % (author, project)
-                    tip = "Open this version to review"
+                key = str(item.get("_key") or "")
+                is_unread = key in unread
+                kind = str(item.get("kind") or "")
+                label = _notification_list_label(item)
+                if is_unread:
+                    label = "●  %s" % label
                 button = qt.QPushButton(label)
-                button.setStyleSheet(BTN_SECONDARY)
+                tip = "Open invitation" if kind == "invite" else "Open notification"
                 button.setToolTip(tip)
+                if is_unread:
+                    button.setStyleSheet(
+                        "QPushButton {"
+                        " text-align: left; padding: 9px 12px;"
+                        " border: 1px solid %s; border-radius: 6px;"
+                        " background-color: %s; font-weight: 600;"
+                        "}"
+                        "QPushButton:hover { border: 1px solid %s; }"
+                        % (ACCENT_ICE, BG_ELEVATED or "#383838", ACCENT_ICE)
+                    )
+                else:
+                    button.setStyleSheet(
+                        "QPushButton {"
+                        " text-align: left; padding: 9px 12px;"
+                        " border: 1px solid %s; border-radius: 6px;"
+                        " background: transparent; color: %s; font-weight: 400;"
+                        "}"
+                        "QPushButton:hover { border: 1px solid %s; }"
+                        % (BORDER or "#505050", TEXT_MUTED, ACCENT_ICE)
+                    )
                 group.addButton(button, index)
-                layout.addWidget(button)
+                hold_layout.addWidget(button)
+            hold_layout.addStretch(1)
             try:
                 group.connect("idClicked(int)", self._onPick)
             except (TypeError, RuntimeError, AttributeError):
                 group.connect("buttonClicked(int)", self._onPick)
             self._group = group
+            scroll.setWidget(holder)
+            layout.addWidget(scroll)
+
+        buttons = qt.QHBoxLayout()
+        buttons.addStretch(1)
+        if self._items:
+            markAllButton = qt.QPushButton("Mark all as read")
+            markAllButton.setStyleSheet(BTN_SECONDARY)
+            markAllButton.connect("clicked()", self._onMarkAll)
+            buttons.addWidget(markAllButton)
         closeButton = qt.QPushButton("Close")
         closeButton.setStyleSheet(BTN_SECONDARY)
         closeButton.connect("clicked()", self.reject)
-        layout.addWidget(closeButton)
+        buttons.addWidget(closeButton)
+        layout.addLayout(buttons)
+
+    def _onMarkAll(self) -> None:
+        self.mark_all = True
+        self.chosen = None
+        self.reject()
 
     def _onPick(self, index) -> None:
         try:
@@ -369,7 +439,76 @@ class NotificationsDialog(qt.QDialog):
             return
         if 0 <= index < len(self._items):
             self.chosen = self._items[index]
-        self.close()
+        self.accept()
+
+
+class NotificationDetailDialog(qt.QDialog):
+    """Read one notification. Invitations can Join / Decline here."""
+
+    def __init__(self, parent, item: dict) -> None:
+        qt.QDialog.__init__(self, parent)
+        self.setWindowTitle("Notification")
+        self.setFixedWidth(420)
+        self.setModal(True)
+        self.choice = ""
+        item = item or {}
+        kind = str(item.get("kind") or "")
+        layout = qt.QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        if kind == "invite":
+            title = "Invitation"
+            body = "You were invited to %s." % (item.get("full_name") or "a project")
+        else:
+            title = "Update"
+            body = str(item.get("text") or "Project update")
+        head = qt.QLabel(title)
+        head.setStyleSheet("font-weight: 600; font-size: 13px;")
+        layout.addWidget(head)
+
+        body_label = qt.QLabel(body)
+        body_label.setWordWrap(True)
+        body_label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
+        layout.addWidget(body_label)
+
+        meta_bits = []
+        project = str(item.get("full_name") or "").strip()
+        when = str(item.get("when") or item.get("at_label") or "").strip()
+        if project:
+            meta_bits.append(project)
+        if when:
+            meta_bits.append(when)
+        if meta_bits:
+            meta = qt.QLabel(" · ".join(meta_bits))
+            meta.setWordWrap(True)
+            meta.setStyleSheet(DIALOG_HINT_STYLE)
+            layout.addWidget(meta)
+
+        buttons = qt.QHBoxLayout()
+        buttons.addStretch(1)
+        if kind == "invite":
+            decline_btn = qt.QPushButton("Decline")
+            join_btn = qt.QPushButton("Join")
+            later_btn = qt.QPushButton("Close")
+            decline_btn.setStyleSheet(BTN_DELETE)
+            join_btn.setStyleSheet(BTN_CREATE)
+            later_btn.setStyleSheet(BTN_SECONDARY)
+            decline_btn.connect("clicked()", lambda: self._finish("decline"))
+            join_btn.connect("clicked()", lambda: self._finish("join"))
+            later_btn.connect("clicked()", self.reject)
+            buttons.addWidget(later_btn)
+            buttons.addWidget(decline_btn)
+            buttons.addWidget(join_btn)
+        else:
+            close_btn = qt.QPushButton("Close")
+            close_btn.setStyleSheet(BTN_SECONDARY)
+            close_btn.connect("clicked()", self.accept)
+            buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+    def _finish(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()
 
 
 class PeopleDialog(qt.QDialog):
@@ -418,14 +557,9 @@ class PeopleDialog(qt.QDialog):
         form.addRow("GitHub username:", self.usernameEdit)
         self.accessCombo = qt.QComboBox()
         self.accessCombo.setStyleSheet(FIELD_STYLE)
-        self.accessCombo.addItem("Can share")
-        self.accessCombo.addItem("Needs approval")
-        form.addRow("Access:", self.accessCombo)
-        self.taskTitleEdit = qt.QLineEdit()
-        self.taskTitleEdit.setPlaceholderText("Optional — what they should work on")
-        self.taskTitleEdit.setMaxLength(80)
-        self.taskTitleEdit.setStyleSheet(FIELD_STYLE)
-        form.addRow("Task title:", self.taskTitleEdit)
+        self.accessCombo.addItem("Senior")
+        self.accessCombo.addItem("Junior")
+        form.addRow("Role:", self.accessCombo)
         add_layout.addLayout(form)
         self.suggestionList = qt.QListWidget()
         self.suggestionList.setMaximumHeight(120)
@@ -444,9 +578,8 @@ class PeopleDialog(qt.QDialog):
             self.suggestionList.connect("currentRowChanged(int)", self._onSuggestionRowChanged)
         add_layout.addWidget(self.suggestionList)
         owner_hint = qt.QLabel(
-            "They will receive a GitHub invitation. After they accept, this project appears in their list.\n"
-            "Can share: they publish versions themselves. Needs approval: they send a request for you to review.\n"
-            "Task title is optional. Everyone on People can see it."
+            "They will receive an invitation. After they accept, the project appears in their list.\n"
+            "Junior: they can access the project and share versions on their own line beside main."
         )
         owner_hint.setWordWrap(True)
         owner_hint.setStyleSheet(DIALOG_HINT_STYLE)
@@ -701,16 +834,16 @@ class PeopleDialog(qt.QDialog):
 
     def selected_access(self) -> str:
         if not getattr(self, "accessCombo", None):
-            return "share"
+            return PEOPLE_ACCESS_JUNIOR
         try:
             index = self.accessCombo.currentIndex
             if callable(index):
                 index = index()
-            if int(index) == 1:
-                return "approval"
+            if int(index) == 0:
+                return PEOPLE_ACCESS_SENIOR
         except (TypeError, ValueError, RuntimeError, AttributeError):
             pass
-        return "share"
+        return PEOPLE_ACCESS_JUNIOR
 
     def username(self) -> str:
         try:
@@ -720,15 +853,6 @@ class PeopleDialog(qt.QDialog):
         except (TypeError, AttributeError, RuntimeError):
             text = ""
         return str(text or "").strip().lstrip("@")
-
-    def task_title(self) -> str:
-        try:
-            text = self.taskTitleEdit.text
-            if callable(text):
-                text = text()
-        except (TypeError, AttributeError, RuntimeError):
-            text = ""
-        return normalize_task_title(text)
 
     def people(self) -> list:
         return list(self._people)
@@ -743,28 +867,18 @@ class PeopleDialog(qt.QDialog):
         for person in self._people:
             login = str(person.get("login") or "").strip()
             role = str(person.get("role") or "")
-            access = str(person.get("access") or "share")
-            task = str(person.get("task") or "").strip()
-            access_label = "Needs approval" if access == "approval" else "Can share"
-            if role == "owner":
-                label = "%s (owner)" % login
-            elif role == "pending":
-                label = "%s (invitation pending · %s)" % (login, access_label)
+            access = str(person.get("access") or PEOPLE_ACCESS_JUNIOR)
+            if access == PEOPLE_ACCESS_SENIOR:
+                role_label = "senior"
             else:
-                label = "%s (%s)" % (login, access_label)
-            if task:
-                label = "%s — %s" % (label, task)
+                role_label = "junior"
+            if role == "owner":
+                label = "%s (owner-senior)" % login
+            elif role == "pending":
+                label = "%s (invitation pending · %s)" % (login, role_label)
+            else:
+                label = "%s (%s)" % (login, role_label)
             self.peopleList.addItem(label)
-            if task:
-                try:
-                    count = self.peopleList.count
-                    if callable(count):
-                        count = count()
-                    item = self.peopleList.item(int(count) - 1)
-                    if item is not None:
-                        item.setToolTip(task)
-                except (TypeError, RuntimeError, AttributeError, ValueError):
-                    pass
         self._updateRemoveEnabled()
 
     def selected_person(self):
@@ -806,6 +920,328 @@ class PeopleDialog(qt.QDialog):
         handler = self._remove_handler
         if handler is not None:
             handler(self)
+
+
+_TASK_EXCERPT_LEN = 32
+
+
+def _task_excerpt(description: str) -> str:
+    text = " ".join(str(description or "").split())
+    if len(text) <= _TASK_EXCERPT_LEN:
+        return text
+    return text[:_TASK_EXCERPT_LEN].rstrip() + "....."
+
+
+class TaskDialog(qt.QDialog):
+    """Assign a junior to yourself, or read every active task."""
+
+    def __init__(self, parent, people=None, tasks=None, me="", can_assign=False) -> None:
+        qt.QDialog.__init__(self, parent)
+        self.setWindowTitle("Task")
+        self.setFixedWidth(460)
+        self.setModal(True)
+        self._people = list(people or [])
+        self._all_tasks = list(tasks or [])
+        self._tasks = list(self._all_tasks)
+        self._me = str(me or "").strip()
+        self._can_assign = bool(can_assign)
+        self._assign_handler = None
+        self._cancel_handler = None
+
+        layout = qt.QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        self.assignPanel = qt.QWidget()
+        form = qt.QFormLayout(self.assignPanel)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        self.juniorCombo = qt.QComboBox()
+        self.juniorCombo.setStyleSheet(FIELD_STYLE)
+        form.addRow("Junior:", self.juniorCombo)
+        self.descriptionEdit = qt.QPlainTextEdit()
+        self.descriptionEdit.setStyleSheet(FIELD_STYLE)
+        self.descriptionEdit.setPlaceholderText("What should they work on?")
+        self.descriptionEdit.setFixedHeight(72)
+        self.descriptionEdit.setLineWrapMode(qt.QPlainTextEdit.WidgetWidth)
+        self.descriptionEdit.setSizePolicy(qt.QSizePolicy.Ignored, qt.QSizePolicy.Fixed)
+        try:
+            self.descriptionEdit.setTabChangesFocus(True)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+        form.addRow("Description:", self.descriptionEdit)
+        hint = qt.QLabel("This junior will work with you. One junior can only have one task at a time.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(DIALOG_HINT_STYLE)
+        form.addRow(hint)
+        layout.addWidget(self.assignPanel)
+        self.assignPanel.setVisible(self._can_assign)
+
+        active_label = qt.QLabel("Tasks:")
+        active_label.setStyleSheet(DIALOG_HINT_STYLE)
+        layout.addWidget(active_label)
+        self.taskList = qt.QListWidget()
+        self.taskList.setMinimumHeight(200)
+        self.taskList.setMaximumHeight(280)
+        self.taskList.setSpacing(2)
+        try:
+            self.taskList.setWordWrap(True)
+        except (TypeError, AttributeError, RuntimeError):
+            pass
+        self.taskList.setHorizontalScrollBarPolicy(qt.Qt.ScrollBarAlwaysOff)
+        self.taskList.setSizePolicy(qt.QSizePolicy.Ignored, qt.QSizePolicy.Fixed)
+        accent = ACCENT_ICE or "#5b9fd4"
+        # Dark panel behind the cards so tasks stay readable in Light and Dark Slicer.
+        self.taskList.setStyleSheet(
+            """
+            QListWidget {
+                background: #1a1a1a;
+                border: 1px solid #333333;
+                border-radius: 8px;
+                outline: none;
+                padding: 4px;
+                color: #e8e8e8;
+            }
+            QListWidget::item {
+                margin: 1px 0px;
+                padding: 6px 10px;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+                background: #2a2a2a;
+            }
+            QListWidget::item:selected {
+                border: 1px solid %s;
+                background: #333333;
+            }
+            QListWidget::item:hover {
+                border: 1px solid %s;
+            }
+            """
+            % (accent, accent)
+        )
+        layout.addWidget(self.taskList)
+        self.detailLabel = qt.QLabel("Double-click a task to read the full description.")
+        self.detailLabel.setWordWrap(True)
+        self.detailLabel.setStyleSheet(DIALOG_HINT_STYLE)
+        layout.addWidget(self.detailLabel)
+
+        self.statusLabel = qt.QLabel("")
+        self.statusLabel.setWordWrap(True)
+        self.statusLabel.setVisible(False)
+        layout.addWidget(self.statusLabel)
+
+        buttons = qt.QHBoxLayout()
+        buttons.addStretch(1)
+        closeButton = qt.QPushButton("Close")
+        self.cancelTaskButton = qt.QPushButton("Cancel task")
+        self.assignButton = qt.QPushButton("Assign")
+        closeButton.setStyleSheet(BTN_SECONDARY)
+        self.cancelTaskButton.setStyleSheet(BTN_DELETE)
+        self.assignButton.setStyleSheet(BTN_CREATE)
+        closeButton.connect("clicked()", self.reject)
+        self.cancelTaskButton.connect("clicked()", self._onCancelTaskClicked)
+        self.assignButton.connect("clicked()", self._onAssignClicked)
+        buttons.addWidget(closeButton)
+        buttons.addWidget(self.cancelTaskButton)
+        buttons.addWidget(self.assignButton)
+        layout.addLayout(buttons)
+        self.assignButton.setVisible(self._can_assign)
+        self.assignButton.setDefault(self._can_assign)
+        # Only seniors/owner cancel a task they assigned. Juniors only read the list.
+        self.cancelTaskButton.setVisible(self._can_assign)
+
+        self.taskList.connect("currentRowChanged(int)", self._onTaskRowChanged)
+        self.taskList.connect("itemDoubleClicked(QListWidgetItem*)", self._onTaskDoubleClicked)
+        if self._can_assign:
+            self._fillCombos()
+        self._fillTasks()
+        self._updateDetail()
+        self._updateCancelEnabled()
+
+    def set_assign_handler(self, handler) -> None:
+        self._assign_handler = handler
+
+    def set_cancel_handler(self, handler) -> None:
+        self._cancel_handler = handler
+
+    def set_status(self, message: str, error: bool = False) -> None:
+        text = (message or "").strip()
+        self.statusLabel.setText(text)
+        self.statusLabel.setVisible(bool(text))
+        if not text:
+            return
+        color = FEED_COLOR_ERROR if error else ACCENT_MINT
+        self.statusLabel.setStyleSheet("color: %s; font-size: 11px; font-weight: 600;" % color)
+
+    def selected_junior(self) -> str:
+        return self._combo_user(self.juniorCombo)
+
+    def task_description(self) -> str:
+        try:
+            text = self.descriptionEdit.toPlainText()
+            if callable(text):
+                text = text()
+        except (TypeError, AttributeError, RuntimeError):
+            text = ""
+        return normalize_task_title(text)
+
+    def selected_task(self):
+        row = self.taskList.currentRow
+        if callable(row):
+            row = row()
+        row = int(row)
+        if row < 0 or row >= len(self._tasks):
+            return None
+        return self._tasks[row]
+
+    def _combo_user(self, combo) -> str:
+        try:
+            label = combo.currentText
+            if callable(label):
+                label = label()
+        except (TypeError, AttributeError, RuntimeError):
+            label = ""
+        return str(label or "").strip()
+
+    def _busy_juniors(self) -> set:
+        busy = set()
+        for task in self._all_tasks:
+            if str(task.get("status") or "") == "accepted":
+                continue
+            login = str(task.get("junior") or "").strip().lower()
+            if login:
+                busy.add(login)
+        return busy
+
+    def _fillCombos(self) -> None:
+        busy = self._busy_juniors()
+        juniors = []
+        for person in self._people:
+            login = str(person.get("login") or "").strip()
+            role = str(person.get("role") or "")
+            if not login or role in ("pending", "owner"):
+                continue
+            access = str(person.get("access") or PEOPLE_ACCESS_JUNIOR)
+            if access == PEOPLE_ACCESS_JUNIOR and login.lower() not in busy:
+                juniors.append(login)
+        self.juniorCombo.clear()
+        if juniors:
+            for login in juniors:
+                self.juniorCombo.addItem(login)
+            self.assignButton.setEnabled(True)
+        else:
+            self.juniorCombo.addItem("No junior is free")
+            self.assignButton.setEnabled(False)
+
+    def _task_list_label(self, task: dict) -> str:
+        junior = str(task.get("junior") or "").strip()
+        senior = str(task.get("senior") or "").strip()
+        accepted = str(task.get("status") or "") == "accepted"
+        excerpt = _task_excerpt(task.get("description") or "") or "No description."
+        mark = "✅" if accepted else "⏳"
+        return "%s  %s -> %s : %s" % (mark, senior, junior, excerpt)
+
+    def _fillTasks(self) -> None:
+        self.taskList.clear()
+        if not self._tasks:
+            self.taskList.addItem("No task yet.")
+            return
+        for task in self._tasks:
+            self.taskList.addItem(self._task_list_label(task))
+        self.taskList.clearSelection()
+        self.taskList.setCurrentRow(-1)
+
+    def _canCancelSelected(self) -> bool:
+        if not self._can_assign:
+            return False
+        task = self.selected_task()
+        if not task:
+            return False
+        if str(task.get("status") or "") == "accepted":
+            return False
+        me = self._me.lower()
+        senior = str(task.get("senior") or "").strip().lower()
+        return bool(me) and me == senior
+
+    def _onTaskRowChanged(self, _row) -> None:
+        self._updateDetail()
+        self._updateCancelEnabled()
+
+    def _updateDetail(self) -> None:
+        self.detailLabel.setVisible(bool(self._tasks))
+
+    def _task_at_row(self, row) -> dict | None:
+        try:
+            row = int(row)
+        except (TypeError, ValueError):
+            return None
+        if row < 0 or row >= len(self._tasks):
+            return None
+        return self._tasks[row]
+
+    def _onTaskDoubleClicked(self, item) -> None:
+        row = -1
+        try:
+            row = self.taskList.row(item)
+        except (TypeError, AttributeError, RuntimeError):
+            row = -1
+        task = self._task_at_row(row) or self.selected_task()
+        if not task:
+            return
+        qt.QTimer.singleShot(0, lambda chosen=task: self._showTaskText(chosen))
+
+    def _showTaskText(self, task) -> None:
+        senior = str(task.get("senior") or "").strip()
+        junior = str(task.get("junior") or "").strip()
+        description = str(task.get("description") or "").strip() or "No description."
+        dialog = qt.QDialog(self)
+        dialog.setWindowTitle("Task")
+        dialog.setFixedWidth(420)
+        dialog.setModal(True)
+        layout = qt.QVBoxLayout(dialog)
+        title = qt.QLabel("%s assigned %s to this task." % (senior, junior))
+        if str(task.get("status") or "") == "accepted":
+            title.setText("✅ " + title.text)
+        title.setWordWrap(True)
+        title.setStyleSheet(DIALOG_HINT_STYLE)
+        layout.addWidget(title)
+        body = qt.QPlainTextEdit()
+        body.setReadOnly(True)
+        body.setPlainText(description)
+        body.setLineWrapMode(qt.QPlainTextEdit.WidgetWidth)
+        body.setFixedHeight(160)
+        body.setSizePolicy(qt.QSizePolicy.Ignored, qt.QSizePolicy.Fixed)
+        body.setStyleSheet(FIELD_STYLE)
+        layout.addWidget(body)
+        closeButton = qt.QPushButton("Close")
+        closeButton.setStyleSheet(BTN_SECONDARY)
+        closeButton.connect("clicked()", dialog.accept)
+        layout.addWidget(closeButton)
+        dialog.exec_()
+
+    def _updateCancelEnabled(self) -> None:
+        self.cancelTaskButton.setEnabled(self._canCancelSelected())
+
+    def _onAssignClicked(self) -> None:
+        junior = self.selected_junior()
+        if not junior or junior == "No junior is free":
+            self.set_status("Select a junior first.", error=True)
+            return
+        description = self.task_description()
+        if not description:
+            self.set_status("Write a short description first.", error=True)
+            return
+        handler = self._assign_handler
+        if handler is not None:
+            handler(self, junior, description)
+
+    def _onCancelTaskClicked(self) -> None:
+        task = self.selected_task()
+        if not task or not self._canCancelSelected():
+            self.set_status("Select a task first.", error=True)
+            return
+        handler = self._cancel_handler
+        if handler is not None:
+            handler(self, task)
 
 
 DISCONNECT_GITHUB_HELP = (
@@ -880,15 +1316,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._notificationFetchResults = []
         self._notificationFetchAnnounce = False
         self._notificationFetchKind = ""
+        self._notificationFetchProject = ""
+        self._invite_read_ids = set()
+        self._reads_by_project = {}
+        self._project_reads = {}
+        self._messageSendActivity = []
+        self._messageSendReads = {}
         self._people_dialog_open = False
+        self._task_dialog_open = False
         self._notifications_popup_open = False
         self._ontology_graph_pending = False
         self._messages = []
+        self._project_tasks = []
+        self._project_activity = []
         self._messagesTimer = None
         self._refreshing_messages = False
         self._sending_message = False
-        self._messages_read_ids = set()
-        self._messages_baseline_ready = False
         self._messages_unread = 0
         self._messages_project = ""
         self._messagesProcess = None
@@ -900,6 +1343,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messageSendProject = ""
         self._messageSendAttempt = 0
         self._messageSendExisting = []
+        self._messageSendTasks = []
 
     def setup(self) -> None:
         try:
@@ -1127,6 +1571,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.deleteButton.connect("clicked()", self.onDeleteProject)
         self.messagesSend.connect("clicked()", self._onSendMessage)
         self.messagesInput.connect("returnPressed()", self._onSendMessage)
+        self.messagesTaskButton.connect("clicked()", self.onOpenTask)
         self.volumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self._onVolumeAssetChanged)
         self.segmentationSelector.connect("currentNodeChanged(vtkMRMLNode*)", self._onSegmentationAssetChanged)
 
@@ -1134,6 +1579,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         messagesButton = qt.QPushButton("Messages")
         messagesButton.setCheckable(True)
         messagesButton.setChecked(False)
+        messagesButton.setAutoDefault(False)
+        messagesButton.setDefault(False)
+        try:
+            messagesButton.setFocusPolicy(qt.Qt.NoFocus)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
         messagesButton.setStyleSheet(MESSAGES_HEADER_STYLE)
         messagesButton.setMinimumHeight(32)
         messagesButton.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
@@ -1156,6 +1607,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         messagesLayout = qt.QVBoxLayout(messagesBody)
         messagesLayout.setSpacing(6)
         messagesLayout.setContentsMargins(0, 6, 0, 0)
+
+        self.messagesTaskButton = qt.QPushButton("Task")
+        self.messagesTaskButton.setStyleSheet(BTN_SECONDARY)
+        self.messagesTaskButton.setMinimumHeight(32)
+        self.messagesTaskButton.setEnabled(False)
+        messagesLayout.addWidget(self.messagesTaskButton)
 
         self.messagesView = qt.QTextEdit()
         self.messagesView.setReadOnly(True)
@@ -1568,6 +2025,32 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.exec_()
         return box.clickedButton() == switch_btn
 
+    def _promptShareDestination(self, on_branch: bool) -> str:
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Share")
+        box.setText("Share these versions?")
+        if on_branch:
+            box.setInformativeText(
+                "Put them on main, or update your branch beside main."
+            )
+            branch_label = "Update branch"
+        else:
+            box.setInformativeText(
+                "Put them on main, or create a branch beside main."
+            )
+            branch_label = "Create a branch"
+        main_btn = box.addButton("Put on main", qt.QMessageBox.AcceptRole)
+        branch_btn = box.addButton(branch_label, qt.QMessageBox.ActionRole)
+        box.addButton("Cancel", qt.QMessageBox.RejectRole)
+        box.setDefaultButton(main_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == main_btn:
+            return "main"
+        if clicked == branch_btn:
+            return "branch"
+        return "cancel"
+
     def _githubLogin(self) -> str:
         session = getattr(self, "_github_session", None) or {}
         return str(session.get("login") or "annotator")
@@ -1715,7 +2198,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _setMessagesComposerEnabled(self, enabled: bool) -> None:
         can_write = bool(enabled and self._connected and self._hasSelectedProject())
-        for name in ("messagesInput", "messagesSend"):
+        for name in ("messagesInput", "messagesSend", "messagesTaskButton"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(can_write)
@@ -2125,9 +2608,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not share_ok:
             self.shareButton.setToolTip(self._shareDisabledReason())
         elif self._shareNeedsApproval():
-            self.shareButton.setToolTip("Send this version to the owner for review")
+            self.shareButton.setToolTip("Share on your branch beside main")
         else:
-            self.shareButton.setToolTip("Share a saved version that is not shared yet")
+            self.shareButton.setToolTip("Share to main or create a branch")
         can_people = self._canOpenPeople()
         self.peopleButton.setStyleSheet(BTN_PEOPLE)
         self.peopleButton.setEnabled(True)
@@ -2146,10 +2629,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _rememberPeopleAccess(self, full_name: str, access: str | None = None) -> str:
         name = (full_name or "").strip()
         if not name:
-            return "share"
+            return PEOPLE_ACCESS_JUNIOR
         if access is None:
             if self._isCurrentProjectOwner():
-                access = "share"
+                access = PEOPLE_ACCESS_SENIOR
             else:
                 access = people_access_for(name, self._githubLogin())
         cache = getattr(self, "_people_access_cache", None)
@@ -2167,7 +2650,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return False
         cache = getattr(self, "_people_access_cache", {}) or {}
         access = cache.get(full_name.lower())
-        return access == PEOPLE_ACCESS_APPROVAL
+        return access == PEOPLE_ACCESS_JUNIOR
 
     def _canOpenPeople(self) -> bool:
         return bool(self._connected and self._hasSelectedProject())
@@ -2196,7 +2679,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.projectCombo.setCurrentIndex(none_index if none_index >= 0 else 0)
         self.projectCombo.blockSignals(False)
 
-    def _applyProjectHistoryBundle(self, history: dict | None) -> str | None:
+    def _applyProjectHistoryBundle(self, history: dict | None, follow_head: bool = False) -> str | None:
         previous_id = getattr(self, "_currentVersionId", None)
         previous_sha = (
             ((getattr(self, "_project_history_bundle", None) or {}).get("sha_by_id") or {}).get(
@@ -2209,10 +2692,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._project_history_bundle = bundle
         sha_by_id = bundle.get("sha_by_id") or {}
         id_by_sha = {sha: version_id for version_id, sha in sha_by_id.items()}
-        if previous_sha and previous_sha in id_by_sha:
+        head_id = bundle.get("head_id")
+        if follow_head and head_id:
+            self._currentVersionId = head_id
+        elif previous_sha and previous_sha in id_by_sha:
             self._currentVersionId = id_by_sha[previous_sha]
         else:
-            self._currentVersionId = bundle.get("head_id")
+            self._currentVersionId = head_id
             if not self._currentVersionId:
                 specs = bundle.get("version_specs") or []
                 self._currentVersionId = specs[-1].get("id") if specs else None
@@ -2221,7 +2707,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _historyHasUnsharedVersion(self, history: dict | None = None) -> bool:
         bundle = history if history is not None else getattr(self, "_project_history_bundle", None)
         for row in (bundle or {}).get("commit_history") or []:
-            if len(row) > 4 and str(row[4]).lower() == "local":
+            if len(row) > 4 and str(row[4]).lower() in ("local", "to review"):
                 return True
         return False
 
@@ -3286,7 +3772,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed(reason, error=True)
             return
         full_name = self._currentProjectName()
-        can_add = self._isCurrentProjectOwner()
         self.peopleButton.setEnabled(False)
         self._openProgress("People", "Reading who is on this project…")
         try:
@@ -3299,6 +3784,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self._closeProgress()
         self._updateVersionActionButtons()
+        can_add = self._isCurrentProjectOwner()
         qt.QTimer.singleShot(
             0,
             lambda n=full_name, p=people, a=can_add: self._showPeopleDialog(n, p, a),
@@ -3369,7 +3855,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._pending_people_action = ("add", {
             "username": username,
             "access": dialog.selected_access(),
-            "task": dialog.task_title(),
         })
         self._closePeopleDialog(dialog)
 
@@ -3400,17 +3885,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _applyAddColleague(self, full_name: str, payload, current):
         if isinstance(payload, dict):
             username = str(payload.get("username") or "").strip()
-            access = str(payload.get("access") or "share")
-            task = str(payload.get("task") or "").strip()
+            access = str(payload.get("access") or PEOPLE_ACCESS_JUNIOR)
         else:
             username = str(payload or "").strip()
-            access = "share"
-            task = ""
-        access_label = "Needs approval" if access == "approval" else "Can share"
+            access = PEOPLE_ACCESS_JUNIOR
+        if access == PEOPLE_ACCESS_SENIOR:
+            access_label = "Senior"
+        else:
+            access_label = "Junior"
         self._openProgress("People", "Adding colleague…")
         try:
             self._updateProgress("Adding colleague…")
-            outcome = invite_project_colleague(full_name, username, access, task=task)
+            outcome = invite_project_colleague(full_name, username, access)
             self._updateProgress("Updating the people list…")
             people = list_project_people(full_name)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
@@ -3425,8 +3911,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "Invitation sent to %s (%s). They can join from 3D Slicer after they Connect."
                 % (username, access_label)
             )
-            if task:
-                message = "%s Task: %s." % (message, task)
+            me = self._githubLogin() or "Someone"
+            self._recordActivity(
+                full_name,
+                "people_add",
+                "%s invited %s (%s)." % (me, username, access_label),
+            )
         self._appendFeed(message)
         return people
 
@@ -3457,10 +3947,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if str(item.get("login") or "").strip().lower() != login_key
             or item.get("role") == "owner"
         ]
+        me = self._githubLogin() or "Someone"
         if role == "pending":
             message = "Cancelled the invitation for %s." % login
+            self._recordActivity(
+                full_name,
+                "people_remove",
+                "%s cancelled the invitation for %s." % (me, login),
+            )
         else:
             message = "Removed %s from the project." % login
+            self._recordActivity(
+                full_name,
+                "people_remove",
+                "%s removed %s from the project." % (me, login),
+            )
         self._appendFeed(message)
         return people
 
@@ -3503,6 +4004,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
         self._closeProgress()
+        me = self._githubLogin() or "Someone"
+        try:
+            access = people_access_for(full_name, me)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            access = PEOPLE_ACCESS_JUNIOR
+        role_label = "Senior" if access == PEOPLE_ACCESS_SENIOR else "Junior"
+        self._recordActivity(
+            full_name,
+            "join",
+            "%s joined the project as %s." % (me, role_label),
+        )
         self._appendFeed("Joined %s. Open it when you are ready." % full_name)
 
     def _declineIncomingInvitation(self, invitation: dict) -> None:
@@ -3543,6 +4055,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._notificationFetchQueue = []
         self._notificationFetchResults = []
         self._notificationFetchKind = ""
+        self._notificationFetchProject = ""
         self._refreshing_notifications = False
         if process is None:
             return
@@ -3563,17 +4076,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 names.append(full_name)
         return names
 
-    def _notificationOwnerLogins(self) -> list[str]:
-        owners = []
+    def _accessibleProjectNames(self) -> list[str]:
+        names = []
         seen = set()
-        for name in self._ownedProjectNames():
-            owner = str(name or "").partition("/")[0].strip()
-            key = owner.lower()
-            if not owner or key in seen:
+        for repo in ((self._github_session or {}).get("repos") or []):
+            full_name = str(repo.get("full_name") or "").strip()
+            key = full_name.lower()
+            if not full_name or key in seen:
                 continue
             seen.add(key)
-            owners.append(owner)
-        return owners
+            names.append(full_name)
+        current = self._currentProjectName() if self._hasSelectedProject() else ""
+        if current and current.lower() not in seen:
+            names.insert(0, current)
+        return names[:20]
 
     def _onNotificationsPoll(self) -> None:
         self._runNotificationChecks(announce=True)
@@ -3598,10 +4114,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         if getattr(self, "_notifications_popup_open", False):
             return
-        queue = []
-        for owner in self._notificationOwnerLogins():
-            queue.append({"kind": "review", "args": notification_review_fetch_args(owner)})
-        queue.append({"kind": "invite", "args": incoming_invitations_fetch_args()})
+        queue = [{"kind": "invite", "args": incoming_invitations_fetch_args(), "full_name": ""}]
+        for name in self._accessibleProjectNames():
+            queue.append(
+                {
+                    "kind": "activity",
+                    "args": project_messages_fetch_args(name),
+                    "full_name": name,
+                }
+            )
         self._notificationFetchQueue = queue
         self._notificationFetchResults = []
         self._notificationFetchAnnounce = bool(announce)
@@ -3615,12 +4136,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             announce = bool(getattr(self, "_notificationFetchAnnounce", False))
             self._notificationsProcess = None
             self._notificationFetchKind = ""
+            self._notificationFetchProject = ""
             self._refreshing_notifications = False
             self._applyNotificationRequests(incoming, announce=announce)
             return
         job = queue.pop(0)
         self._notificationFetchQueue = queue
         self._notificationFetchKind = job.get("kind") or ""
+        self._notificationFetchProject = job.get("full_name") or ""
         gh = find_gh()
         if not gh:
             self._startNextNotificationFetch()
@@ -3645,8 +4168,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _onNotificationFetchFinished(self, _code=0) -> None:
         process = getattr(self, "_notificationsProcess", None)
         kind = getattr(self, "_notificationFetchKind", "")
+        project = getattr(self, "_notificationFetchProject", "")
         self._notificationsProcess = None
         self._notificationFetchKind = ""
+        self._notificationFetchProject = ""
         if not getattr(self, "_refreshing_notifications", False):
             if process is not None:
                 try:
@@ -3667,11 +4192,64 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             process.deleteLater()
         except (RuntimeError, ValueError):
             pass
+        items = []
         try:
             if kind == "invite":
                 items = parse_incoming_invitations_output(stdout, stderr, code)
-            else:
-                items = parse_share_request_search_output(stdout, stderr, code)
+            elif kind == "activity":
+                _messages, _sha, _tasks, activity, reads = parse_project_messages_output(
+                    stdout, stderr, code
+                )
+                me = (self._githubLogin() or "").lower()
+                my_reads = (reads or {}).get(me) or {}
+                by_project = getattr(self, "_reads_by_project", None)
+                if not isinstance(by_project, dict):
+                    by_project = {}
+                    self._reads_by_project = by_project
+                # Keep a newer local optimistic cursor if we already bumped it.
+                previous = by_project.get(project) or {}
+                ids = []
+                seen_ids = set()
+                for source in (previous.get("activity_ids"), my_reads.get("activity_ids")):
+                    if not isinstance(source, list):
+                        continue
+                    for aid in source:
+                        text = str(aid or "").strip()
+                        if not text or text in seen_ids:
+                            continue
+                        seen_ids.add(text)
+                        ids.append(text)
+                merged_cursor = {
+                    "activity_at": max(
+                        str(previous.get("activity_at") or ""),
+                        str(my_reads.get("activity_at") or ""),
+                    ),
+                    "messages_at": max(
+                        str(previous.get("messages_at") or ""),
+                        str(my_reads.get("messages_at") or ""),
+                    ),
+                }
+                if ids:
+                    merged_cursor["activity_ids"] = ids
+                by_project[project] = {
+                    key: value for key, value in merged_cursor.items() if value
+                }
+                for event in activity or []:
+                    author = str(event.get("author") or "").strip()
+                    if author.lower() == me:
+                        continue
+                    items.append(
+                        {
+                            "kind": "activity",
+                            "activity_kind": str(event.get("kind") or ""),
+                            "id": str(event.get("id") or ""),
+                            "author": author,
+                            "text": str(event.get("text") or ""),
+                            "at": str(event.get("at") or ""),
+                            "full_name": project,
+                            "when": self._formatMessageTime(event.get("at") or ""),
+                        }
+                    )
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             items = []
         results = getattr(self, "_notificationFetchResults", None)
@@ -3682,29 +4260,45 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._startNextNotificationFetch()
 
     def _notificationKey(self, item: dict) -> str:
-        kind = item.get("kind") or "review"
+        kind = item.get("kind") or ""
         if kind == "invite":
             return "invite#%s" % item.get("id")
-        return "review#%s#%s" % (item.get("full_name") or "", item.get("number"))
+        return "activity#%s#%s" % (item.get("full_name") or "", item.get("id") or "")
 
     def _applyNotificationRequests(self, requests: list, announce: bool = False) -> None:
+        invites = []
+        activity = []
+        for item in requests or []:
+            if str(item.get("kind") or "") == "invite":
+                invites.append(item)
+            else:
+                activity.append(item)
+        activity.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+        activity = activity[:40]
         previous_keys = {self._notificationKey(item) for item in getattr(self, "_notifications", [])}
-        incoming = list(requests or [])
+        display = list(invites) + list(activity)
         if announce:
-            for item in incoming:
-                if self._notificationKey(item) in previous_keys:
+            for item in display:
+                key = self._notificationKey(item)
+                if key in previous_keys:
                     continue
-                project = item.get("full_name") or "a project"
+                if not self._isNotificationUnread(item):
+                    continue
                 if item.get("kind") == "invite":
-                    self._appendFeed("You were invited to %s." % project)
-                else:
-                    author = item.get("author") or "A colleague"
-                    self._appendFeed("%s sent a version to review on %s." % (author, project))
-        self._notifications = incoming
+                    self._appendFeed(
+                        "You were invited to %s." % (item.get("full_name") or "a project")
+                    )
+                    continue
+                text = str(item.get("text") or "").strip()
+                if text:
+                    self._appendFeed(text)
+        self._notifications = display
         self._updateNotificationsBadge()
 
     def _clearNotificationsDisplay(self) -> None:
         self._notifications = []
+        self._invite_read_ids = set()
+        self._reads_by_project = {}
         self._updateNotificationsBadge()
 
     def _notificationsEmptyText(self) -> str:
@@ -3712,10 +4306,217 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "Connect with GitHub to see notifications."
         return "No new notifications."
 
+    def _projectReadEntry(self, full_name: str) -> dict:
+        project = str(full_name or "").strip()
+        if not project:
+            return {}
+        return dict((getattr(self, "_reads_by_project", {}) or {}).get(project) or {})
+
+    def _isNotificationUnread(self, item: dict) -> bool:
+        kind = str((item or {}).get("kind") or "")
+        key = self._notificationKey(item or {})
+        if kind == "invite":
+            return bool(key) and key not in getattr(self, "_invite_read_ids", set())
+        entry = self._projectReadEntry((item or {}).get("full_name") or "")
+        aid = str((item or {}).get("id") or "").strip()
+        ids = entry.get("activity_ids") or []
+        if aid and isinstance(ids, list) and aid in ids:
+            return False
+        stamp = str((item or {}).get("at") or "")
+        cursor = str(entry.get("activity_at") or "")
+        if cursor and stamp and stamp <= cursor:
+            return False
+        return True
+
+    def _unreadNotificationKeys(self) -> set:
+        unread = set()
+        for item in getattr(self, "_notifications", []) or []:
+            key = self._notificationKey(item)
+            if key and self._isNotificationUnread(item):
+                unread.add(key)
+        return unread
+
+    def _unreadNotificationCount(self) -> int:
+        return len(self._unreadNotificationKeys())
+
+    def _bumpLocalReadCursor(
+        self,
+        full_name: str,
+        activity_at: str = "",
+        messages_at: str = "",
+        activity_ids=None,
+    ) -> None:
+        project = str(full_name or "").strip()
+        if not project:
+            return
+        by_project = getattr(self, "_reads_by_project", None)
+        if not isinstance(by_project, dict):
+            by_project = {}
+            self._reads_by_project = by_project
+        entry = dict(by_project.get(project) or {})
+        activity_stamp = str(activity_at or "").strip()
+        messages_stamp = str(messages_at or "").strip()
+        if activity_stamp and activity_stamp > str(entry.get("activity_at") or ""):
+            entry["activity_at"] = activity_stamp
+        if messages_stamp and messages_stamp > str(entry.get("messages_at") or ""):
+            entry["messages_at"] = messages_stamp
+        ids = list(entry.get("activity_ids") or []) if isinstance(entry.get("activity_ids"), list) else []
+        seen = set(ids)
+        for aid in activity_ids or []:
+            text = str(aid or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            ids.append(text)
+        if ids:
+            entry["activity_ids"] = ids[-200:]
+        by_project[project] = entry
+        current = self._currentProjectName() if self._hasSelectedProject() else ""
+        if project == current:
+            self._project_reads = dict(entry)
+
+    def _persistReadCursor(
+        self,
+        full_name: str,
+        activity_at: str = "",
+        messages_at: str = "",
+        activity_ids=None,
+    ) -> None:
+        # Update local cursor immediately; push to GitHub async (same path as chat).
+        self._bumpLocalReadCursor(
+            full_name,
+            activity_at=activity_at,
+            messages_at=messages_at,
+            activity_ids=activity_ids,
+        )
+        self._enqueueReadCursor(
+            full_name,
+            activity_at=activity_at,
+            messages_at=messages_at,
+            activity_ids=activity_ids,
+        )
+
+    def _enqueueReadCursor(
+        self,
+        full_name: str,
+        activity_at: str = "",
+        messages_at: str = "",
+        activity_ids=None,
+    ) -> None:
+        project = str(full_name or "").strip()
+        activity_stamp = str(activity_at or "").strip()
+        messages_stamp = str(messages_at or "").strip()
+        ids = [str(aid).strip() for aid in (activity_ids or []) if str(aid).strip()]
+        if not project or (not activity_stamp and not messages_stamp and not ids):
+            return
+
+        def _bump_payload(payload: dict) -> None:
+            if activity_stamp and activity_stamp > str(payload.get("activity_at") or ""):
+                payload["activity_at"] = activity_stamp
+            if messages_stamp and messages_stamp > str(payload.get("messages_at") or ""):
+                payload["messages_at"] = messages_stamp
+            existing = list(payload.get("activity_ids") or [])
+            seen = set(existing)
+            for aid in ids:
+                if aid not in seen:
+                    seen.add(aid)
+                    existing.append(aid)
+            if existing:
+                payload["activity_ids"] = existing[-200:]
+
+        current = getattr(self, "_messageSendCurrent", None) or {}
+        if (
+            getattr(self, "_sending_message", False)
+            and str(current.get("kind") or "") == "reads"
+            and str(current.get("full_name") or "") == project
+        ):
+            _bump_payload(current)
+            return
+        queue = list(getattr(self, "_messageSendQueue", []) or [])
+        for item in queue:
+            if str(item.get("kind") or "") == "reads" and str(item.get("full_name") or "") == project:
+                _bump_payload(item)
+                self._messageSendQueue = queue
+                return
+        payload = {
+            "id": "reads-%s-%s" % (project, int(time.time() * 1000)),
+            "kind": "reads",
+            "full_name": project,
+            "author": self._githubLogin() or "Someone",
+            "text": "",
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "activity_at": activity_stamp,
+            "messages_at": messages_stamp,
+            "activity_ids": list(ids),
+        }
+        queue.append(payload)
+        self._messageSendQueue = queue
+        if not getattr(self, "_sending_message", False):
+            self._startNextQueuedSend()
+
+    def _markNotificationRead(self, item: dict) -> None:
+        kind = str((item or {}).get("kind") or "")
+        key = self._notificationKey(item or {})
+        if kind == "invite":
+            if key:
+                invite_ids = getattr(self, "_invite_read_ids", set())
+                invite_ids.add(key)
+                self._invite_read_ids = invite_ids
+            self._updateNotificationsBadge()
+            return
+        project = str((item or {}).get("full_name") or "").strip()
+        aid = str((item or {}).get("id") or "").strip()
+        if project and aid:
+            self._persistReadCursor(project, activity_ids=[aid])
+        self._updateNotificationsBadge()
+
+    def _markAllNotificationsRead(self) -> None:
+        newest_by_project = {}
+        ids_by_project = {}
+        invite_ids = getattr(self, "_invite_read_ids", set())
+        for item in getattr(self, "_notifications", []) or []:
+            if str(item.get("kind") or "") == "invite":
+                key = self._notificationKey(item)
+                if key:
+                    invite_ids.add(key)
+                continue
+            project = str(item.get("full_name") or "").strip()
+            stamp = str(item.get("at") or "").strip()
+            aid = str(item.get("id") or "").strip()
+            if not project:
+                continue
+            if stamp and stamp > str(newest_by_project.get(project) or ""):
+                newest_by_project[project] = stamp
+            if aid:
+                ids_by_project.setdefault(project, []).append(aid)
+        self._invite_read_ids = invite_ids
+        projects = set(newest_by_project) | set(ids_by_project)
+        for project in projects:
+            self._persistReadCursor(
+                project,
+                activity_at=newest_by_project.get(project) or "",
+                activity_ids=ids_by_project.get(project) or [],
+            )
+        self._updateNotificationsBadge()
+
+    def _taskExcerptForJunior(self, junior: str) -> str:
+        name = str(junior or "").strip().lower()
+        if not name:
+            return ""
+        for task in getattr(self, "_project_tasks", []) or []:
+            if str(task.get("junior") or "").strip().lower() != name:
+                continue
+            if str(task.get("status") or "") == "accepted":
+                continue
+            return _task_excerpt(
+                task.get("submitted_description") or task.get("description") or ""
+            )
+        return ""
+
     def _updateNotificationsBadge(self) -> None:
         badge = getattr(self, "notificationsBadge", None)
         bell = getattr(self, "notificationsBell", None)
-        count = len(getattr(self, "_notifications", []) or [])
+        count = self._unreadNotificationCount()
         if badge is None:
             return
         if count <= 0:
@@ -3728,9 +4529,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         badge.raise_()
         if bell is not None:
             if count == 1:
-                bell.setToolTip("1 version to review")
+                bell.setToolTip("1 notification")
             else:
-                bell.setToolTip("%d versions to review" % count)
+                bell.setToolTip("%d notifications" % count)
 
     def _setNotificationsEnabled(self, enabled: bool) -> None:
         bell = getattr(self, "notificationsBell", None)
@@ -3758,13 +4559,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if checked:
             self._markMessagesRead()
             self._scrollMessagesToEnd()
+        button = getattr(self, "messagesButton", None)
+        if button is not None:
+            try:
+                button.clearFocus()
+            except (AttributeError, RuntimeError, TypeError):
+                pass
         self._positionMessagesBadge()
 
     def _resetMessagesState(self, project: str) -> None:
         self._stopMessageSend()
         self._messages = []
-        self._messages_read_ids = set()
-        self._messages_baseline_ready = False
+        self._project_tasks = []
+        self._project_activity = []
+        self._project_reads = {}
         self._messages_unread = 0
         self._messages_project = project or ""
         self._renderMessagesView()
@@ -3857,6 +4665,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         if getattr(self, "_people_dialog_open", False):
             return
+        if getattr(self, "_task_dialog_open", False):
+            return
         if getattr(self, "_notifications_popup_open", False):
             return
         gh = find_gh()
@@ -3903,42 +4713,91 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if expected != self._currentProjectName():
             return
         try:
-            incoming, _sha = parse_project_messages_output(stdout, stderr, code)
+            incoming, _sha, tasks, activity, reads = parse_project_messages_output(
+                stdout, stderr, code
+            )
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             return
-        self._applyProjectMessages(incoming)
+        self._applyProjectMessages(incoming, tasks, activity, reads)
 
-    def _applyProjectMessages(self, incoming: list) -> None:
+    def _messagesCursor(self) -> str:
+        return str((getattr(self, "_project_reads", {}) or {}).get("messages_at") or "")
+
+    def _newestMessageStamp(self, messages=None) -> str:
+        newest = ""
+        for item in messages if messages is not None else (getattr(self, "_messages", []) or []):
+            stamp = str((item or {}).get("at") or "")
+            if stamp > newest:
+                newest = stamp
+        return newest
+
+    def _applyProjectMessages(
+        self, incoming: list, tasks=None, activity=None, reads=None
+    ) -> None:
+        if tasks is not None:
+            self._project_tasks = list(tasks or [])
+        if activity is not None:
+            self._project_activity = list(activity or [])
         messages = list(incoming or [])
         me = (self._githubLogin() or "").lower()
-        if not getattr(self, "_messages_baseline_ready", False):
-            self._messages_read_ids = {item.get("id") for item in messages if item.get("id")}
-            self._messages_baseline_ready = True
+        project = self._currentProjectName() if self._hasSelectedProject() else ""
+        if reads is not None and project:
+            my_reads = (reads or {}).get(me) or {}
+            previous = getattr(self, "_project_reads", {}) or {}
+            ids = []
+            seen_ids = set()
+            for source in (previous.get("activity_ids"), my_reads.get("activity_ids")):
+                if not isinstance(source, list):
+                    continue
+                for aid in source:
+                    text = str(aid or "").strip()
+                    if not text or text in seen_ids:
+                        continue
+                    seen_ids.add(text)
+                    ids.append(text)
+            merged = {
+                "activity_at": max(
+                    str(previous.get("activity_at") or ""),
+                    str(my_reads.get("activity_at") or ""),
+                ),
+                "messages_at": max(
+                    str(previous.get("messages_at") or ""),
+                    str(my_reads.get("messages_at") or ""),
+                ),
+            }
+            if ids:
+                merged["activity_ids"] = ids[-200:]
+            self._project_reads = {key: value for key, value in merged.items() if value}
+            by_project = getattr(self, "_reads_by_project", None)
+            if not isinstance(by_project, dict):
+                by_project = {}
+                self._reads_by_project = by_project
+            by_project[project] = dict(self._project_reads)
+        cursor = self._messagesCursor()
+        if self._messagesPanelOpen():
+            newest = self._newestMessageStamp(messages)
+            if project and newest and newest > cursor:
+                self._persistReadCursor(project, messages_at=newest)
             self._messages_unread = 0
         else:
-            read_ids = getattr(self, "_messages_read_ids", set())
-            if self._messagesPanelOpen():
-                for item in messages:
-                    mid = item.get("id")
-                    if mid:
-                        read_ids.add(mid)
-                self._messages_read_ids = read_ids
-                self._messages_unread = 0
-            else:
-                unread = 0
-                for item in messages:
-                    mid = item.get("id")
-                    author = str(item.get("author") or "").lower()
-                    if not mid or mid in read_ids or author == me:
-                        continue
+            unread = 0
+            for item in messages:
+                author = str(item.get("author") or "").lower()
+                stamp = str(item.get("at") or "")
+                if not stamp or author == me:
+                    continue
+                if stamp > cursor:
                     unread += 1
-                self._messages_unread = unread
+            self._messages_unread = unread
         self._messages = self._mergePendingMessages(messages)
         self._renderMessagesView()
         self._updateMessagesBadge()
 
     def _markMessagesRead(self) -> None:
-        self._messages_read_ids = {item.get("id") for item in getattr(self, "_messages", []) if item.get("id")}
+        project = self._currentProjectName() if self._hasSelectedProject() else ""
+        newest = self._newestMessageStamp()
+        if project and newest:
+            self._persistReadCursor(project, messages_at=newest)
         self._messages_unread = 0
         self._updateMessagesBadge()
 
@@ -4017,17 +4876,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         when = html.escape(self._formatMessageTime(item.get("at") or ""))
         mine = raw_author.lower() == (self._githubLogin() or "").lower()
         pending = bool(item.get("pending"))
-        name_color = TEXT_MUTED if pending else (ACCENT_ICE if mine else TEXT_SECONDARY)
+        system = str(item.get("kind") or "") == "task"
+        name_color = TEXT_MUTED if pending or system else (ACCENT_ICE if mine else TEXT_SECONDARY)
         time_html = (
             ' <span style="color:%s;font-size:10px;">%s</span>' % (TEXT_MUTED, when)
             if when
             else ""
         )
+        body_style = ' style="color:%s;font-style:italic;"' % TEXT_MUTED if system else ""
         return (
             '<p style="margin:0 0 8px 0;">'
             '<span style="color:%s;font-weight:600;">%s</span>%s<br>'
-            "<span>%s</span></p>"
-        ) % (name_color, author, time_html, body)
+            "<span%s>%s</span></p>"
+        ) % (name_color, author, time_html, body_style, body)
 
     def _messagesScrollBar(self):
         view = getattr(self, "messagesView", None)
@@ -4041,10 +4902,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return None
 
-    def _messagesViewAtBottom(self) -> bool:
+    def _messagesScrollMetrics(self):
         bar = self._messagesScrollBar()
         if bar is None:
-            return True
+            return None
         try:
             value = bar.value
             if callable(value):
@@ -4052,33 +4913,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             maximum = bar.maximum
             if callable(maximum):
                 maximum = maximum()
-            return int(maximum) - int(value) <= 12
+            return int(value), int(maximum)
         except (AttributeError, RuntimeError, TypeError, ValueError):
-            return True
+            return None
 
-    def _restoreMessagesScroll(self, value) -> None:
-        bar = self._messagesScrollBar()
-        if bar is None:
-            return
-        try:
-            bar.setValue(int(value))
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            pass
+    def _messagesViewAtBottom(self) -> bool:
+        metrics = self._messagesScrollMetrics()
+        if metrics is None:
+            return True
+        value, maximum = metrics
+        return maximum - value <= 12
 
     def _renderMessagesView(self, force_bottom: bool = False) -> None:
         view = getattr(self, "messagesView", None)
         if view is None or not _qt_widget_is_valid(view):
             return
-        stay_at_bottom = bool(force_bottom) or self._messagesViewAtBottom()
-        saved = 0
-        if not stay_at_bottom:
-            bar = self._messagesScrollBar()
-            try:
-                saved = bar.value
-                if callable(saved):
-                    saved = saved()
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                saved = 0
         messages = getattr(self, "_messages", []) or []
         if not messages:
             markup = '<span style="color:%s">%s</span>' % (
@@ -4087,22 +4936,47 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
         else:
             markup = "".join(self._formatMessageHtml(item) for item in messages)
+        # Polling must not rewrite identical HTML: that resets the scrollbar slightly.
+        if markup == getattr(self, "_messagesViewHtml", None) and not force_bottom:
+            return
+        stay_at_bottom = bool(force_bottom) or self._messagesViewAtBottom()
+        from_bottom = 0
+        if not stay_at_bottom:
+            metrics = self._messagesScrollMetrics()
+            if metrics is not None:
+                value, maximum = metrics
+                from_bottom = max(0, maximum - value)
+        self._messagesViewHtml = markup
         try:
             view.setHtml(markup)
         except (RuntimeError, TypeError, ValueError):
             return
-        if stay_at_bottom:
-            self._scrollMessagesToEnd()
-            return
-        self._messagesScrollRestore = saved
+        self._messagesScrollRestore = "end" if stay_at_bottom else ("from_bottom", from_bottom)
         qt.QTimer.singleShot(0, self._applyMessagesScrollRestore)
 
     def _applyMessagesScrollRestore(self) -> None:
-        value = getattr(self, "_messagesScrollRestore", None)
+        payload = getattr(self, "_messagesScrollRestore", None)
         self._messagesScrollRestore = None
-        if value is None:
+        if payload is None:
             return
-        self._restoreMessagesScroll(value)
+        if payload == "end":
+            self._scrollMessagesToEnd()
+            return
+        if not isinstance(payload, (tuple, list)) or len(payload) != 2:
+            return
+        kind, from_bottom = payload
+        if kind != "from_bottom":
+            return
+        bar = self._messagesScrollBar()
+        if bar is None:
+            return
+        try:
+            maximum = bar.maximum
+            if callable(maximum):
+                maximum = maximum()
+            bar.setValue(max(0, int(maximum) - int(from_bottom)))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
 
     def _scrollMessagesToEnd(self) -> None:
         view = getattr(self, "messagesView", None)
@@ -4111,6 +4985,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         try:
             view.moveCursor(qt.QTextCursor.End)
             view.ensureCursorVisible()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+        bar = self._messagesScrollBar()
+        if bar is None:
+            return
+        try:
+            maximum = bar.maximum
+            if callable(maximum):
+                maximum = maximum()
+            bar.setValue(int(maximum))
         except (AttributeError, RuntimeError, TypeError, ValueError):
             pass
 
@@ -4145,15 +5029,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messageSendProject = ""
         self._messageSendAttempt = 0
         self._messageSendExisting = []
+        self._messageSendTasks = []
+        self._messageSendActivity = []
+        self._messageSendReads = {}
         self._stopMessageSendProcess()
 
     def _storedMessage(self, message: dict) -> dict:
-        return {
+        stored = {
             "id": str(message.get("id") or ""),
             "author": str(message.get("author") or "Someone"),
             "text": str(message.get("text") or ""),
             "at": str(message.get("at") or ""),
         }
+        kind = str(message.get("kind") or "").strip()
+        if kind:
+            stored["kind"] = kind
+        return stored
 
     def _startNextQueuedSend(self) -> None:
         if getattr(self, "_sending_message", False):
@@ -4164,9 +5055,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         message = queue.pop(0)
         self._messageSendQueue = queue
         self._messageSendCurrent = message
-        self._messageSendProject = self._currentProjectName()
+        if str(message.get("kind") or "") == "reads":
+            self._messageSendProject = str(message.get("full_name") or "").strip()
+        else:
+            self._messageSendProject = self._currentProjectName()
         self._messageSendAttempt = 0
         self._messageSendExisting = []
+        self._messageSendTasks = list(getattr(self, "_project_tasks", []) or [])
+        self._messageSendActivity = list(getattr(self, "_project_activity", []) or [])
+        self._messageSendReads = {}
         self._sending_message = True
         self._startMessageSendGet()
 
@@ -4231,28 +5128,120 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 process.deleteLater()
             except (RuntimeError, ValueError):
                 pass
-        if project != self._currentProjectName():
+        if str(current.get("kind") or "") != "reads" and project != self._currentProjectName():
             self._failPendingMessage(current, "Could not send the message.")
             return
         if phase == "get":
             try:
-                existing, sha = parse_project_messages_output(stdout, stderr, code)
+                existing, sha, tasks, activity, reads = parse_project_messages_output(
+                    stdout, stderr, code
+                )
             except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
                 self._failPendingMessage(current, str(error))
                 return
-            if any(item.get("id") == current.get("id") for item in existing):
+            if str(current.get("kind") or "") == "reads":
+                me = (self._githubLogin() or "").strip().lower()
+                merged_reads = dict(reads or {})
+                entry = dict(merged_reads.get(me) or {})
+                activity_stamp = str(current.get("activity_at") or "").strip()
+                messages_stamp = str(current.get("messages_at") or "").strip()
+                local = (getattr(self, "_reads_by_project", {}) or {}).get(project) or {}
+                if str(local.get("activity_at") or "") > activity_stamp:
+                    activity_stamp = str(local.get("activity_at") or "")
+                if str(local.get("messages_at") or "") > messages_stamp:
+                    messages_stamp = str(local.get("messages_at") or "")
+                if activity_stamp and activity_stamp > str(entry.get("activity_at") or ""):
+                    entry["activity_at"] = activity_stamp
+                if messages_stamp and messages_stamp > str(entry.get("messages_at") or ""):
+                    entry["messages_at"] = messages_stamp
+                ids = []
+                seen_ids = set()
+                for source in (
+                    entry.get("activity_ids"),
+                    current.get("activity_ids"),
+                    local.get("activity_ids"),
+                ):
+                    if not isinstance(source, list):
+                        continue
+                    for aid in source:
+                        text = str(aid or "").strip()
+                        if not text or text in seen_ids:
+                            continue
+                        seen_ids.add(text)
+                        ids.append(text)
+                if ids:
+                    entry["activity_ids"] = ids[-200:]
+                if me and entry:
+                    merged_reads[me] = entry
+                self._messageSendExisting = existing
+                self._messageSendTasks = tasks
+                self._messageSendActivity = activity
+                self._messageSendReads = merged_reads
+                self._messageSendPhase = "put"
+                self._startMessageSendProcess(
+                    project_messages_put_args(
+                        project,
+                        existing,
+                        sha,
+                        tasks=tasks,
+                        activity=activity,
+                        reads=merged_reads,
+                    )
+                )
+                return
+            activity_only = str(current.get("kind") or "") == "activity"
+            if activity_only:
+                if any(item.get("id") == current.get("id") for item in (activity or [])):
+                    self._messageSendTasks = tasks
+                    self._messageSendActivity = activity
+                    self._messageSendReads = reads
+                    self._confirmPendingMessage(current, existing)
+                    return
+            elif any(item.get("id") == current.get("id") for item in existing):
+                self._messageSendTasks = tasks
+                self._messageSendActivity = activity
+                self._messageSendReads = reads
                 self._confirmPendingMessage(current, existing)
                 return
+            try:
+                if not activity_only:
+                    tasks = self._tasksAfterMessageOp(current, tasks)
+            except GitHubAuthError as error:
+                self._failPendingMessage(current, str(error))
+                return
+            merged_activity = list(activity or [])
+            extra = self._activityEventFromQueuedMessage(current)
+            if extra and not any(
+                str(item.get("id") or "") == extra.get("id") for item in merged_activity
+            ):
+                merged_activity.append(extra)
             self._messageSendExisting = existing
+            self._messageSendTasks = tasks
+            self._messageSendActivity = merged_activity
+            self._messageSendReads = reads
             self._messageSendPhase = "put"
-            payload = list(existing) + [self._storedMessage(current)]
-            self._startMessageSendProcess(project_messages_put_args(project, payload, sha))
+            if activity_only:
+                payload = list(existing)
+            else:
+                payload = list(existing) + [self._storedMessage(current)]
+            self._startMessageSendProcess(
+                project_messages_put_args(
+                    project,
+                    payload,
+                    sha,
+                    tasks=tasks,
+                    activity=merged_activity,
+                    reads=reads,
+                )
+            )
             return
         if code == 0:
             existing = list(getattr(self, "_messageSendExisting", []) or [])
-            stored = self._storedMessage(current)
-            if not any(item.get("id") == stored.get("id") for item in existing):
-                existing.append(stored)
+            kind = str(current.get("kind") or "")
+            if kind not in ("activity", "reads"):
+                stored = self._storedMessage(current)
+                if not any(item.get("id") == stored.get("id") for item in existing):
+                    existing.append(stored)
             self._confirmPendingMessage(current, existing)
             return
         if is_project_messages_conflict(stdout, stderr):
@@ -4265,22 +5254,93 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self._failPendingMessage(current, "Could not send the message.")
 
+    def _activityEventFromQueuedMessage(self, message: dict):
+        if not isinstance(message, dict):
+            return None
+        if str(message.get("kind") or "") == "activity":
+            kind = str(message.get("activity_kind") or "").strip()
+            text = str(message.get("text") or "").strip()
+            if not kind or not text:
+                return None
+            try:
+                event = build_project_activity(
+                    str(message.get("author") or self._githubLogin() or "Someone"),
+                    kind,
+                    text,
+                )
+            except (GitHubAuthError, OSError, RuntimeError, ValueError):
+                return None
+            if message.get("id"):
+                event["id"] = str(message.get("id"))
+            if message.get("at"):
+                event["at"] = str(message.get("at"))
+            return event
+        op = str(message.get("task_op") or "").strip()
+        if op not in ("assign", "cancel", "submit", "accept"):
+            return None
+        author = str(message.get("author") or self._githubLogin() or "Someone")
+        junior = str(message.get("junior") or "").strip() or "a junior"
+        if op == "assign":
+            excerpt = _task_excerpt(message.get("description") or "")
+            text = (
+                "%s assigned %s to a task: %s" % (author, junior, excerpt)
+                if excerpt
+                else "%s assigned %s to a task." % (author, junior)
+            )
+        elif op == "cancel":
+            text = "%s cancelled the task for %s." % (author, junior)
+        elif op == "submit":
+            excerpt = _task_excerpt(message.get("description") or "")
+            text = (
+                "%s submitted their line for review for task: %s" % (author, excerpt)
+                if excerpt
+                else "%s submitted their line for review." % author
+            )
+        else:
+            excerpt = _task_excerpt(message.get("description") or "")
+            text = (
+                "%s accepted %s's line onto main for task: %s" % (author, junior, excerpt)
+                if excerpt
+                else "%s accepted %s's line onto main." % (author, junior)
+            )
+        try:
+            return build_project_activity(author, op, text)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            return None
+
     def _confirmPendingMessage(self, message: dict, existing: list) -> None:
         self._sending_message = False
         self._messageSendCurrent = None
         self._messageSendPhase = ""
-        self._applyProjectMessages(existing)
+        if str((message or {}).get("kind") or "") != "reads":
+            self._applyProjectMessages(
+                existing,
+                getattr(self, "_messageSendTasks", None),
+                getattr(self, "_messageSendActivity", None),
+                getattr(self, "_messageSendReads", None),
+            )
         self._startNextQueuedSend()
 
     def _failPendingMessage(self, message: dict, error_text: str) -> None:
+        kind = str((message or {}).get("kind") or "")
+        if kind == "reads":
+            self._sending_message = False
+            self._messageSendCurrent = None
+            self._messageSendPhase = ""
+            self._startNextQueuedSend()
+            return
         mid = (message or {}).get("id")
-        if mid:
+        if mid and kind != "activity":
             self._messages = [
                 item for item in (getattr(self, "_messages", []) or []) if item.get("id") != mid
             ]
             self._renderMessagesView()
         text = str((message or {}).get("text") or "")
-        if text and _qt_widget_is_valid(getattr(self, "messagesInput", None)):
+        if (
+            text
+            and kind not in ("task", "activity")
+            and _qt_widget_is_valid(getattr(self, "messagesInput", None))
+        ):
             if not _qt_line_text(self.messagesInput):
                 self.messagesInput.setText(text)
         self._appendFeed(str(error_text or "Could not send the message.").split("\n")[0], error=True)
@@ -4288,6 +5348,214 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messageSendCurrent = None
         self._messageSendPhase = ""
         self._startNextQueuedSend()
+
+    def _recordActivity(self, full_name: str, kind: str, text: str) -> None:
+        name = str(full_name or "").strip()
+        if not name:
+            return
+        try:
+            publish_project_activity(name, kind, text)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            # Activity is secondary: never block Share / People / Join / review.
+            return
+
+    def _canAssignTask(self) -> bool:
+        if not self._connected or not self._hasSelectedProject():
+            return False
+        if self._isCurrentProjectOwner():
+            return True
+        name = self._currentProjectName()
+        cache = getattr(self, "_people_access_cache", {}) or {}
+        return cache.get((name or "").lower()) == PEOPLE_ACCESS_SENIOR
+
+    def _tasksAfterMessageOp(self, message, tasks):
+        current = list(tasks or [])
+        op = str((message or {}).get("task_op") or "").strip()
+        if not op:
+            return current
+        junior = str((message or {}).get("junior") or "").strip()
+        senior = str((message or {}).get("senior") or "").strip()
+        description = normalize_task_title((message or {}).get("description"))
+        if op == "assign":
+            if not junior or not senior:
+                raise GitHubAuthError("Select a junior first.")
+            if not description:
+                raise GitHubAuthError("Write a short description first.")
+            if any(
+                str(task.get("junior") or "").lower() == junior.lower()
+                and str(task.get("status") or "") != "accepted"
+                for task in current
+            ):
+                raise GitHubAuthError("%s already has a task." % junior)
+            current.append(
+                {
+                    "id": str(message.get("task_id") or message.get("id") or ""),
+                    "junior": junior,
+                    "senior": senior,
+                    "description": description,
+                    "status": "",
+                }
+            )
+            return current
+        if op == "submit":
+            return self._tasksWithStatus(
+                current,
+                message,
+                "submitted",
+                snapshot=description,
+            )
+        if op == "accept":
+            return self._tasksWithStatus(current, message, "accepted")
+        if op == "cancel":
+            tid = str((message or {}).get("task_id") or "").strip()
+            junior_key = junior.lower()
+            kept = []
+            removed = False
+            for task in current:
+                if str(task.get("status") or "") == "accepted":
+                    kept.append(task)
+                    continue
+                matches = bool(tid) and str(task.get("id") or "") == tid
+                if not matches and not tid and junior_key:
+                    matches = str(task.get("junior") or "").lower() == junior_key
+                if matches and not removed:
+                    removed = True
+                    continue
+                kept.append(task)
+            return kept
+        return current
+
+    def _tasksWithStatus(self, tasks, message, status: str, snapshot: str = ""):
+        tid = str((message or {}).get("task_id") or "").strip()
+        junior_key = str((message or {}).get("junior") or "").strip().lower()
+        updated = []
+        matched = False
+        for task in tasks or []:
+            if str(task.get("status") or "") == "accepted":
+                updated.append(task)
+                continue
+            matches = bool(tid) and str(task.get("id") or "") == tid
+            if not matches and not tid and junior_key:
+                matches = str(task.get("junior") or "").lower() == junior_key
+            if matches and not matched:
+                task = dict(task)
+                task["status"] = status
+                if status == "submitted":
+                    task["submitted_description"] = snapshot or str(task.get("description") or "")
+                matched = True
+            updated.append(task)
+        if not matched:
+            raise GitHubAuthError("That task is no longer active.")
+        return updated
+
+    def _enqueueTaskMessage(self, message: dict) -> None:
+        try:
+            self._project_tasks = self._tasksAfterMessageOp(
+                message, getattr(self, "_project_tasks", []) or []
+            )
+        except GitHubAuthError as error:
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        message["pending"] = True
+        current = list(getattr(self, "_messages", []) or [])
+        current.append(message)
+        self._messages = current
+        stamp = str(message.get("at") or "")
+        project = self._currentProjectName() if self._hasSelectedProject() else ""
+        if project and stamp:
+            self._bumpLocalReadCursor(project, messages_at=stamp)
+        self._messages_unread = 0
+        self._renderMessagesView(force_bottom=True)
+        self._updateMessagesBadge()
+        queue = list(getattr(self, "_messageSendQueue", []) or [])
+        queue.append(message)
+        self._messageSendQueue = queue
+        if not getattr(self, "_sending_message", False):
+            self._startNextQueuedSend()
+
+    def onOpenTask(self) -> None:
+        if not self._connected or not self._hasSelectedProject():
+            self._appendFeed("Select a project first.", error=True)
+            return
+        can_assign = self._canAssignTask()
+        people = []
+        button = getattr(self, "messagesTaskButton", None)
+        if button is not None:
+            button.setEnabled(False)
+        if can_assign:
+            self._openProgress("Task", "Reading who is on this project…")
+            try:
+                self._updateProgress("Reading who is on this project…")
+                people = list_project_people(self._currentProjectName())
+            except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+                self._closeProgress()
+                if button is not None:
+                    button.setEnabled(True)
+                self._appendFeed(str(error).split("\n")[0], error=True)
+                return
+            self._closeProgress()
+        try:
+            dialog = TaskDialog(
+                slicer.util.mainWindow(),
+                people=people,
+                tasks=getattr(self, "_project_tasks", []) or [],
+                me=self._githubLogin(),
+                can_assign=can_assign,
+            )
+        except Exception as error:
+            if button is not None:
+                button.setEnabled(True)
+            self._appendFeed("Could not open tasks. %s" % str(error).split("\n")[0], error=True)
+            return
+        if can_assign:
+            dialog.set_assign_handler(self._onAssignTaskChosen)
+            dialog.set_cancel_handler(self._onCancelTaskChosen)
+        self._task_dialog_open = True
+        try:
+            dialog.exec_()
+        finally:
+            self._task_dialog_open = False
+            if button is not None:
+                button.setEnabled(True)
+
+    def _onAssignTaskChosen(self, dialog, junior: str, description: str) -> None:
+        senior = self._githubLogin()
+        try:
+            message = build_project_message(
+                senior,
+                "assigned %s to this task: %s" % (junior, _task_excerpt(description)),
+                kind="task",
+            )
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            dialog.set_status(str(error).split("\n")[0], error=True)
+            return
+        message["task_op"] = "assign"
+        message["junior"] = junior
+        message["senior"] = senior
+        message["description"] = normalize_task_title(description)
+        message["task_id"] = message.get("id")
+        dialog.accept()
+        self._enqueueTaskMessage(message)
+        self._appendFeed("Assigned %s to this task." % junior)
+
+    def _onCancelTaskChosen(self, dialog, task: dict) -> None:
+        junior = str((task or {}).get("junior") or "").strip()
+        try:
+            message = build_project_message(
+                self._githubLogin(),
+                "cancelled the task for %s." % junior,
+                kind="task",
+            )
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            dialog.set_status(str(error).split("\n")[0], error=True)
+            return
+        message["task_op"] = "cancel"
+        message["task_id"] = str((task or {}).get("id") or "")
+        message["junior"] = junior
+        message["senior"] = str((task or {}).get("senior") or "")
+        dialog.accept()
+        self._enqueueTaskMessage(message)
+        self._appendFeed("Cancelled the task for %s." % junior)
 
     def _onSendMessage(self) -> None:
         if not self._connected or not self._hasSelectedProject():
@@ -4305,12 +5573,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         current = list(getattr(self, "_messages", []) or [])
         current.append(message)
         self._messages = current
-        self._messages_baseline_ready = True
-        read_ids = getattr(self, "_messages_read_ids", set())
-        if message.get("id"):
-            read_ids.add(message.get("id"))
-        self._messages_read_ids = read_ids
+        stamp = str(message.get("at") or "")
+        project = self._currentProjectName() if self._hasSelectedProject() else ""
+        if project and stamp:
+            self._bumpLocalReadCursor(project, messages_at=stamp)
+        self._messages_unread = 0
         self._renderMessagesView(force_bottom=True)
+        self._updateMessagesBadge()
         queue = list(getattr(self, "_messageSendQueue", []) or [])
         queue.append(message)
         self._messageSendQueue = queue
@@ -4325,37 +5594,245 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed(str(error).split("\n")[0], error=True)
 
     def _showNotificationsPopup(self) -> None:
-        items = list(getattr(self, "_notifications", []) or [])
+        items = []
+        for item in getattr(self, "_notifications", []) or []:
+            row = dict(item)
+            row["_key"] = self._notificationKey(item)
+            items.append(row)
         dialog = NotificationsDialog(
             slicer.util.mainWindow(),
             items=items,
             empty_text=self._notificationsEmptyText(),
+            unread_keys=self._unreadNotificationKeys(),
         )
         self._notifications_popup_open = True
         try:
-            dialog.exec_()
+            result = dialog.exec_()
         finally:
             self._notifications_popup_open = False
-        chosen = getattr(dialog, "chosen", None)
-        if not chosen:
+        if getattr(dialog, "mark_all", False):
+            self._markAllNotificationsRead()
             return
-        if chosen.get("kind") == "invite":
-            self._openInvitationNotification(chosen)
-        else:
-            self._reviewShareRequest(chosen)
+        chosen = getattr(dialog, "chosen", None)
+        if not chosen or result != qt.QDialog.Accepted:
+            return
+        self._markNotificationRead(chosen)
+        self._openNotificationDetail(chosen)
+
+    def _openNotificationDetail(self, item: dict) -> None:
+        detail = NotificationDetailDialog(slicer.util.mainWindow(), item)
+        detail.exec_()
+        if str((item or {}).get("kind") or "") != "invite":
+            return
+        choice = str(getattr(detail, "choice", "") or "")
+        if choice == "join":
+            self._offering_invitations = True
+            try:
+                self._joinIncomingInvitation(item)
+            finally:
+                self._offering_invitations = False
+                if self._connected:
+                    self._runNotificationChecks(announce=False)
+        elif choice == "decline":
+            self._offering_invitations = True
+            try:
+                self._declineIncomingInvitation(item)
+            finally:
+                self._offering_invitations = False
+                if self._connected:
+                    self._runNotificationChecks(announce=False)
 
     def _openInvitationNotification(self, invitation: dict) -> None:
-        self._offering_invitations = True
+        self._markNotificationRead(invitation)
+        self._openNotificationDetail(invitation)
+
+    def _taskRoleForLane(self, lane: str):
+        lane_key = str(lane or "").strip().lower()
+        if not lane_key or lane_key == "main":
+            return None
+        me = (self._githubLogin() or "").strip().lower()
+        if not me:
+            return None
+        own = None
+        review = None
+        for task in getattr(self, "_project_tasks", []) or []:
+            if str(task.get("status") or "") == "accepted":
+                continue
+            junior = str(task.get("junior") or "").strip()
+            senior = str(task.get("senior") or "").strip()
+            if review_lane_slug(junior).lower() != lane_key:
+                continue
+            if junior.lower() == me:
+                own = task
+            elif senior.lower() == me:
+                review = task
+        if own:
+            return ("submit", own)
+        if review:
+            return ("review", review)
+        return None
+
+    def _openReviewForJunior(self, junior: str) -> dict | None:
+        name = str(junior or "").strip()
+        if not name:
+            return None
+        full_name = self._currentProjectName()
+        branch = review_branch_for(name).lower()
+        for item in getattr(self, "_notifications", []) or []:
+            if str(item.get("kind") or "") != "review":
+                continue
+            if str(item.get("full_name") or "").lower() != full_name.lower():
+                continue
+            author = str(item.get("author") or "").strip().lower()
+            item_branch = str(item.get("branch") or "").strip().lower()
+            if author == name.lower() or (branch and item_branch == branch):
+                return item
         try:
-            choice = self._promptJoinProject(invitation)
-            if choice == "join":
-                self._joinIncomingInvitation(invitation)
-            elif choice == "decline":
-                self._declineIncomingInvitation(invitation)
-        finally:
-            self._offering_invitations = False
-            if self._connected:
-                self._runNotificationChecks(announce=False)
+            return find_open_review_request(full_name, name)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            return None
+
+    def _reviewActionsForVersion(self, spec, history) -> dict:
+        role = self._taskRoleForLane(str((spec or {}).get("branch") or ""))
+        if not role:
+            return {}
+        kind, task = role
+        if kind == "review":
+            text = str(task.get("submitted_description") or task.get("description") or "").strip()
+        else:
+            text = str(task.get("description") or "").strip()
+        payload = {
+            "task_text": text,
+            "task_senior": str(task.get("senior") or "").strip(),
+        }
+        if kind == "submit":
+            payload["submit"] = True
+            return payload
+        request = self._openReviewForJunior(str(task.get("junior") or ""))
+        if not request:
+            return {}
+        payload["accept"] = True
+        payload["decline"] = True
+        return payload
+
+    def onVersionReviewAction(self, action: str, spec) -> None:
+        lane = str((spec or {}).get("branch") or "")
+        role = self._taskRoleForLane(lane)
+        if action == "submit":
+            if not role or role[0] != "submit":
+                self._appendFeed("You can submit only your own line.", error=True)
+                return
+            self._submitOwnReviewLine()
+            return
+        if action not in ("accept", "decline"):
+            return
+        if not role or role[0] != "review":
+            self._appendFeed("You can review only a junior you assigned.", error=True)
+            return
+        try:
+            request = self._openReviewForJunior(str(role[1].get("junior") or ""))
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        if not request:
+            self._appendFeed("Nothing is waiting for review on this line.", error=True)
+            return
+        junior = str(role[1].get("junior") or "this junior")
+        if action == "accept":
+            confirmed = slicer.util.confirmYesNoDisplay(
+                "Accept %s's line onto main?" % junior,
+                windowTitle="Accept",
+            )
+            if not confirmed:
+                return
+            if self._acceptReviewedShareRequest(request):
+                self._markTaskAccepted(role[1])
+        else:
+            confirmed = slicer.util.confirmYesNoDisplay(
+                "Decline %s's line?\n\nThe versions stay in the version tree." % junior,
+                windowTitle="Decline",
+            )
+            if not confirmed:
+                return
+            self._declineReviewedShareRequest(request)
+        self._updateActiveVersionIndicators()
+
+    def _submitOwnReviewLine(self) -> None:
+        role = self._taskRoleForLane(review_lane_slug(self._githubLogin()))
+        if not role or role[0] != "submit":
+            self._appendFeed("You can submit only your own line.", error=True)
+            return
+        task = role[1]
+        description = str(task.get("description") or "").strip()
+        if self._openReviewForJunior(self._githubLogin()):
+            slicer.util.infoDisplay(
+                "Your line is already submitted.\n\n"
+                "The request was received and is waiting for a senior "
+                "to Accept or Decline it.",
+                windowTitle="Already submitted",
+            )
+            return
+        full_name = self._currentProjectName()
+        self._openProgress("Submit", "Sending your line for review…")
+        try:
+            self._updateProgress("Sending your line for review…")
+            outcome = submit_review_line(full_name)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        self._closeProgress()
+        if outcome == "updated":
+            if str(task.get("status") or "") != "submitted":
+                self._markTaskSubmitted(task, description)
+            slicer.util.infoDisplay(
+                "Your line is already submitted.\n\n"
+                "The request was received and is waiting for a senior "
+                "to Accept or Decline it.",
+                windowTitle="Already submitted",
+            )
+            return
+        self._markTaskSubmitted(task, description)
+        self._appendFeed("Sent your line for review. It is not on main yet.")
+
+    def _markTaskSubmitted(self, task: dict, description: str) -> None:
+        junior = str((task or {}).get("junior") or "").strip()
+        excerpt = _task_excerpt(description)
+        body = "submitted this task: %s" % excerpt if excerpt else "submitted this task."
+        try:
+            message = build_project_message(self._githubLogin(), body, kind="task")
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        message["task_op"] = "submit"
+        message["task_id"] = str((task or {}).get("id") or "")
+        message["junior"] = junior
+        message["senior"] = str((task or {}).get("senior") or "")
+        message["description"] = normalize_task_title(description)
+        self._enqueueTaskMessage(message)
+
+    def _markTaskAccepted(self, task: dict) -> None:
+        junior = str((task or {}).get("junior") or "").strip()
+        description = str(
+            (task or {}).get("submitted_description")
+            or (task or {}).get("description")
+            or ""
+        ).strip()
+        try:
+            message = build_project_message(
+                self._githubLogin(),
+                "accepted the task for %s." % junior,
+                kind="task",
+            )
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        message["task_op"] = "accept"
+        message["task_id"] = str((task or {}).get("id") or "")
+        message["junior"] = junior
+        message["senior"] = str((task or {}).get("senior") or "")
+        message["description"] = normalize_task_title(description)
+        self._enqueueTaskMessage(message)
 
     def _reviewShareRequest(self, request: dict) -> None:
         full_name = request.get("full_name") or ""
@@ -4389,7 +5866,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._clearChangeFlags()
             self._unshared_version = unshared
             self._syncAssetDataObservers()
-            self._rememberPeopleAccess(full_name, "share")
+            self._rememberPeopleAccess(full_name, PEOPLE_ACCESS_SENIOR)
         finally:
             self._suppress_asset_ui_updates -= 1
             self._suppress_dirty -= 1
@@ -4476,6 +5953,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._armLoadSettle()
         self._appendFeed("Accepted the version from %s. It is now on the project." % author)
         self._runNotificationChecks(announce=False)
+        return True
 
     def _declineReviewedShareRequest(self, request: dict) -> None:
         author = request.get("author") or "the colleague"
@@ -4502,6 +5980,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
         self._closeProgress()
+        me = self._githubLogin() or "Someone"
+        excerpt = self._taskExcerptForJunior(author)
+        decline_text = (
+            "%s declined %s's line for task: %s" % (me, author, excerpt)
+            if excerpt
+            else "%s declined %s's line." % (me, author)
+        )
+        self._recordActivity(
+            request.get("full_name") or self._currentProjectName(),
+            "decline",
+            decline_text,
+        )
         self._appendFeed(
             "Declined the version from %s. Their versions stay in the version tree." % author
         )
@@ -4685,7 +6175,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             commit_local_version(local_path, message)
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
-            version_id = self._applyProjectHistoryBundle(history)
+            version_id = self._applyProjectHistoryBundle(history, follow_head=True)
             self._clearDirtyAssets()
             self._unshared_version = True
             self._syncAssetDataObservers()
@@ -4726,13 +6216,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         try:
             needs_approval = (
                 not self._isCurrentProjectOwner()
-                and self._rememberPeopleAccess(full_name) == PEOPLE_ACCESS_APPROVAL
+                and self._rememberPeopleAccess(full_name) == PEOPLE_ACCESS_JUNIOR
             )
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             needs_approval = self._shareNeedsApproval()
         self.shareButton.setEnabled(False)
         if needs_approval:
-            self._shareForReview(local_path, full_name)
+            self._shareAsBranch(local_path)
+            return
+        on_branch = False
+        try:
+            on_branch = work_is_on_review_branch(local_path)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            on_branch = False
+        choice = self._promptShareDestination(on_branch)
+        if choice == "cancel":
+            self._appendFeed("Share cancelled.")
+            self._updateVersionActionButtons()
+            return
+        if choice == "branch":
+            self._shareAsBranch(local_path)
         else:
             self._shareToProject(local_path)
 
@@ -4752,36 +6255,53 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
         unshared = self._historyHasUnsharedVersion(history)
-        self._applyProjectHistoryBundle(history)
+        self._applyProjectHistoryBundle(history, follow_head=True)
         self._unshared_version = unshared
         self._closeProgress()
         self._refreshUiState()
         self._unshared_version = unshared
         self._updateVersionActionButtons()
-        self._appendFeed("Project shared.")
+        me = self._githubLogin() or "Someone"
+        self._recordActivity(
+            self._currentProjectName(),
+            "share",
+            "%s shared versions on main." % me,
+        )
+        self._appendFeed("Project shared on main.")
         if self._unsaved_changes:
             self._appendFeed(
                 "Unsaved changes are still on this computer. Save a version if you want them shared later."
             )
 
-    def _shareForReview(self, local_path: str, full_name: str) -> None:
-        self._appendFeed("Sending the version to the owner…")
-        self._openProgress("Share", "Sending the version to the owner…")
+    def _shareAsBranch(self, local_path: str) -> None:
+        self._appendFeed("Sharing on a branch beside main…")
+        self._openProgress("Share", "Sharing on a branch beside main…")
+        history = {}
         try:
-            self._updateProgress("Sending the version to the owner…")
-            outcome = submit_share_request(local_path, full_name)
+            self._updateProgress("Sharing on a branch beside main…")
+            publish_review_branch(local_path)
+            self._updateProgress("Updating version history…")
+            history = read_project_history(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._updateVersionActionButtons()
             slicer.util.warningDisplay(str(error))
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
+        unshared = self._historyHasUnsharedVersion(history)
+        self._applyProjectHistoryBundle(history, follow_head=True)
+        self._unshared_version = unshared
         self._closeProgress()
+        self._refreshUiState()
+        self._unshared_version = unshared
         self._updateVersionActionButtons()
-        if outcome == "updated":
-            self._appendFeed("Updated the review request. The owner can open it after they Connect.")
-        else:
-            self._appendFeed("Sent to the owner for review. It is not on the project yet.")
+        me = self._githubLogin() or "Someone"
+        self._recordActivity(
+            self._currentProjectName(),
+            "share",
+            "%s shared versions on their line." % me,
+        )
+        self._appendFeed("Shared on a branch beside main. It is not on main yet.")
 
     def onOpenProject(self) -> None:
         if not self._canOpenProject():
@@ -5030,6 +6550,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         version_id: str,
         notify: bool = False,
         sync_table: bool = True,
+        prompt: bool = True,
     ) -> bool:
         if not version_id:
             return False
@@ -5041,7 +6562,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not self._projectDataIsLoaded():
             self._appendFeed("Open the project first.", error=True)
             return False
-        if not self._promptSwitchVersion(version_id):
+        if prompt and not self._promptSwitchVersion(version_id):
             self._appendFeed("Switch version cancelled.")
             return False
         sha = ((getattr(self, "_project_history_bundle", None) or {}).get("sha_by_id") or {}).get(
@@ -5151,6 +6672,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         canvas = getattr(self.logic, "_historyCanvas", None) if self.logic else None
         if canvas is not None and hasattr(canvas, "set_active_version_id"):
             try:
+                bundle = getattr(self, "_project_history_bundle", None) or {}
+                specs = list(bundle.get("version_specs") or [])
+                if specs and hasattr(canvas, "version_specs"):
+                    canvas.version_specs = specs
+                    canvas._specs_by_id = {spec["id"]: spec for spec in specs}
+                    canvas.commit_history_by_id = CollaborativeVersioningLib.GraphCanvas.commit_history_lookup(
+                        bundle.get("commit_history", [])
+                    )
                 canvas.active_version_id = None
                 canvas.set_active_version_id(active)
             except (RuntimeError, ValueError):
@@ -5293,6 +6822,18 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
         if not widget:
             return
         widget._checkoutVersion(version_id, notify=True, sync_table=True)
+
+    def reviewActionsForVersion(self, spec, history) -> dict:
+        widget = self.widget
+        if not widget:
+            return {}
+        return widget._reviewActionsForVersion(spec, history)
+
+    def onVersionReviewAction(self, action: str, spec) -> None:
+        widget = self.widget
+        if not widget:
+            return
+        widget.onVersionReviewAction(action, spec)
 
     def _loadGraphModule(self):
         import CollaborativeVersioningLib.GraphCanvas as graph_module

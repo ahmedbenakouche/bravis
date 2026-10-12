@@ -679,10 +679,22 @@ QPushButton {{
   min-height: 24px;
   border-radius: 4px;
   border: none;
+  outline: none;
 }}
-QPushButton:hover:enabled {{ background-color: {ACCENT_ICE_HOVER}; color: {TEXT_ON_ICE}; }}
-QPushButton:checked {{ background-color: {ACCENT_ICE_HOVER}; color: {TEXT_ON_ICE}; }}
-QPushButton:pressed:enabled {{ background-color: {ACCENT_ICE_HOVER}; color: {TEXT_ON_ICE}; }}
+QPushButton:hover:enabled,
+QPushButton:focus:hover:enabled,
+QPushButton:checked:hover:enabled {{
+  background-color: {ACCENT_ICE_HOVER};
+  color: {TEXT_ON_ICE};
+}}
+QPushButton:focus,
+QPushButton:checked,
+QPushButton:checked:focus,
+QPushButton:pressed:enabled {{
+  background-color: {ACCENT_ICE};
+  color: {TEXT_ON_ICE};
+  outline: none;
+}}
 {btn_disabled}
 """,
         "TABLE_STYLE": f"""

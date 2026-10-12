@@ -376,16 +376,47 @@ def _draw_coverage_badges(scene, x, y, w, coverage):
     )
 
 
+def _draw_ontology_edge(scene, parent, child, color=None, width=2):
+    """Orthogonal tree: leave the bottom-center of the parent, then drop to the child."""
+    if color is None:
+        color = _ui.GRAPH_EDGE
+    px = parent["x"] + parent["w"] / 2.0
+    cx = child["x"] + child["w"] / 2.0
+    start_y = parent["y"] + parent["h"]
+    end_y = child["y"]
+    pen = qt.QPen(qt.QColor(color), width)
+    if abs(px - cx) < 1:
+        scene.addLine(px, start_y, cx, end_y, pen)
+        return
+    mid_y = start_y + (end_y - start_y) / 2.0
+    scene.addLine(px, start_y, px, mid_y, pen)
+    scene.addLine(px, mid_y, cx, mid_y, pen)
+    scene.addLine(cx, mid_y, cx, end_y, pen)
+
+
 def _draw_tree_edge(scene, parent, child, color=None, width=2):
     if color is None:
         color = _ui.GRAPH_EDGE
-    px, _ = _node_center(parent)
-    cx, _ = _node_center(child)
-    mid_y = parent["y"] + parent["h"] + (child["y"] - parent["y"] - parent["h"]) / 2.0
+    px, py = _node_center(parent)
+    cx, cy = _node_center(child)
     pen = qt.QPen(qt.QColor(color), width)
-    scene.addLine(px, parent["y"] + parent["h"], px, mid_y, pen)
-    scene.addLine(px, mid_y, cx, mid_y, pen)
-    scene.addLine(cx, mid_y, cx, child["y"], pen)
+    parent_branch = parent.get("branch") or "main"
+    child_branch = child.get("branch") or "main"
+    if abs(px - cx) < 1:
+        scene.addLine(px, parent["y"] + parent["h"], cx, child["y"], pen)
+        return
+    merge_in = child.get("merge") or (
+        child_branch == "main" and parent_branch != "main"
+    )
+    if merge_in:
+        start_y = parent["y"] + parent["h"] if py <= cy else parent["y"]
+        end_x = child["x"] + child["w"] if px > cx else child["x"]
+        scene.addLine(px, start_y, px, cy, pen)
+        scene.addLine(px, cy, end_x, cy, pen)
+        return
+    start_x = parent["x"] + parent["w"] if cx > px else parent["x"]
+    scene.addLine(start_x, py, cx, py, pen)
+    scene.addLine(cx, py, cx, child["y"], pen)
 
 
 def _branch_color(branch):
@@ -405,21 +436,67 @@ def _branch_color(branch):
     return palette[acc % len(palette)]
 
 
-def _lane_centers_for(specs):
-    branches = []
-    seen = set()
+def _ranges_overlap(first, second):
+    return not (first[1] < second[0] or second[1] < first[0])
+
+
+def _side_branch_spans(specs, rows):
+    specs_by_id = {spec["id"]: spec for spec in specs or []}
+    spans = {}
     for spec in specs or []:
         branch = spec.get("branch") or "main"
-        if branch in seen:
+        if branch == "main":
             continue
-        seen.add(branch)
-        branches.append(branch)
-    sides = sorted(branch for branch in branches if branch != "main")
+        row = rows.get(spec["id"], 0)
+        current = spans.get(branch)
+        if current is None:
+            spans[branch] = (row, row)
+        else:
+            spans[branch] = (min(current[0], row), max(current[1], row))
+    for spec in specs or []:
+        if not spec.get("merge"):
+            continue
+        merge_row = rows.get(spec["id"], 0)
+        for source_id in spec.get("merge_from") or []:
+            source = specs_by_id.get(source_id) or {}
+            branch = source.get("branch") or "main"
+            if branch == "main" or branch not in spans:
+                continue
+            lo, hi = spans[branch]
+            spans[branch] = (lo, max(hi, merge_row))
+    return spans
+
+
+def _assign_side_lanes(specs, rows):
+    """Closest free column: right of main, then left, then further out. Reuse when ranges do not overlap."""
+    assigned = {"main": 0}
+    occupied = defaultdict(list)
+    spans = _side_branch_spans(specs, rows)
+    for branch in sorted(spans, key=lambda name: (spans[name][0], name)):
+        span = spans[branch]
+        chosen = None
+        for offset in range(1, 24):
+            for lane in (offset, -offset):
+                if all(not _ranges_overlap(span, other) for other in occupied[lane]):
+                    chosen = lane
+                    break
+            if chosen is not None:
+                break
+        if chosen is None:
+            chosen = max(assigned.values(), default=0) + 1
+        assigned[branch] = chosen
+        occupied[chosen].append(span)
+    return assigned
+
+
+def _lane_centers_for(specs, rows=None):
+    if rows is None:
+        rows = _compute_version_rows(specs or [])
+    assigned = _assign_side_lanes(specs, rows)
+    spacing = 200
     centers = {"main": MAIN_LANE_X}
-    spacing = 190
-    main_x = MAIN_LANE_X
-    for index, branch in enumerate(sides):
-        centers[branch] = main_x + (index + 1) * spacing
+    for branch, lane in assigned.items():
+        centers[branch] = MAIN_LANE_X + lane * spacing
     return centers
 
 
@@ -499,7 +576,7 @@ def _layout_version_graph(specs):
     """Layout : colonnes par ligne de versions, lignes sans chevauchement."""
     specs_by_id = {spec["id"]: dict(spec) for spec in specs}
     rows = _compute_version_rows(specs)
-    centers = _lane_centers_for(specs)
+    centers = _lane_centers_for(specs, rows)
 
     positions = {}
     for node_id, spec in specs_by_id.items():
@@ -522,6 +599,12 @@ def _layout_version_graph(specs):
         }
 
     _resolve_vertical_overlaps(positions)
+    if positions:
+        min_x = min(node["x"] for node in positions.values())
+        if min_x < MARGIN:
+            shift = MARGIN - min_x
+            for node in positions.values():
+                node["x"] += shift
 
     return positions, _version_graph_edges(specs)
 
@@ -771,9 +854,25 @@ class VersionHistoryCanvas(InteractiveGraphView):
         if not spec:
             return
         history = self.commit_history_by_id.get(node_id, {})
-        checked_out = node_id == self.active_version_id
-        dialog = _VersionInfoDialog(self, spec, history, checked_out=checked_out)
-        dialog.exec_()
+        dialog = _VersionInfoDialog(
+            self,
+            spec,
+            history,
+            actions=self._review_actions(spec, history),
+        )
+        if dialog.exec_() != qt.QDialog.Accepted or not dialog.chosen:
+            return
+        if hasattr(self.logic, "onVersionReviewAction"):
+            self.logic.onVersionReviewAction(dialog.chosen, spec)
+
+    def _review_actions(self, spec, history):
+        if not hasattr(self.logic, "reviewActionsForVersion"):
+            return {}
+        try:
+            actions = self.logic.reviewActionsForVersion(spec, history or {})
+        except Exception:
+            return {}
+        return actions if isinstance(actions, dict) else {}
 
     def _on_single_click_timeout(self):
         node_id = self._pending_node_id
@@ -903,10 +1002,11 @@ def _node_id_at_scene_pos(nodes_by_id, scene_pos):
 class _VersionInfoDialog(qt.QDialog):
     """Read-only details for a version graph node."""
 
-    def __init__(self, parent, spec, history=None, checked_out=False):
+    def __init__(self, parent, spec, history=None, actions=None):
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("Version details")
         self.setMinimumWidth(440)
+        self.chosen = ""
         layout = qt.QVBoxLayout(self)
         form = qt.QFormLayout()
 
@@ -918,18 +1018,10 @@ class _VersionInfoDialog(qt.QDialog):
 
         history = history or {}
         message = history.get("message") or spec.get("label", "")
-        roles = []
-        if checked_out:
-            roles.append("Checked out")
-        if spec.get("merge"):
-            roles.append("Merge commit")
 
         add_row("Version:", str(spec.get("tag", "")))
         line = spec.get("branch") or ""
-        if line == "main":
-            line = "Shared project"
-        add_row("Line:", str(line))
-        add_row("Title:", str(spec.get("label", "")))
+        add_row("Line:", "main" if line == "main" else str(line))
         add_row("Message:", message)
         add_row("Date:", history.get("date", ""))
         add_row("Author:", history.get("author", ""))
@@ -939,16 +1031,66 @@ class _VersionInfoDialog(qt.QDialog):
             merge_from = spec.get("merge_from") or []
             add_row("Merge from:", ", ".join(merge_from) if merge_from else "—")
             add_row("Merge into:", str(spec.get("parent") or "—"))
-        add_row("Role:", ", ".join(roles) if roles else "—")
+        task_text = str((actions or {}).get("task_text") or "").strip()
+        task_senior = str((actions or {}).get("task_senior") or "").strip()
+        if task_text:
+            shown = ("%s: %s" % (task_senior, task_text)) if task_senior else task_text
+            task_label = qt.QLabel(shown)
+            task_label.setWordWrap(True)
+            task_label.setFixedWidth(300)
+            task_label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
+            form.addRow("Task:", task_label)
 
         layout.addLayout(form)
 
-        footer = qt.QHBoxLayout()
-        footer.addStretch(1)
+        allowed = actions or {}
+        has_action = bool(allowed.get("submit") or allowed.get("accept") or allowed.get("decline"))
+        if has_action:
+            actions_row = qt.QHBoxLayout()
+            actions_row.setSpacing(16)
+            actions_row.addStretch(1)
+
+            def add_action(label, handler, style):
+                button = qt.QPushButton(label)
+                button.setMinimumWidth(120)
+                button.setMinimumHeight(32)
+                if style:
+                    button.setStyleSheet(style)
+                button.connect("clicked()", handler)
+                actions_row.addWidget(button)
+
+            if allowed.get("submit"):
+                add_action("Submit", self._chooseSubmit, _ui.BTN_CREATE)
+            if allowed.get("accept"):
+                add_action("Accept", self._chooseAccept, _ui.BTN_CREATE)
+            if allowed.get("decline"):
+                add_action("Decline", self._chooseDecline, _ui.BTN_DELETE)
+            layout.addSpacing(14)
+            layout.addLayout(actions_row)
+
+        layout.addSpacing(10)
+        close_row = qt.QHBoxLayout()
+        close_row.addStretch(1)
         close_btn = qt.QPushButton("Close")
-        close_btn.connect("clicked()", self.accept)
-        footer.addWidget(close_btn)
-        layout.addLayout(footer)
+        close_btn.setMinimumWidth(120)
+        close_btn.setMinimumHeight(32)
+        close_btn.setStyleSheet(_ui.BTN_SECONDARY)
+        close_btn.connect("clicked()", self.reject)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+    def _chooseSubmit(self):
+        self._choose("submit")
+
+    def _chooseAccept(self):
+        self._choose("accept")
+
+    def _chooseDecline(self):
+        self._choose("decline")
+
+    def _choose(self, name):
+        self.chosen = name
+        self.accept()
 
 
 COVERAGE_HELP_TEXT = """Left mark (top-left corner)
@@ -1300,7 +1442,7 @@ class DependencyGraphCanvas(InteractiveGraphView):
 
         for parent_id, child_id in edges:
             if parent_id in nodes_by_id and child_id in nodes_by_id:
-                _draw_tree_edge(self._graphe_scene, nodes_by_id[parent_id], nodes_by_id[child_id])
+                _draw_ontology_edge(self._graphe_scene, nodes_by_id[parent_id], nodes_by_id[child_id])
 
         for node in nodes_by_id.values():
             coverage = None

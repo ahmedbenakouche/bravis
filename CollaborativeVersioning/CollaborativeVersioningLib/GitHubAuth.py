@@ -618,6 +618,21 @@ def extract_project_version(repo_dir: str, sha: str) -> str:
     return dest
 
 
+def head_can_update_shared_project(repo_dir: str) -> bool:
+    """True when Share can add this computer's versions onto the shared project line."""
+    head = _git_rev_parse(repo_dir, "HEAD")
+    if not head:
+        return False
+    origin = _git_rev_parse(repo_dir, "origin/main")
+    if not origin:
+        return True
+    return _is_ancestor(repo_dir, origin, head)
+
+
+def work_is_on_review_branch(repo_dir: str) -> bool:
+    return _current_branch_name(repo_dir).startswith("cv-review/")
+
+
 def commit_local_version(repo_dir: str, message: str) -> None:
     """Commit all files in the local project folder. Does not publish them."""
     _stage_and_commit(repo_dir, message, "Could not save the version.")
@@ -640,7 +655,7 @@ def _share_failure_message(detail: str) -> str:
 
 
 def share_local_versions(repo_dir: str) -> None:
-    """Publish saved local versions. Does not create a new version."""
+    """Publish saved local versions onto the shared project. Does not create a new version."""
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
     origin = _run_git(["rev-parse", "--verify", "--quiet", "origin/main"], cwd=repo_dir, timeout=30)
@@ -649,19 +664,118 @@ def share_local_versions(repo_dir: str) -> None:
     login = current_login()
     if login:
         _configure_repo_identity(repo_dir, login)
-    _run_git(["branch", "-M", "main"], cwd=repo_dir)
-    push = _run_git(["push", "-u", "origin", "main"], cwd=repo_dir, timeout=180)
+    if origin.returncode == 0 and not head_can_update_shared_project(repo_dir):
+        _merge_head_into_shared_project(repo_dir, login or "owner")
+        return
+    push = _run_git(
+        ["push", "-u", "origin", "HEAD:refs/heads/main"],
+        cwd=repo_dir,
+        timeout=180,
+    )
     if push.returncode != 0:
         raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+    head = _git_rev_parse(repo_dir, "HEAD")
+    if head:
+        _run_git(["update-ref", "refs/remotes/origin/main", head], cwd=repo_dir, timeout=20)
+    _publish_current_review_line(repo_dir, login)
+    _return_head_to_main(repo_dir)
+
+
+def _merge_head_into_shared_project(repo_dir: str, login: str) -> None:
+    """Merge this computer's line into the shared project. No pull request.
+
+    The shared project keeps its history as the first parent. The files at the
+    merge are this computer's current version (the work that was just saved).
+    """
+    origin = _git_rev_parse(repo_dir, "origin/main")
+    head = _git_rev_parse(repo_dir, "HEAD")
+    if not origin or not head:
+        raise GitHubAuthError("Could not share the project yet.")
+    tree = _run_git(["rev-parse", "%s^{tree}" % head], cwd=repo_dir, timeout=20)
+    tree_sha = (tree.stdout or "").strip()
+    if tree.returncode != 0 or not tree_sha:
+        raise GitHubAuthError("Could not share the project yet.")
+    name = normalize_github_username(login) or "owner"
+    commit = _run_git(
+        [
+            "commit-tree",
+            tree_sha,
+            "-p",
+            origin,
+            "-p",
+            head,
+            "-m",
+            "Accept version from %s" % name,
+        ],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    merge_sha = (commit.stdout or "").strip()
+    if commit.returncode != 0 or not merge_sha:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise GitHubAuthError("Could not share the project yet.\n%s" % detail[:400])
+    _run_git(["update-ref", "refs/heads/main", merge_sha], cwd=repo_dir, timeout=20)
+    push = _run_git(
+        ["push", "origin", "%s:refs/heads/main" % merge_sha],
+        cwd=repo_dir,
+        timeout=180,
+    )
+    if push.returncode != 0:
+        raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+    _run_git(["update-ref", "refs/remotes/origin/main", merge_sha], cwd=repo_dir, timeout=20)
+    _publish_current_review_line(repo_dir, name)
+    _return_head_to_main(repo_dir)
+
+
+def _publish_current_review_line(repo_dir: str, login: str) -> None:
+    """Publish this computer's side branch so it appears on GitHub. Share only."""
+    name = normalize_github_username(login or "")
+    if not name:
+        return
+    current = _current_branch_name(repo_dir)
+    if not current.startswith("cv-review/"):
+        return
+    head = _git_rev_parse(repo_dir, "HEAD")
+    if not head:
+        return
+    branch = review_branch_for(name)
+    push = _run_git(
+        ["push", "origin", "HEAD:refs/heads/%s" % branch],
+        cwd=repo_dir,
+        timeout=180,
+    )
+    if push.returncode != 0:
+        raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+    _run_git(["update-ref", "refs/remotes/origin/%s" % branch, head], cwd=repo_dir, timeout=20)
+
+
+def _return_head_to_main(repo_dir: str) -> None:
+    """After Share, work from main again so Open can update the shared project."""
+    main = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(repo_dir, "origin/main")
+    if not main:
+        return
+    if _current_branch_name(repo_dir) != "main":
+        _point_head_at(repo_dir, "main", main)
+    _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
 
 
 def people_access_for(full_name: str, login: str | None = None) -> str:
-    """share = publish now; approval = owner must accept. Owner always share."""
+    """senior = share now; junior = needs review. Owner is always senior."""
     owner, _repo = _split_project_name(full_name)
     name = normalize_github_username(login or current_login() or "")
     if not name or name.lower() == owner.lower():
-        return PEOPLE_ACCESS_SHARE
-    return _people_access_map(full_name).get(name.lower()) or PEOPLE_ACCESS_SHARE
+        return PEOPLE_ACCESS_SENIOR
+    return _people_access_map(full_name).get(name.lower()) or PEOPLE_ACCESS_JUNIOR
+
+
+def review_lane_slug(login: str) -> str:
+    """Version-tree column for this person. Matches the history lane name."""
+    name = normalize_github_username(login) or ""
+    if not name:
+        return ""
+    if name.lower() == "main":
+        return "reviewer-main"
+    return name
 
 
 def review_branch_for(login: str) -> str:
@@ -670,8 +784,8 @@ def review_branch_for(login: str) -> str:
     return "cv-review/%s" % safe
 
 
-def submit_share_request(repo_dir: str, full_name: str) -> str:
-    """Send saved versions for the owner to review. Returns sent or updated."""
+def publish_review_branch(repo_dir: str) -> None:
+    """Share current versions on this person's branch beside main. Does not merge into main."""
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
     origin = _run_git(["rev-parse", "--verify", "--quiet", "origin/main"], cwd=repo_dir, timeout=30)
@@ -681,22 +795,126 @@ def submit_share_request(repo_dir: str, full_name: str) -> str:
     if not login:
         raise GitHubNotSignedInError(not_signed_in_message())
     _configure_repo_identity(repo_dir, login)
-    _run_git(["branch", "-M", "main"], cwd=repo_dir)
     branch = review_branch_for(login)
+    head = _git_rev_parse(repo_dir, "HEAD")
+    if not head:
+        raise GitHubAuthError("Could not share the project yet.")
+    if _current_branch_name(repo_dir) != branch:
+        _point_head_at(repo_dir, branch, head)
     push = _run_git(
-        ["push", "--force-with-lease", "origin", "HEAD:refs/heads/%s" % branch],
+        ["push", "origin", "HEAD:refs/heads/%s" % branch],
         cwd=repo_dir,
         timeout=180,
     )
     if push.returncode != 0:
-        push = _run_git(
-            ["push", "origin", "HEAD:refs/heads/%s" % branch],
-            cwd=repo_dir,
-            timeout=180,
-        )
-    if push.returncode != 0:
         raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
-    _run_git(["update-ref", "refs/remotes/origin/%s" % branch, "HEAD"], cwd=repo_dir, timeout=20)
+    _run_git(["update-ref", "refs/remotes/origin/%s" % branch, head], cwd=repo_dir, timeout=20)
+    origin_main = _git_rev_parse(repo_dir, "origin/main")
+    if origin_main:
+        _run_git(["update-ref", "refs/heads/main", origin_main], cwd=repo_dir, timeout=20)
+
+
+def submit_review_line(full_name: str) -> str:
+    """Open a review for this person's already shared line. Does not push."""
+    login = current_login()
+    if not login:
+        raise GitHubNotSignedInError(not_signed_in_message())
+    branch = review_branch_for(login)
+    owner, repo = _split_project_name(full_name)
+    existing = _run_gh(
+        ["api", "repos/%s/%s/git/ref/heads/%s" % (owner, repo, branch)],
+        timeout=30,
+    )
+    if existing.returncode != 0:
+        raise GitHubAuthError("Share your line first.")
+    title = "Share request from %s" % login
+    body = "A colleague sent a version for review in 3D Slicer."
+    created = _run_gh(
+        [
+            "pr",
+            "create",
+            "--repo",
+            full_name,
+            "--base",
+            "main",
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        ],
+        timeout=60,
+    )
+    if created.returncode == 0:
+        return "sent"
+    detail = (created.stderr or created.stdout or "").strip()
+    lower = detail.lower()
+    if "already exists" in lower or "already a pull request" in lower:
+        return "updated"
+    raise GitHubAuthError("Could not send the version for review.\n%s" % detail[:400])
+
+
+def find_open_review_request(full_name: str, login: str) -> dict[str, Any] | None:
+    """Open review for this person's line, if they have submitted one."""
+    name = normalize_github_username(login)
+    if not name or not full_name:
+        return None
+    branch = review_branch_for(name)
+    result = _run_gh(
+        [
+            "pr",
+            "list",
+            "--repo",
+            full_name,
+            "--state",
+            "open",
+            "--limit",
+            "30",
+            "--json",
+            "number,headRefName,title",
+        ],
+        timeout=40,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    title_key = "share request from %s" % name.lower()
+    fallback = None
+    for item in payload:
+        if not isinstance(item, dict) or item.get("number") is None:
+            continue
+        head = str(item.get("headRefName") or "").strip()
+        title = str(item.get("title") or "").strip().lower()
+        if head.lower() == branch.lower():
+            return {
+                "number": item.get("number"),
+                "full_name": full_name,
+                "author": name,
+                "branch": head or branch,
+            }
+        if title == title_key and fallback is None:
+            fallback = {
+                "number": item.get("number"),
+                "full_name": full_name,
+                "author": name,
+                "branch": head or branch,
+            }
+    return fallback
+
+
+def submit_share_request(repo_dir: str, full_name: str) -> str:
+    """Send saved versions for the owner to review. Returns sent or updated."""
+    publish_review_branch(repo_dir)
+    login = current_login()
+    if not login:
+        raise GitHubNotSignedInError(not_signed_in_message())
+    branch = review_branch_for(login)
     title = "Share request from %s" % login
     body = "A colleague sent a version for the owner to review in 3D Slicer."
     created = _run_gh(
@@ -808,10 +1026,7 @@ def _review_login_from_ref(ref: str) -> str:
 
 
 def _history_lane_slug(login: str) -> str:
-    name = normalize_github_username(login) or "colleague"
-    if name.lower() == "main":
-        return "reviewer-main"
-    return name
+    return review_lane_slug(login) or "colleague"
 
 
 def _git_rev_parse(repo_dir: str, ref: str) -> str:
@@ -821,6 +1036,61 @@ def _git_rev_parse(repo_dir: str, ref: str) -> str:
     if result.returncode != 0:
         return ""
     return (result.stdout or "").strip()
+
+
+def _current_branch_name(repo_dir: str) -> str:
+    result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir, timeout=20)
+    name = (result.stdout or "").strip()
+    if result.returncode != 0 or not name or name == "HEAD":
+        return ""
+    return name
+
+
+def _is_ancestor(repo_dir: str, ancestor: str, descendant: str) -> bool:
+    if not ancestor or not descendant:
+        return False
+    result = _run_git(
+        ["merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    return result.returncode == 0
+
+
+def _point_head_at(repo_dir: str, branch: str, sha: str) -> None:
+    current = _current_branch_name(repo_dir)
+    if current == branch:
+        reset = _run_git(["reset", "--mixed", sha], cwd=repo_dir, timeout=30)
+        if reset.returncode != 0:
+            detail = (reset.stderr or reset.stdout or "").strip()
+            raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+        return
+    created = _run_git(["branch", "-f", branch, sha], cwd=repo_dir, timeout=30)
+    if created.returncode != 0:
+        detail = (created.stderr or created.stdout or "").strip()
+        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+    pointed = _run_git(
+        ["symbolic-ref", "HEAD", "refs/heads/%s" % branch],
+        cwd=repo_dir,
+        timeout=20,
+    )
+    if pointed.returncode != 0:
+        detail = (pointed.stderr or pointed.stdout or "").strip()
+        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+    reset = _run_git(["reset", "--mixed", sha], cwd=repo_dir, timeout=30)
+    if reset.returncode != 0:
+        detail = (reset.stderr or reset.stdout or "").strip()
+        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+
+
+def _restore_non_volume_worktree(repo_dir: str, sha: str) -> None:
+    paths = [path for path in _list_commit_paths(repo_dir, sha) if not _commit_path_is_volume(path)]
+    if not paths:
+        return
+    restored = _run_git(["checkout", sha, "--", *paths], cwd=repo_dir, timeout=60)
+    if restored.returncode != 0:
+        detail = (restored.stderr or restored.stdout or "").strip()
+        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
 
 
 def _ensure_github_branch(full_name: str, branch: str, sha: str) -> None:
@@ -881,30 +1151,74 @@ def _share_request_head(full_name: str, number) -> tuple[str, str]:
 
 
 def accept_share_request(full_name: str, branch: str, number) -> str:
-    """Merge the reviewed line into the shared project. Keep that line's versions."""
+    """Merge the reviewed line into the shared project. Keep that line's versions.
+
+    Same merge style as Put on main: the junior's files become the shared tip,
+    with main and the review tip as parents (no GitHub conflict check).
+    """
     dest, sha = fetch_share_request_sha(full_name, branch)
     login = _review_login_from_ref(branch) or "colleague"
-    result = _run_gh(
-        [
-            "pr",
-            "merge",
-            str(number),
-            "--repo",
-            full_name,
-            "--merge",
-            "--subject",
-            "Accept version from %s" % login,
-        ],
-        timeout=180,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        lower = detail.lower()
-        if "conflict" in lower or "not mergeable" in lower or "dirty" in lower:
-            raise GitHubAuthError(
-                "Could not accept this version. It does not combine with the shared project."
-            )
+    accepter = current_login()
+    if accepter:
+        _configure_repo_identity(dest, accepter)
+    fetch_main = _run_git(["fetch", "origin", "main"], cwd=dest, timeout=180)
+    if fetch_main.returncode != 0:
+        detail = (fetch_main.stderr or fetch_main.stdout or "").strip()
         raise GitHubAuthError("Could not accept the version.\n%s" % detail[:400])
+    origin = _git_rev_parse(dest, "origin/main")
+    head = sha
+    if not origin or not head:
+        raise GitHubAuthError("Could not accept the version.")
+    if origin != head:
+        tree = _run_git(["rev-parse", "%s^{tree}" % head], cwd=dest, timeout=20)
+        tree_sha = (tree.stdout or "").strip()
+        if tree.returncode != 0 or not tree_sha:
+            raise GitHubAuthError("Could not accept the version.")
+        commit = _run_git(
+            [
+                "commit-tree",
+                tree_sha,
+                "-p",
+                origin,
+                "-p",
+                head,
+                "-m",
+                "Accept version from %s" % login,
+            ],
+            cwd=dest,
+            timeout=30,
+        )
+        merge_sha = (commit.stdout or "").strip()
+        if commit.returncode != 0 or not merge_sha:
+            detail = (commit.stderr or commit.stdout or "").strip()
+            raise GitHubAuthError("Could not accept the version.\n%s" % detail[:400])
+        push = _run_git(
+            ["push", "origin", "%s:refs/heads/main" % merge_sha],
+            cwd=dest,
+            timeout=180,
+        )
+        if push.returncode != 0:
+            raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+        _run_git(["update-ref", "refs/remotes/origin/main", merge_sha], cwd=dest, timeout=20)
+        _run_git(["update-ref", "refs/heads/main", merge_sha], cwd=dest, timeout=20)
+    if number not in (None, ""):
+        closed = _run_gh(
+            [
+                "pr",
+                "close",
+                str(number),
+                "--repo",
+                full_name,
+                "--comment",
+                "Accepted in Collaborative Versioning.",
+            ],
+            timeout=40,
+        )
+        if closed.returncode != 0:
+            detail = (closed.stderr or closed.stdout or "").strip().lower()
+            if "already" not in detail and "not found" not in detail and "merged" not in detail:
+                # Main already has the version; ignore a stuck review request label.
+                pass
     try:
         _ensure_github_branch(full_name, branch, sha)
     except (GitHubAuthError, OSError, ValueError):
@@ -1026,6 +1340,41 @@ def inspect_local_project(full_name: str) -> dict[str, Any]:
     }
 
 
+def _update_local_from_origin(repo_dir: str) -> None:
+    """Update main from GitHub even if this computer is on a review line with no tracking."""
+    fetch = _run_git(["fetch", "origin"], cwd=repo_dir, timeout=180)
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout or "").strip()
+        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+    origin_main = _git_rev_parse(repo_dir, "origin/main")
+    if not origin_main:
+        raise GitHubAuthError("Could not update the local project.")
+    current = _current_branch_name(repo_dir)
+    local_main = _git_rev_parse(repo_dir, "refs/heads/main")
+    if current == "main":
+        pull = _run_git(["pull", "--ff-only", "origin", "main"], cwd=repo_dir, timeout=180)
+        if pull.returncode != 0:
+            pull = _run_git(["pull", "origin", "main"], cwd=repo_dir, timeout=180)
+        if pull.returncode != 0:
+            detail = (pull.stderr or pull.stdout or "").strip()
+            raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+        _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
+        return
+    if not local_main or local_main == origin_main or _is_ancestor(repo_dir, local_main, origin_main):
+        _run_git(["update-ref", "refs/heads/main", origin_main], cwd=repo_dir, timeout=20)
+        target = origin_main
+    elif _is_ancestor(repo_dir, origin_main, local_main):
+        target = local_main
+    else:
+        raise GitHubAuthError(
+            "Could not update the local project. The shared project has versions that are not on this computer.\n\n"
+            "Open the project and choose Open shared project first."
+        )
+    _point_head_at(repo_dir, "main", target)
+    _restore_non_volume_worktree(repo_dir, target)
+    _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
+
+
 def open_or_update_local_project(full_name: str, mode: str = "update") -> str:
     """Clone the GitHub project locally, or open/update the existing local copy."""
     ensure_tools()
@@ -1040,10 +1389,7 @@ def open_or_update_local_project(full_name: str, mode: str = "update") -> str:
         _configure_repo_identity(dest, login)
         return dest
     if os.path.isdir(git_dir) and mode != "replace":
-        pull = _run_git(["pull"], cwd=dest, timeout=180)
-        if pull.returncode != 0:
-            detail = (pull.stderr or pull.stdout or "").strip()
-            raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+        _update_local_from_origin(dest)
         _configure_repo_identity(dest, login)
         return dest
     if os.path.exists(dest):
@@ -1079,15 +1425,18 @@ def _history_refs(repo_dir: str) -> list[str]:
     return refs
 
 
-def _review_tips(repo_dir: str) -> dict[str, str]:
-    tips = {}
+def _review_tips(repo_dir: str) -> dict[str, list[str]]:
+    tips: dict[str, list[str]] = {}
     for ref in _history_refs(repo_dir):
         login = _review_login_from_ref(ref)
         if not login:
             continue
         sha = _git_rev_parse(repo_dir, ref)
-        if sha:
-            tips[login.lower()] = sha
+        if not sha:
+            continue
+        bucket = tips.setdefault(login.lower(), [])
+        if sha not in bucket:
+            bucket.append(sha)
     return tips
 
 
@@ -1136,7 +1485,7 @@ def _slug_from_merge(
     commit_by_sha: dict[str, dict],
     merge_sha: str,
     extra_sha: str,
-    review_tips: dict[str, str],
+    review_tips: dict[str, list[str]],
 ) -> str:
     message = str((commit_by_sha.get(merge_sha) or {}).get("message") or "")
     found = re.search(r"Accept version from\s+(\S+)", message, re.I)
@@ -1146,11 +1495,14 @@ def _slug_from_merge(
     if found:
         return _history_lane_slug(found.group(1))
     extra_chain = set(_first_parent_chain(commit_by_sha, extra_sha))
-    for login, tip in review_tips.items():
-        if extra_sha in set(_first_parent_chain(commit_by_sha, tip)) or extra_chain.intersection(
-            _first_parent_chain(commit_by_sha, tip)
-        ):
-            return _history_lane_slug(login)
+    for login, tips in review_tips.items():
+        if isinstance(tips, str):
+            tips = [tips]
+        for tip in tips:
+            if extra_sha in set(_first_parent_chain(commit_by_sha, tip)) or extra_chain.intersection(
+                _first_parent_chain(commit_by_sha, tip)
+            ):
+                return _history_lane_slug(login)
     author = str((commit_by_sha.get(extra_sha) or {}).get("author") or "colleague")
     return _history_lane_slug(re.sub(r"[^A-Za-z0-9]+", "-", author).strip("-") or "colleague")
 
@@ -1176,7 +1528,7 @@ def build_project_history_model(
     commit_by_sha: dict[str, dict[str, Any]],
     main_tip: str,
     head_sha: str,
-    review_tips: dict[str, str],
+    review_tips: dict[str, list[str]],
     unpushed: set[str],
     declined_shas: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -1229,8 +1581,12 @@ def build_project_history_model(
             return
         lane_shas.setdefault(slug, []).extend(_unique_side_chain(commit_by_sha, tip, main_set))
 
-    for login, tip in sorted(review_tips.items(), key=lambda item: item[0]):
-        remember_side(_history_lane_slug(login), tip)
+    for login, tips in sorted(review_tips.items(), key=lambda item: item[0]):
+        slug = _history_lane_slug(login)
+        if isinstance(tips, str):
+            tips = [tips]
+        for tip in tips:
+            remember_side(slug, tip)
     for merge_sha in main_chain:
         parents = (commit_by_sha.get(merge_sha) or {}).get("parents") or []
         for extra in parents[1:]:
@@ -1472,20 +1828,35 @@ def suggest_github_usernames(prefix: str) -> list[str]:
         return []
 
 
-PEOPLE_ACCESS_SHARE = "share"
-PEOPLE_ACCESS_APPROVAL = "approval"
+PEOPLE_ACCESS_SENIOR = "senior"
+PEOPLE_ACCESS_JUNIOR = "junior"
 _PEOPLE_RIGHTS_PATH = ".collaborative-versioning/people.json"
 _MESSAGES_PATH = ".collaborative-versioning/messages.json"
 _PROJECT_INFO_BRANCH = "project-info"
 _MESSAGE_MAX_LEN = 2000
-_TASK_TITLE_MAX_LEN = 80
+_TASK_TITLE_MAX_LEN = 200
+_ACTIVITY_MAX = 100
+_ACTIVITY_READ_IDS_MAX = 200
+_ACTIVITY_KINDS = frozenset(
+    (
+        "join",
+        "assign",
+        "cancel",
+        "submit",
+        "accept",
+        "decline",
+        "share",
+        "people_add",
+        "people_remove",
+    )
+)
 
 
 def normalize_people_access(value: str | None) -> str:
-    text = str(value or "").strip().lower()
-    if text in ("approval", "needs approval", "propose", "review"):
-        return PEOPLE_ACCESS_APPROVAL
-    return PEOPLE_ACCESS_SHARE
+    text = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+    if text in ("senior", "co-owner", "coowner", "admin"):
+        return PEOPLE_ACCESS_SENIOR
+    return PEOPLE_ACCESS_JUNIOR
 
 
 def normalize_task_title(value: str | None) -> str:
@@ -1499,14 +1870,11 @@ def _normalize_people_record(login: str, value) -> dict[str, str]:
     name = normalize_github_username(login)
     if isinstance(value, dict):
         access = value.get("access") or value.get("right") or ""
-        task = value.get("task") or value.get("title") or ""
     else:
         access = value
-        task = ""
     return {
         "login": name,
         "access": normalize_people_access(str(access) if access is not None else ""),
-        "task": normalize_task_title(task),
     }
 
 
@@ -1561,7 +1929,7 @@ def _people_records_map(full_name: str) -> dict[str, dict[str, str]]:
 
 def _people_access_map(full_name: str) -> dict[str, str]:
     return {
-        key: str(record.get("access") or PEOPLE_ACCESS_SHARE)
+        key: normalize_people_access(record.get("access"))
         for key, record in _people_records_map(full_name).items()
     }
 
@@ -1628,9 +1996,6 @@ def _write_people_records_map(full_name: str, records: dict[str, dict[str, str]]
         if not name:
             continue
         entry: dict[str, str] = {"access": normalize_people_access(stored.get("access"))}
-        task = normalize_task_title(stored.get("task"))
-        if task:
-            entry["task"] = task
         colleagues[name] = entry
     document = json.dumps({"colleagues": colleagues}, separators=(",", ":"), sort_keys=True)
     encoded = base64.b64encode(document.encode("utf-8")).decode("ascii")
@@ -1660,15 +2025,10 @@ def set_people_access(full_name: str, username: str, access: str, task: str | No
     if not name:
         raise GitHubAuthError("Enter a GitHub username.")
     current = _people_records_map(full_name)
-    previous = current.get(name.lower()) or {}
-    kept_task = previous.get("task") or ""
-    if task is not None:
-        kept_task = normalize_task_title(task)
     records = {key: value for key, value in current.items() if key != name.lower()}
     records[name.lower()] = {
         "login": name,
         "access": normalize_people_access(access),
-        "task": kept_task,
     }
     _write_people_records_map(full_name, records)
 
@@ -1705,8 +2065,89 @@ def _normalize_stored_messages(document) -> list[dict[str, str]]:
         mid = str(item.get("id") or "").strip()
         if not mid:
             mid = "%s|%s|%s" % (author, stamp, text[:40])
-        messages.append({"id": mid, "author": author, "text": text, "at": stamp})
+        entry = {"id": mid, "author": author, "text": text, "at": stamp}
+        kind = str(item.get("kind") or "").strip()
+        if kind:
+            entry["kind"] = kind
+        messages.append(entry)
     return messages
+
+
+def _normalize_stored_tasks(document) -> list[dict[str, str]]:
+    raw = document.get("tasks") if isinstance(document, dict) else None
+    if not isinstance(raw, list):
+        return []
+    tasks = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        junior = normalize_github_username(str(item.get("junior") or ""))
+        senior = normalize_github_username(str(item.get("senior") or ""))
+        if not junior or not senior:
+            continue
+        tid = str(item.get("id") or "").strip() or ("%s-%s" % (junior, senior))
+        key = tid.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        status = str(item.get("status") or "").strip().lower()
+        if status not in ("accepted", "submitted"):
+            status = ""
+        entry = {
+            "id": tid,
+            "junior": junior,
+            "senior": senior,
+            "description": normalize_task_title(item.get("description") or item.get("task") or ""),
+            "status": status,
+        }
+        submitted = normalize_task_title(item.get("submitted_description") or "")
+        if submitted:
+            entry["submitted_description"] = submitted
+        tasks.append(entry)
+    return tasks
+
+
+def _normalize_stored_activity(document) -> list[dict[str, str]]:
+    raw = document.get("activity") if isinstance(document, dict) else None
+    if not isinstance(raw, list):
+        return []
+    activity = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind not in _ACTIVITY_KINDS:
+            continue
+        text = " ".join(str(item.get("text") or "").split())
+        if not text:
+            continue
+        if len(text) > _MESSAGE_MAX_LEN:
+            text = text[:_MESSAGE_MAX_LEN]
+        author = normalize_github_username(str(item.get("author") or "")) or str(
+            item.get("author") or "Someone"
+        ).strip() or "Someone"
+        stamp = str(item.get("at") or "").strip()
+        aid = str(item.get("id") or "").strip()
+        if not aid:
+            aid = "%s|%s|%s|%s" % (kind, author, stamp, text[:40])
+        key = aid.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        activity.append(
+            {
+                "id": aid,
+                "kind": kind,
+                "author": author,
+                "text": text,
+                "at": stamp,
+            }
+        )
+    if len(activity) > _ACTIVITY_MAX:
+        activity = activity[-_ACTIVITY_MAX:]
+    return activity
 
 
 def project_messages_fetch_args(full_name: str) -> list[str]:
@@ -1717,9 +2158,55 @@ def project_messages_fetch_args(full_name: str) -> list[str]:
     ]
 
 
+def _normalize_activity_read_ids(raw) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    ids = []
+    seen = set()
+    for item in raw:
+        aid = str(item or "").strip()
+        if not aid or aid in seen:
+            continue
+        seen.add(aid)
+        ids.append(aid)
+    if len(ids) > _ACTIVITY_READ_IDS_MAX:
+        ids = ids[-_ACTIVITY_READ_IDS_MAX:]
+    return ids
+
+
+def _normalize_stored_reads(document) -> dict[str, dict]:
+    raw = document.get("reads") if isinstance(document, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    reads: dict[str, dict] = {}
+    for key, value in raw.items():
+        login = normalize_github_username(str(key or ""))
+        if not login or not isinstance(value, dict):
+            continue
+        entry: dict = {}
+        for field in ("activity_at", "messages_at"):
+            stamp = str(value.get(field) or "").strip()
+            if stamp:
+                entry[field] = stamp
+        ids = _normalize_activity_read_ids(value.get("activity_ids"))
+        if ids:
+            entry["activity_ids"] = ids
+        if entry:
+            reads[login.lower()] = entry
+    return reads
+
+
 def parse_project_messages_output(
     stdout: str, stderr: str = "", returncode: int = 0
-) -> tuple[list[dict[str, str]], str]:
+) -> tuple[
+    list[dict[str, str]],
+    str,
+    list[dict[str, str]],
+    list[dict[str, str]],
+    dict[str, dict[str, str]],
+]:
     class _Result:
         pass
 
@@ -1729,52 +2216,98 @@ def parse_project_messages_output(
     result.returncode = returncode
     if returncode != 0:
         if _is_github_missing(result):
-            return [], ""
+            return [], "", [], [], {}
         detail = (stderr or stdout or "").strip()
         raise GitHubAuthError("Could not read messages.\n%s" % detail[:400])
     try:
         payload = json.loads(stdout or "{}")
     except json.JSONDecodeError:
-        return [], ""
+        return [], "", [], [], {}
     if not isinstance(payload, dict):
-        return [], ""
+        return [], "", [], [], {}
     try:
         document = json.loads(_decode_github_file_content(payload) or "{}")
     except json.JSONDecodeError:
         document = {}
-    return _normalize_stored_messages(document), str(payload.get("sha") or "").strip()
+    return (
+        _normalize_stored_messages(document),
+        str(payload.get("sha") or "").strip(),
+        _normalize_stored_tasks(document),
+        _normalize_stored_activity(document),
+        _normalize_stored_reads(document),
+    )
 
 
-def build_project_message(author: str, text: str) -> dict[str, str]:
+def build_project_message(author: str, text: str, kind: str = "") -> dict[str, str]:
     body = str(text or "").strip()
     if not body:
         raise GitHubAuthError("Write a message first.")
     if len(body) > _MESSAGE_MAX_LEN:
         body = body[:_MESSAGE_MAX_LEN]
     name = normalize_github_username(author) or str(author or "").strip() or "Someone"
+    payload = {
+        "id": "%s-%s-%s" % (int(time.time() * 1000), name, os.urandom(3).hex()),
+        "author": name,
+        "text": body,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    marker = str(kind or "").strip()
+    if marker:
+        payload["kind"] = marker
+    return payload
+
+
+def build_project_activity(author: str, kind: str, text: str) -> dict[str, str]:
+    marker = str(kind or "").strip().lower()
+    if marker not in _ACTIVITY_KINDS:
+        raise GitHubAuthError("Unknown activity.")
+    body = " ".join(str(text or "").split())
+    if not body:
+        raise GitHubAuthError("Missing activity text.")
+    if len(body) > _MESSAGE_MAX_LEN:
+        body = body[:_MESSAGE_MAX_LEN]
+    name = normalize_github_username(author) or str(author or "").strip() or "Someone"
     return {
         "id": "%s-%s-%s" % (int(time.time() * 1000), name, os.urandom(3).hex()),
+        "kind": marker,
         "author": name,
         "text": body,
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
 
-def project_messages_put_args(full_name: str, messages: list, sha: str = "") -> list[str]:
+def project_messages_put_args(
+    full_name: str,
+    messages: list,
+    sha: str = "",
+    tasks: list | None = None,
+    activity: list | None = None,
+    reads: dict | None = None,
+) -> list[str]:
     owner, repo = _split_project_name(full_name)
     stored = []
     for item in messages or []:
         if not isinstance(item, dict):
             continue
-        stored.append(
-            {
-                "id": str(item.get("id") or ""),
-                "author": str(item.get("author") or "Someone"),
-                "text": str(item.get("text") or ""),
-                "at": str(item.get("at") or ""),
-            }
-        )
-    document = json.dumps({"messages": stored}, separators=(",", ":"))
+        entry = {
+            "id": str(item.get("id") or ""),
+            "author": str(item.get("author") or "Someone"),
+            "text": str(item.get("text") or ""),
+            "at": str(item.get("at") or ""),
+        }
+        kind = str(item.get("kind") or "").strip()
+        if kind:
+            entry["kind"] = kind
+        stored.append(entry)
+    document = json.dumps(
+        {
+            "messages": stored,
+            "tasks": _normalize_stored_tasks({"tasks": list(tasks or [])}),
+            "activity": _normalize_stored_activity({"activity": list(activity or [])}),
+            "reads": _normalize_stored_reads({"reads": dict(reads or {})}),
+        },
+        separators=(",", ":"),
+    )
     encoded = base64.b64encode(document.encode("utf-8")).decode("ascii")
     args = [
         "api",
@@ -1797,6 +2330,141 @@ def is_project_messages_conflict(stdout: str = "", stderr: str = "") -> bool:
     return _is_contents_conflict("%s\n%s" % (stderr or "", stdout or ""))
 
 
+def _merge_read_cursor(
+    entry: dict,
+    activity_at: str = "",
+    messages_at: str = "",
+    activity_ids=None,
+) -> dict:
+    merged = dict(entry or {})
+    activity_stamp = str(activity_at or "").strip()
+    messages_stamp = str(messages_at or "").strip()
+    if activity_stamp and activity_stamp > str(merged.get("activity_at") or ""):
+        merged["activity_at"] = activity_stamp
+    if messages_stamp and messages_stamp > str(merged.get("messages_at") or ""):
+        merged["messages_at"] = messages_stamp
+    ids = _normalize_activity_read_ids(merged.get("activity_ids"))
+    seen = set(ids)
+    for aid in _normalize_activity_read_ids(activity_ids):
+        if aid not in seen:
+            seen.add(aid)
+            ids.append(aid)
+    if ids:
+        merged["activity_ids"] = ids[-_ACTIVITY_READ_IDS_MAX:]
+    elif "activity_ids" in merged:
+        del merged["activity_ids"]
+    return merged
+
+
+def publish_project_activity(full_name: str, kind: str, text: str) -> None:
+    """Append one project activity event. Safe to call after Share / People / Join."""
+    if not full_name:
+        return
+    try:
+        ensure_project_info_branch(full_name)
+    except (GitHubAuthError, OSError, ValueError):
+        pass
+    event = build_project_activity(current_login() or "Someone", kind, text)
+    last_error = ""
+    for _attempt in range(4):
+        fetch = _run_gh(project_messages_fetch_args(full_name), timeout=40)
+        try:
+            messages, sha, tasks, activity, reads = parse_project_messages_output(
+                fetch.stdout or "",
+                fetch.stderr or "",
+                fetch.returncode,
+            )
+        except GitHubAuthError as error:
+            last_error = str(error)
+            break
+        merged = list(activity or [])
+        if not any(str(item.get("id") or "") == event["id"] for item in merged):
+            merged.append(event)
+        put = _run_gh(
+            project_messages_put_args(
+                full_name,
+                messages,
+                sha=sha,
+                tasks=tasks,
+                activity=merged,
+                reads=reads,
+            ),
+            timeout=40,
+        )
+        if put.returncode == 0:
+            return
+        detail = "%s\n%s" % (put.stderr or "", put.stdout or "")
+        if is_project_messages_conflict(put.stdout or "", put.stderr or ""):
+            continue
+        last_error = detail.strip()
+        break
+    if last_error:
+        raise GitHubAuthError("Could not record the notification.\n%s" % last_error[:400])
+
+
+def publish_project_reads(
+    full_name: str,
+    activity_at: str = "",
+    messages_at: str = "",
+    activity_ids=None,
+) -> None:
+    """Update this user's read cursor. Call only after a local read action."""
+    if not full_name:
+        return
+    activity_stamp = str(activity_at or "").strip()
+    messages_stamp = str(messages_at or "").strip()
+    ids = _normalize_activity_read_ids(activity_ids)
+    if not activity_stamp and not messages_stamp and not ids:
+        return
+    login = normalize_github_username(current_login() or "")
+    if not login:
+        return
+    try:
+        ensure_project_info_branch(full_name)
+    except (GitHubAuthError, OSError, ValueError):
+        pass
+    last_error = ""
+    for _attempt in range(4):
+        fetch = _run_gh(project_messages_fetch_args(full_name), timeout=40)
+        try:
+            messages, sha, tasks, activity, reads = parse_project_messages_output(
+                fetch.stdout or "",
+                fetch.stderr or "",
+                fetch.returncode,
+            )
+        except GitHubAuthError as error:
+            last_error = str(error)
+            break
+        merged_reads = dict(reads or {})
+        key = login.lower()
+        merged_reads[key] = _merge_read_cursor(
+            merged_reads.get(key) or {},
+            activity_at=activity_stamp,
+            messages_at=messages_stamp,
+            activity_ids=ids,
+        )
+        put = _run_gh(
+            project_messages_put_args(
+                full_name,
+                messages,
+                sha=sha,
+                tasks=tasks,
+                activity=activity,
+                reads=merged_reads,
+            ),
+            timeout=40,
+        )
+        if put.returncode == 0:
+            return
+        detail = "%s\n%s" % (put.stderr or "", put.stdout or "")
+        if is_project_messages_conflict(put.stdout or "", put.stderr or ""):
+            continue
+        last_error = detail.strip()
+        break
+    if last_error:
+        raise GitHubAuthError("Could not save the read position.\n%s" % last_error[:400])
+
+
 def forget_people_access(full_name: str, username: str) -> None:
     name = normalize_github_username(username)
     if not name:
@@ -1811,13 +2479,9 @@ def forget_people_access(full_name: str, username: str) -> None:
         return
 
 
-def _person_task_fields(records: dict[str, dict[str, str]], login: str) -> dict[str, str]:
+def _person_access_fields(records: dict[str, dict[str, str]], login: str) -> dict[str, str]:
     record = records.get(login.lower()) or {}
-    task = normalize_task_title(record.get("task"))
-    fields = {"access": record.get("access") or PEOPLE_ACCESS_SHARE}
-    if task:
-        fields["task"] = task
-    return fields
+    return {"access": normalize_people_access(record.get("access"))}
 
 
 def list_project_people(full_name: str) -> list[dict[str, str]]:
@@ -1841,7 +2505,7 @@ def list_project_people(full_name: str) -> list[dict[str, str]]:
                 continue
             seen.add(login.lower())
             person = {"login": login, "role": "colleague"}
-            person.update(_person_task_fields(records, login))
+            person.update(_person_access_fields(records, login))
             colleagues.append(person)
         colleagues.sort(key=lambda item: item["login"].lower())
         people.extend(colleagues)
@@ -1875,7 +2539,7 @@ def list_project_people(full_name: str) -> list[dict[str, str]]:
                 "role": "pending",
                 "invitation_id": item.get("id"),
             }
-            person.update(_person_task_fields(records, login))
+            person.update(_person_access_fields(records, login))
             pending.append(person)
         pending.sort(key=lambda item: item["login"].lower())
         people.extend(pending)
@@ -1885,10 +2549,10 @@ def list_project_people(full_name: str) -> list[dict[str, str]]:
 def invite_project_colleague(
     full_name: str,
     username: str,
-    access: str = PEOPLE_ACCESS_SHARE,
+    access: str = PEOPLE_ACCESS_JUNIOR,
     task: str = "",
 ) -> str:
-    """Invite a GitHub user with write access. Returns invited or already."""
+    """Invite a GitHub user as senior or junior. Returns invited or already."""
     owner, repo = _split_project_name(full_name)
     name = normalize_github_username(username)
     chosen = normalize_people_access(access)
@@ -1915,7 +2579,7 @@ def invite_project_colleague(
         if "not found" in lower or "404" in lower:
             raise GitHubAuthError("GitHub user not found: %s." % name)
         raise GitHubAuthError("Could not send the invitation.\n%s" % detail[:400])
-    set_people_access(full_name, name, chosen, task=task)
+    set_people_access(full_name, name, chosen)
     if not (result.stdout or "").strip():
         return "already"
     return "invited"
