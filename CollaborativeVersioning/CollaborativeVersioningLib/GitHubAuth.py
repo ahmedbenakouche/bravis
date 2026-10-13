@@ -9,7 +9,6 @@ import re
 import shutil
 import stat
 import subprocess
-import tempfile
 import threading
 import time
 from typing import Any
@@ -548,76 +547,6 @@ def _list_commit_paths(repo_dir: str, sha: str) -> list[str]:
     return paths
 
 
-def _git_show_to_file(repo_dir: str, sha: str, git_path: str, dest_file: str, timeout: int = 120) -> None:
-    git = find_git()
-    if not git:
-        raise GitHubAuthError(missing_tools_message())
-    parent = os.path.dirname(dest_file)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    env = os.environ.copy()
-    env["GIT_PAGER"] = ""
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    stderr_chunks: list[bytes] = []
-
-    def _drain_err(stream) -> None:
-        try:
-            stderr_chunks.append(stream.read() or b"")
-        except Exception:
-            pass
-
-    with open(dest_file, "wb") as outgoing:
-        try:
-            process = subprocess.Popen(
-                [git, "show", "%s:%s" % (sha, git_path)],
-                cwd=repo_dir,
-                stdin=subprocess.DEVNULL,
-                stdout=outgoing,
-                stderr=subprocess.PIPE,
-                env=env,
-                **_windows_create_no_window(),
-            )
-        except OSError as error:
-            raise GitHubAuthError("Could not run Git: %s" % error) from error
-        reader = threading.Thread(target=_drain_err, args=(process.stderr,))
-        reader.daemon = True
-        reader.start()
-        start = time.time()
-        while True:
-            if timeout - (time.time() - start) <= 0:
-                process.kill()
-                reader.join(timeout=1)
-                raise GitHubAuthError("Git timed out.")
-            if process.poll() is not None:
-                reader.join(timeout=2)
-                if process.returncode != 0:
-                    detail = b"".join(stderr_chunks).decode("utf-8", "replace").strip()
-                    raise GitHubAuthError("Could not switch version.\n%s" % detail[:400])
-                return
-            _pump_wait()
-            time.sleep(0.05)
-
-
-def extract_project_version(repo_dir: str, sha: str) -> str:
-    """Write this version's segmentation and ontology into a temp folder. Volume is skipped."""
-    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
-        raise GitHubAuthError("Open the project first.")
-    if not sha:
-        raise GitHubAuthError("Could not switch version.")
-    paths = [path for path in _list_commit_paths(repo_dir, sha) if not _commit_path_is_volume(path)]
-    if not paths:
-        raise GitHubAuthError("Could not switch version.")
-    dest = tempfile.mkdtemp(prefix="CollaborativeVersioning-")
-    try:
-        for path in paths:
-            outgoing = os.path.join(dest, *path.split("/"))
-            _git_show_to_file(repo_dir, sha, path, outgoing)
-    except Exception:
-        shutil.rmtree(dest, ignore_errors=True)
-        raise
-    return dest
-
-
 def head_can_update_shared_project(repo_dir: str) -> bool:
     """True when Share can add this computer's versions onto the shared project line."""
     head = _git_rev_parse(repo_dir, "HEAD")
@@ -647,7 +576,11 @@ def git_branch_for_history_lane(lane: str) -> str:
 
 
 def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
-    """Point HEAD at this version so Save continues from it (not from stale main)."""
+    """Point HEAD at this version and sync the full worktree (Switch / Open).
+
+    Uses one git reset --hard (full checkout). Git skips rewriting blobs that
+    are unchanged (e.g. a fixed volume). Faster to measure vs mixed+restore.
+    """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
     if not sha:
@@ -656,7 +589,6 @@ def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
     head = _git_rev_parse(repo_dir, "HEAD")
     current = _current_branch_name(repo_dir)
     if head == sha and current == branch:
-        _restore_non_volume_worktree(repo_dir, sha)
         return
     # Already continuing past this version on the same line — keep HEAD.
     if (
@@ -666,13 +598,7 @@ def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
         and _is_ancestor(repo_dir, sha, head)
     ):
         return
-    _point_head_at(repo_dir, branch, sha)
-    _restore_non_volume_worktree(repo_dir, sha)
-
-
-def ensure_local_head_for_version(repo_dir: str, sha: str, lane: str = "main") -> None:
-    """Before Save: make sure the next commit parents from the checked-out version."""
-    checkout_local_version(repo_dir, sha, lane)
+    _checkout_branch_at(repo_dir, branch, sha)
 
 
 def _share_failure_message(detail: str) -> str:
@@ -967,16 +893,27 @@ def find_open_review_request(full_name: str, login: str) -> dict[str, Any] | Non
 
 
 def fetch_share_request_sha(full_name: str, branch: str) -> tuple[str, str]:
-    """Fetch a review line and return (local clone, commit sha). Does not change main."""
-    dest = open_or_update_local_project(full_name, mode="update")
-    fetch = _run_git(["fetch", "origin", branch], cwd=dest, timeout=180)
-    if fetch.returncode != 0:
-        detail = (fetch.stderr or fetch.stdout or "").strip()
-        raise GitHubAuthError("Could not open the version to review.\n%s" % detail[:400])
-    sha = _run_git(["rev-parse", "origin/%s" % branch], cwd=dest, timeout=30)
-    value = (sha.stdout or "").strip()
-    if sha.returncode != 0 or not value:
+    """Resolve a review tip from the local clone. No network fetch.
+
+    For now the clone is expected to be up to date via Open (reload + reconnect +
+    open). Live history refresh can replace that later.
+    """
+    dest = local_project_dir(full_name)
+    if not os.path.isdir(os.path.join(dest, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    ref = (branch or "").strip()
+    if not ref:
         raise GitHubAuthError("Could not open the version to review.")
+    value = (
+        _git_rev_parse(dest, "refs/remotes/origin/%s" % ref)
+        or _git_rev_parse(dest, "origin/%s" % ref)
+        or _git_rev_parse(dest, "refs/heads/%s" % ref)
+    )
+    if not value:
+        raise GitHubAuthError(
+            "Could not find this review line locally.\n\n"
+            "Open the shared project first, then try again."
+        )
     return dest, value
 
 
@@ -1022,6 +959,7 @@ def _is_ancestor(repo_dir: str, ancestor: str, descendant: str) -> bool:
 
 
 def _point_head_at(repo_dir: str, branch: str, sha: str) -> None:
+    """Move HEAD/branch to sha without updating worktree files (reset --mixed)."""
     current = _current_branch_name(repo_dir)
     if current == branch:
         reset = _run_git(["reset", "--mixed", sha], cwd=repo_dir, timeout=30)
@@ -1042,6 +980,28 @@ def _point_head_at(repo_dir: str, branch: str, sha: str) -> None:
         detail = (pointed.stderr or pointed.stdout or "").strip()
         raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
     reset = _run_git(["reset", "--mixed", sha], cwd=repo_dir, timeout=30)
+    if reset.returncode != 0:
+        detail = (reset.stderr or reset.stdout or "").strip()
+        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+
+
+def _checkout_branch_at(repo_dir: str, branch: str, sha: str) -> None:
+    """Move HEAD/branch to sha and sync the full worktree (reset --hard)."""
+    current = _current_branch_name(repo_dir)
+    if current != branch:
+        created = _run_git(["branch", "-f", branch, sha], cwd=repo_dir, timeout=30)
+        if created.returncode != 0:
+            detail = (created.stderr or created.stdout or "").strip()
+            raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+        pointed = _run_git(
+            ["symbolic-ref", "HEAD", "refs/heads/%s" % branch],
+            cwd=repo_dir,
+            timeout=20,
+        )
+        if pointed.returncode != 0:
+            detail = (pointed.stderr or pointed.stdout or "").strip()
+            raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+    reset = _run_git(["reset", "--hard", sha], cwd=repo_dir, timeout=180)
     if reset.returncode != 0:
         detail = (reset.stderr or reset.stdout or "").strip()
         raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
@@ -1119,20 +1079,21 @@ def accept_share_request(full_name: str, branch: str, number) -> str:
 
     Same merge style as Put on main: the junior's files become the shared tip,
     with main and the review tip as parents (no GitHub conflict check).
+
+    Uses the local clone as already updated by Open — no git fetch here.
     """
     dest, sha = fetch_share_request_sha(full_name, branch)
     login = _review_login_from_ref(branch) or "colleague"
     accepter = current_login()
     if accepter:
         _configure_repo_identity(dest, accepter)
-    fetch_main = _run_git(["fetch", "origin", "main"], cwd=dest, timeout=180)
-    if fetch_main.returncode != 0:
-        detail = (fetch_main.stderr or fetch_main.stdout or "").strip()
-        raise GitHubAuthError("Could not accept the version.\n%s" % detail[:400])
-    origin = _git_rev_parse(dest, "origin/main")
+    origin = _git_rev_parse(dest, "origin/main") or _git_rev_parse(dest, "refs/heads/main")
     head = sha
     if not origin or not head:
-        raise GitHubAuthError("Could not accept the version.")
+        raise GitHubAuthError(
+            "Could not accept the version.\n\n"
+            "Open the shared project first, then try again."
+        )
     if origin != head:
         tree = _run_git(["rev-parse", "%s^{tree}" % head], cwd=dest, timeout=20)
         tree_sha = (tree.stdout or "").strip()
@@ -1187,8 +1148,8 @@ def accept_share_request(full_name: str, branch: str, number) -> str:
         _ensure_github_branch(full_name, branch, sha)
     except (GitHubAuthError, OSError, ValueError):
         pass
-    _run_git(["fetch", "origin"], cwd=dest, timeout=180)
-    _run_git(["reset", "--hard", "origin/main"], cwd=dest, timeout=60)
+    # Local main refs already match what we pushed — no fetch needed.
+    _run_git(["reset", "--hard", "refs/heads/main"], cwd=dest, timeout=180)
     return dest
 
 
@@ -1334,8 +1295,7 @@ def _update_local_from_origin(repo_dir: str) -> None:
             "Could not update the local project. The shared project has versions that are not on this computer.\n\n"
             "Open the project and choose Open shared project first."
         )
-    _point_head_at(repo_dir, "main", target)
-    _restore_non_volume_worktree(repo_dir, target)
+    _checkout_branch_at(repo_dir, "main", target)
     _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
 
 

@@ -622,7 +622,7 @@ class DataManager:
         logging.info("Loaded %d node(s) from DICOM path %s", len(loaded_nodes), dicom_path)
         return loaded_nodes
 
-    def load_segmentation(self, path: str, isolate: bool = True) -> Any:
+    def load_segmentation(self, path: str, isolate: bool = False) -> Any:
         data_format = self.detect_format(path)
         if data_format not in (DataFormat.SEGMENTATION, DataFormat.NIFTI, DataFormat.NRRD):
             raise ValueError(f"Unsupported segmentation format for: {path}")

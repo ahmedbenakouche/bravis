@@ -52,7 +52,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     commit_and_push,
     commit_local_version,
     checkout_local_version,
-    ensure_local_head_for_version,
     connect_session,
     create_private_repository,
     current_login,
@@ -60,7 +59,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     delete_owned_repository,
     ensure_tools,
     ensure_project_info_branch,
-    extract_project_version,
     find_gh,
     forget_people_access,
     has_delete_repo_scope,
@@ -89,7 +87,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     set_wait_callback,
     share_local_versions,
     publish_review_branch,
-    fetch_share_request_sha,
     accept_share_request,
     decline_share_request,
     suggest_github_usernames,
@@ -375,10 +372,17 @@ class NotificationsDialog(qt.QDialog):
             hold_layout.setContentsMargins(0, 0, 2, 0)
             hold_layout.setSpacing(6)
             group = qt.QButtonGroup(self)
+            last_section = None
             for index, item in enumerate(self._items):
+                kind = str(item.get("kind") or "")
+                section = "Invitations" if kind == "invite" else "This project"
+                if section != last_section:
+                    header = qt.QLabel(section)
+                    header.setStyleSheet(DIALOG_HINT_STYLE)
+                    hold_layout.addWidget(header)
+                    last_section = section
                 key = str(item.get("_key") or "")
                 is_unread = key in unread
-                kind = str(item.get("kind") or "")
                 label = _notification_list_label(item)
                 if is_unread:
                     label = "●  %s" % label
@@ -1353,6 +1357,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._painted_ids_cache = set()
         self._people_access_cache = {}
         self._notifications = []
+        self._notification_invites = []
+        self._notification_activity = []
         self._notificationsTimer = None
         self._refreshing_notifications = False
         self._notificationsProcess = None
@@ -4160,15 +4166,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         if getattr(self, "_notifications_popup_open", False):
             return
+        # Invites only (global). Project activity comes from the Messages poll.
         queue = [{"kind": "invite", "args": incoming_invitations_fetch_args(), "full_name": ""}]
-        for name in self._accessibleProjectNames():
-            queue.append(
-                {
-                    "kind": "activity",
-                    "args": project_messages_fetch_args(name),
-                    "full_name": name,
-                }
-            )
         self._notificationFetchQueue = queue
         self._notificationFetchResults = []
         self._notificationFetchAnnounce = bool(announce)
@@ -4214,7 +4213,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _onNotificationFetchFinished(self, _code=0) -> None:
         process = getattr(self, "_notificationsProcess", None)
         kind = getattr(self, "_notificationFetchKind", "")
-        project = getattr(self, "_notificationFetchProject", "")
         self._notificationsProcess = None
         self._notificationFetchKind = ""
         self._notificationFetchProject = ""
@@ -4242,60 +4240,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         try:
             if kind == "invite":
                 items = parse_incoming_invitations_output(stdout, stderr, code)
-            elif kind == "activity":
-                _messages, _sha, _tasks, activity, reads = parse_project_messages_output(
-                    stdout, stderr, code
-                )
-                me = (self._githubLogin() or "").lower()
-                my_reads = (reads or {}).get(me) or {}
-                by_project = getattr(self, "_reads_by_project", None)
-                if not isinstance(by_project, dict):
-                    by_project = {}
-                    self._reads_by_project = by_project
-                # Keep a newer local optimistic cursor if we already bumped it.
-                previous = by_project.get(project) or {}
-                ids = []
-                seen_ids = set()
-                for source in (previous.get("activity_ids"), my_reads.get("activity_ids")):
-                    if not isinstance(source, list):
-                        continue
-                    for aid in source:
-                        text = str(aid or "").strip()
-                        if not text or text in seen_ids:
-                            continue
-                        seen_ids.add(text)
-                        ids.append(text)
-                merged_cursor = {
-                    "activity_at": max(
-                        str(previous.get("activity_at") or ""),
-                        str(my_reads.get("activity_at") or ""),
-                    ),
-                    "messages_at": max(
-                        str(previous.get("messages_at") or ""),
-                        str(my_reads.get("messages_at") or ""),
-                    ),
-                }
-                if ids:
-                    merged_cursor["activity_ids"] = ids
-                by_project[project] = {
-                    key: value for key, value in merged_cursor.items() if value
-                }
-                for event in activity or []:
-                    author = str(event.get("author") or "").strip()
-                    if author.lower() == me:
-                        continue
-                    items.append(
-                        {
-                            "kind": "activity",
-                            "activity_kind": str(event.get("kind") or ""),
-                            "id": str(event.get("id") or ""),
-                            "author": author,
-                            "text": str(event.get("text") or ""),
-                            "at": str(event.get("at") or ""),
-                            "full_name": project,
-                            "when": self._formatMessageTime(event.get("at") or ""),
-                        }
-                    )
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             items = []
         results = getattr(self, "_notificationFetchResults", None)
@@ -4311,38 +4255,81 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "invite#%s" % item.get("id")
         return "activity#%s#%s" % (item.get("full_name") or "", item.get("id") or "")
 
+    def _rebuildNotificationsDisplay(self) -> None:
+        invites = list(getattr(self, "_notification_invites", []) or [])
+        activity = list(getattr(self, "_notification_activity", []) or [])
+        self._notifications = invites + activity
+        self._updateNotificationsBadge()
+
     def _applyNotificationRequests(self, requests: list, announce: bool = False) -> None:
-        invites = []
-        activity = []
-        for item in requests or []:
-            if str(item.get("kind") or "") == "invite":
-                invites.append(item)
-            else:
-                activity.append(item)
-        activity.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
-        activity = activity[:40]
-        previous_keys = {self._notificationKey(item) for item in getattr(self, "_notifications", [])}
-        display = list(invites) + list(activity)
+        """Apply invitation-only poll results; keep project activity from Messages."""
+        invites = [
+            item
+            for item in (requests or [])
+            if str(item.get("kind") or "") == "invite"
+        ]
+        previous_keys = {
+            self._notificationKey(item)
+            for item in getattr(self, "_notification_invites", []) or []
+        }
         if announce:
-            for item in display:
+            for item in invites:
                 key = self._notificationKey(item)
                 if key in previous_keys:
                     continue
                 if not self._isNotificationUnread(item):
                     continue
-                if item.get("kind") == "invite":
-                    self._appendFeed(
-                        "You were invited to %s." % (item.get("full_name") or "a project")
-                    )
+                self._appendFeed(
+                    "You were invited to %s." % (item.get("full_name") or "a project")
+                )
+        self._notification_invites = invites
+        self._rebuildNotificationsDisplay()
+
+    def _syncNotificationActivityFromProject(self, announce: bool = False) -> None:
+        """Fill the bell with activity for the selected project (from Messages poll)."""
+        project = self._currentProjectName() if self._hasSelectedProject() else ""
+        me = (self._githubLogin() or "").lower()
+        items = []
+        if project:
+            for event in getattr(self, "_project_activity", []) or []:
+                author = str((event or {}).get("author") or "").strip()
+                if author.lower() == me:
+                    continue
+                items.append(
+                    {
+                        "kind": "activity",
+                        "activity_kind": str((event or {}).get("kind") or ""),
+                        "id": str((event or {}).get("id") or ""),
+                        "author": author,
+                        "text": str((event or {}).get("text") or ""),
+                        "at": str((event or {}).get("at") or ""),
+                        "full_name": project,
+                        "when": self._formatMessageTime((event or {}).get("at") or ""),
+                    }
+                )
+        items.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+        items = items[:40]
+        previous_keys = {
+            self._notificationKey(item)
+            for item in getattr(self, "_notification_activity", []) or []
+        }
+        if announce:
+            for item in items:
+                key = self._notificationKey(item)
+                if key in previous_keys:
+                    continue
+                if not self._isNotificationUnread(item):
                     continue
                 text = str(item.get("text") or "").strip()
                 if text:
                     self._appendFeed(text)
-        self._notifications = display
-        self._updateNotificationsBadge()
+        self._notification_activity = items
+        self._rebuildNotificationsDisplay()
 
     def _clearNotificationsDisplay(self) -> None:
         self._notifications = []
+        self._notification_invites = []
+        self._notification_activity = []
         self._invite_read_ids = set()
         self._reads_by_project = {}
         self._updateNotificationsBadge()
@@ -4621,6 +4608,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._project_reads = {}
         self._messages_unread = 0
         self._messages_project = project or ""
+        self._notification_activity = []
+        self._rebuildNotificationsDisplay()
         self._renderMessagesView()
         self._updateMessagesBadge()
         self._updateTaskButtonUi()
@@ -4842,6 +4831,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._renderMessagesView()
         self._updateMessagesBadge()
         self._updateTaskButtonUi()
+        self._syncNotificationActivityFromProject(announce=True)
 
     def _markMessagesRead(self) -> None:
         project = self._currentProjectName() if self._hasSelectedProject() else ""
@@ -6144,7 +6134,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._suppress_dirty += 1
         try:
             self._updateProgress(progress_label)
-            self._ensureGitHeadMatchesCheckedOutVersion(local_path)
             self._writeProjectFiles(
                 local_path,
                 volume_node,
@@ -6544,9 +6533,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                             manager._basename_without_extension(segmentation_path)
                         }
                         manager.remove_scene_nodes_by_names(names_to_replace)
+                    # Load directly from the project file (no cv_load_ temp copy).
                     segmentation_node = manager.load_segmentation(
                         segmentation_path,
-                        isolate=not from_snapshot,
+                        isolate=False,
                     )
             finally:
                 self._suppress_asset_ui_updates -= 1
@@ -6639,20 +6629,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 return str((spec or {}).get("branch") or "main") or "main"
         return "main"
 
-    def _ensureGitHeadMatchesCheckedOutVersion(self, local_path: str) -> None:
-        version_id = getattr(self, "_currentVersionId", None)
-        if not version_id or not local_path:
-            return
-        bundle = getattr(self, "_project_history_bundle", None) or {}
-        sha = (bundle.get("sha_by_id") or {}).get(version_id)
-        if not sha:
-            return
-        ensure_local_head_for_version(
-            local_path,
-            sha,
-            self._historyLaneForVersion(version_id),
-        )
-
     def _checkoutVersion(
         self,
         version_id: str,
@@ -6689,7 +6665,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 break
         display = self._versionDisplayTag(version_id)
         previous_id = self._currentVersionId
-        snapshot = None
         self._suppress_history_selection_signal = True
         try:
             self._currentVersionId = version_id
@@ -6698,8 +6673,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._openProgress("Switch version", "Loading %s…" % display)
             try:
                 checkout_local_version(local_path, sha, lane)
-                snapshot = extract_project_version(local_path, sha)
-                self._loadOpenedProjectAssets(snapshot, volume_folder=local_path)
+                # Load from the project folder (volume untouched; seg/ontology restored above).
+                # volume_folder=local_path keeps soft reload: reuse volume + inject seg, no temp copy.
+                self._loadOpenedProjectAssets(local_path, volume_folder=local_path)
                 clone_files = DataManager().discover_project_files(local_path)
                 clone_ontologies = clone_files.get("ontologies") or []
                 if clone_ontologies:
@@ -6721,7 +6697,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     self._clearDirtyAssets()
                 except Exception:
                     pass
-                self._deferRemoveSnapshot(snapshot)
                 slicer.util.warningDisplay(str(error))
                 self._appendFeed(str(error).split("\n")[0], error=True)
                 return False
@@ -6737,14 +6712,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._painted_ids_cache = set()
         self._scheduleAnatomyTreeCoverageRefresh()
         self._updateVersionActionButtons()
-        self._deferRemoveSnapshot(snapshot)
         self._armLoadSettle()
         return True
-
-    def _deferRemoveSnapshot(self, snapshot: str | None) -> None:
-        if not snapshot:
-            return
-        qt.QTimer.singleShot(8000, lambda path=snapshot: shutil.rmtree(path, ignore_errors=True))
 
     def _selectHistoryRowForVersion(self, version_id: str) -> None:
         table = self.historyTableWidget
