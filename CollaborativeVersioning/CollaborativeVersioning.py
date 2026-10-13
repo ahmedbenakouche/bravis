@@ -51,6 +51,8 @@ from CollaborativeVersioningLib.GitHubAuth import (
     accept_project_invitation,
     commit_and_push,
     commit_local_version,
+    checkout_local_version,
+    ensure_local_head_for_version,
     connect_session,
     create_private_repository,
     current_login,
@@ -336,10 +338,10 @@ def _notification_list_label(item: dict) -> str:
     if kind == "invite":
         label = "Invitation to %s" % (project or "a project")
     else:
-        label = str((item or {}).get("text") or "Project update")
+        label = _notification_text(item.get("text") or "Project update", 56)
     if when:
         label = "%s · %s" % (label, when)
-    return label
+    return _notification_text(label, _NOTIFICATION_TEXT_LEN)
 
 
 class NotificationsDialog(qt.QDialog):
@@ -461,7 +463,7 @@ class NotificationDetailDialog(qt.QDialog):
             body = "You were invited to %s." % (item.get("full_name") or "a project")
         else:
             title = "Update"
-            body = str(item.get("text") or "Project update")
+            body = _notification_text(item.get("text") or "Project update", 120)
         head = qt.QLabel(title)
         head.setStyleSheet("font-weight: 600; font-size: 13px;")
         layout.addWidget(head)
@@ -469,6 +471,10 @@ class NotificationDetailDialog(qt.QDialog):
         body_label = qt.QLabel(body)
         body_label.setWordWrap(True)
         body_label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
+        try:
+            body_label.setMaximumHeight(96)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
         layout.addWidget(body_label)
 
         meta_bits = []
@@ -579,7 +585,9 @@ class PeopleDialog(qt.QDialog):
         add_layout.addWidget(self.suggestionList)
         owner_hint = qt.QLabel(
             "They will receive an invitation. After they accept, the project appears in their list.\n"
-            "Junior: they can access the project and share versions on their own line beside main."
+            "Senior: can assign Tasks, share onto main, and Accept / Decline a junior's Submit.\n"
+            "Junior: can work on the project and share on their own line beside main; "
+            "Submit needs a Task from a senior annotator."
         )
         owner_hint.setWordWrap(True)
         owner_hint.setStyleSheet(DIALOG_HINT_STYLE)
@@ -922,14 +930,22 @@ class PeopleDialog(qt.QDialog):
             handler(self)
 
 
-_TASK_EXCERPT_LEN = 32
+_TASK_EXCERPT_LEN = 18
+_NOTIFICATION_TEXT_LEN = 72
 
 
 def _task_excerpt(description: str) -> str:
     text = " ".join(str(description or "").split())
     if len(text) <= _TASK_EXCERPT_LEN:
         return text
-    return text[:_TASK_EXCERPT_LEN].rstrip() + "....."
+    return text[:_TASK_EXCERPT_LEN].rstrip() + "…"
+
+
+def _notification_text(text: str, limit: int = _NOTIFICATION_TEXT_LEN) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "…"
 
 
 class TaskDialog(qt.QDialog):
@@ -1576,6 +1592,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.segmentationSelector.connect("currentNodeChanged(vtkMRMLNode*)", self._onSegmentationAssetChanged)
 
     def _buildMessagesSection(self) -> None:
+        self.juniorTaskBanner = qt.QLabel("")
+        self.juniorTaskBanner.setWordWrap(True)
+        self.juniorTaskBanner.setStyleSheet(DIALOG_HINT_STYLE)
+        self.juniorTaskBanner.setVisible(False)
+        self.layout.addWidget(self.juniorTaskBanner)
+
         messagesButton = qt.QPushButton("Messages")
         messagesButton.setCheckable(True)
         messagesButton.setChecked(False)
@@ -4048,6 +4070,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (AttributeError, RuntimeError, TypeError, ValueError):
             pass
 
+    def _ownedProjectNames(self) -> list[str]:
+        names = []
+        for repo in ((self._github_session or {}).get("repos") or []):
+            if repo.get("role") != "owner":
+                continue
+            full_name = repo.get("full_name")
+            if full_name:
+                names.append(full_name)
+        return names
+
     def _accessibleProjectNames(self) -> list[str]:
         names = []
         seen = set()
@@ -4549,6 +4581,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messages_project = project or ""
         self._renderMessagesView()
         self._updateMessagesBadge()
+        self._updateJuniorTaskBanner()
 
     def _syncMessagesPolling(self) -> None:
         name = self._currentProjectName() if self._connected and self._hasSelectedProject() else ""
@@ -4764,6 +4797,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messages = self._mergePendingMessages(messages)
         self._renderMessagesView()
         self._updateMessagesBadge()
+        self._updateJuniorTaskBanner()
 
     def _markMessagesRead(self) -> None:
         project = self._currentProjectName() if self._hasSelectedProject() else ""
@@ -5439,6 +5473,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messages_unread = 0
         self._renderMessagesView(force_bottom=True)
         self._updateMessagesBadge()
+        self._updateJuniorTaskBanner()
         queue = list(getattr(self, "_messageSendQueue", []) or [])
         queue.append(message)
         self._messageSendQueue = queue
@@ -5614,6 +5649,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if self._connected:
                     self._runNotificationChecks(announce=False)
 
+    def _openInvitationNotification(self, invitation: dict) -> None:
+        self._markNotificationRead(invitation)
+        self._openNotificationDetail(invitation)
+
     def _taskRoleForLane(self, lane: str):
         lane_key = str(lane or "").strip().lower()
         if not lane_key or lane_key == "main":
@@ -5786,12 +5825,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             or (task or {}).get("description")
             or ""
         ).strip()
+        excerpt = _task_excerpt(description)
+        body = (
+            "accepted this task: %s" % excerpt if excerpt else "accepted this task."
+        )
         try:
-            message = build_project_message(
-                self._githubLogin(),
-                "accepted the task for %s." % junior,
-                kind="task",
-            )
+            message = build_project_message(self._githubLogin(), body, kind="task")
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
@@ -6046,6 +6085,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._suppress_dirty += 1
         try:
             self._updateProgress(progress_label)
+            self._ensureGitHeadMatchesCheckedOutVersion(local_path)
             self._writeProjectFiles(
                 local_path,
                 volume_node,
@@ -6185,7 +6225,59 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             "share",
             "%s shared versions on their line." % me,
         )
-        self._appendFeed("Shared on a branch beside main. It is not on main yet.")
+        self._appendFeed("Shared on your line.")
+        slicer.util.infoDisplay(
+            self._shareLineNextStepMessage(),
+            windowTitle="Share",
+        )
+
+    def _activeTaskAsJunior(self):
+        me = (self._githubLogin() or "").strip().lower()
+        if not me:
+            return None
+        for task in getattr(self, "_project_tasks", []) or []:
+            if str(task.get("status") or "") == "accepted":
+                continue
+            if str(task.get("junior") or "").strip().lower() == me:
+                return task
+        return None
+
+    def _hasActiveTaskAsJunior(self) -> bool:
+        return self._activeTaskAsJunior() is not None
+
+    def _shareLineNextStepMessage(self) -> str:
+        if self._hasActiveTaskAsJunior():
+            return (
+                "Shared on your line. Next: open your line in the version tree → Submit."
+            )
+        return (
+            "Shared on your line. Ask a senior annotator to assign a Task "
+            "before you can Submit."
+        )
+
+    def _updateJuniorTaskBanner(self) -> None:
+        banner = getattr(self, "juniorTaskBanner", None)
+        if banner is None:
+            return
+        task = self._activeTaskAsJunior()
+        if task is None:
+            banner.setText("")
+            banner.setVisible(False)
+            return
+        excerpt = _task_excerpt(
+            task.get("submitted_description") or task.get("description") or ""
+        )
+        senior = str(task.get("senior") or "").strip()
+        if excerpt and senior:
+            text = "Your task: %s (Assigned by %s)" % (excerpt, senior)
+        elif excerpt:
+            text = "Your task: %s" % excerpt
+        elif senior:
+            text = "You have an active task (Assigned by %s)." % senior
+        else:
+            text = "You have an active task."
+        banner.setText(text)
+        banner.setVisible(True)
 
     def onOpenProject(self) -> None:
         if not self._canOpenProject():
@@ -6429,6 +6521,27 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not self._checkoutVersion(selected_version_id, notify=True, sync_table=False):
             self._selectHistoryRowForVersion(self._currentVersionId)
 
+    def _historyLaneForVersion(self, version_id: str) -> str:
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        for spec in bundle.get("version_specs") or []:
+            if str((spec or {}).get("id") or "") == str(version_id or ""):
+                return str((spec or {}).get("branch") or "main") or "main"
+        return "main"
+
+    def _ensureGitHeadMatchesCheckedOutVersion(self, local_path: str) -> None:
+        version_id = getattr(self, "_currentVersionId", None)
+        if not version_id or not local_path:
+            return
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        sha = (bundle.get("sha_by_id") or {}).get(version_id)
+        if not sha:
+            return
+        ensure_local_head_for_version(
+            local_path,
+            sha,
+            self._historyLaneForVersion(version_id),
+        )
+
     def _checkoutVersion(
         self,
         version_id: str,
@@ -6449,9 +6562,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if prompt and not self._promptSwitchVersion(version_id):
             self._appendFeed("Switch version cancelled.")
             return False
-        sha = ((getattr(self, "_project_history_bundle", None) or {}).get("sha_by_id") or {}).get(
-            version_id
-        )
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        sha = (bundle.get("sha_by_id") or {}).get(version_id)
         local_path = getattr(self, "_local_project_path", None) or ""
         if not sha or not local_path:
             self._appendFeed(
@@ -6459,6 +6571,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 error=True,
             )
             return False
+        lane = "main"
+        for spec in bundle.get("version_specs") or []:
+            if str((spec or {}).get("id") or "") == str(version_id):
+                lane = str((spec or {}).get("branch") or "main")
+                break
         display = self._versionDisplayTag(version_id)
         previous_id = self._currentVersionId
         snapshot = None
@@ -6469,6 +6586,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._selectHistoryRowForVersion(version_id)
             self._openProgress("Switch version", "Loading %s…" % display)
             try:
+                checkout_local_version(local_path, sha, lane)
                 snapshot = extract_project_version(local_path, sha)
                 self._loadOpenedProjectAssets(snapshot, volume_folder=local_path)
                 clone_files = DataManager().discover_project_files(local_path)

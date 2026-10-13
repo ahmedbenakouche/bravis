@@ -677,8 +677,8 @@ def _draw_checkout_pointer(scene, node):
     ]
     scene.addPolygon(
         qt.QPolygonF(points),
-        qt.QPen(qt.QColor(_ui.ACCENT_ICE), 1),
-        qt.QBrush(qt.QColor(_ui.ACCENT_ICE)),
+        qt.QPen(qt.QColor(_ui.ACCENT_MINT), 1),
+        qt.QBrush(qt.QColor(_ui.ACCENT_MINT)),
     )
 
 

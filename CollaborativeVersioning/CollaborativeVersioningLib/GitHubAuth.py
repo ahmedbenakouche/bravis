@@ -638,6 +638,43 @@ def commit_local_version(repo_dir: str, message: str) -> None:
     _stage_and_commit(repo_dir, message, "Could not save the version.")
 
 
+def git_branch_for_history_lane(lane: str) -> str:
+    """Map a version-tree lane name to the local git branch that owns it."""
+    name = str(lane or "").strip()
+    if not name or name.lower() == "main":
+        return "main"
+    return review_branch_for(name)
+
+
+def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
+    """Point HEAD at this version so Save continues from it (not from stale main)."""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    if not sha:
+        raise GitHubAuthError("Could not switch version.")
+    branch = git_branch_for_history_lane(lane)
+    head = _git_rev_parse(repo_dir, "HEAD")
+    current = _current_branch_name(repo_dir)
+    if head == sha and current == branch:
+        _restore_non_volume_worktree(repo_dir, sha)
+        return
+    # Already continuing past this version on the same line — keep HEAD.
+    if (
+        current == branch
+        and head
+        and head != sha
+        and _is_ancestor(repo_dir, sha, head)
+    ):
+        return
+    _point_head_at(repo_dir, branch, sha)
+    _restore_non_volume_worktree(repo_dir, sha)
+
+
+def ensure_local_head_for_version(repo_dir: str, sha: str, lane: str = "main") -> None:
+    """Before Save: make sure the next commit parents from the checked-out version."""
+    checkout_local_version(repo_dir, sha, lane)
+
+
 def _share_failure_message(detail: str) -> str:
     lower = (detail or "").lower()
     if (
@@ -799,8 +836,29 @@ def publish_review_branch(repo_dir: str) -> None:
     head = _git_rev_parse(repo_dir, "HEAD")
     if not head:
         raise GitHubAuthError("Could not share the project yet.")
+    remote_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch) or _git_rev_parse(
+        repo_dir, "refs/heads/%s" % branch
+    )
     if _current_branch_name(repo_dir) != branch:
+        if (
+            remote_tip
+            and remote_tip != head
+            and not _is_ancestor(repo_dir, remote_tip, head)
+        ):
+            raise GitHubAuthError(
+                "Could not share on your line.\n\n"
+                "Switch to a version on your line first, then Save, then Share again."
+            )
         _point_head_at(repo_dir, branch, head)
+    elif (
+        remote_tip
+        and remote_tip != head
+        and not _is_ancestor(repo_dir, remote_tip, head)
+    ):
+        raise GitHubAuthError(
+            "Could not share on your line.\n\n"
+            "Switch to a version on your line first, then Save, then Share again."
+        )
     push = _run_git(
         ["push", "origin", "HEAD:refs/heads/%s" % branch],
         cwd=repo_dir,
