@@ -953,7 +953,7 @@ class TaskDialog(qt.QDialog):
 
     def __init__(self, parent, people=None, tasks=None, me="", can_assign=False) -> None:
         qt.QDialog.__init__(self, parent)
-        self.setWindowTitle("Task")
+        self.setWindowTitle("Tasks" if can_assign else "My task")
         self.setFixedWidth(460)
         self.setModal(True)
         self._people = list(people or [])
@@ -1148,23 +1148,51 @@ class TaskDialog(qt.QDialog):
             self.juniorCombo.addItem("No junior is free")
             self.assignButton.setEnabled(False)
 
+    def _isMyActiveTask(self, task: dict) -> bool:
+        if self._can_assign:
+            return False
+        me = self._me.lower()
+        if not me:
+            return False
+        if str(task.get("status") or "") == "accepted":
+            return False
+        return str(task.get("junior") or "").strip().lower() == me
+
     def _task_list_label(self, task: dict) -> str:
         junior = str(task.get("junior") or "").strip()
         senior = str(task.get("senior") or "").strip()
         accepted = str(task.get("status") or "") == "accepted"
         excerpt = _task_excerpt(task.get("description") or "") or "No description."
         mark = "✅" if accepted else "⏳"
-        return "%s  %s -> %s : %s" % (mark, senior, junior, excerpt)
+        label = "%s  %s -> %s : %s" % (mark, senior, junior, excerpt)
+        if self._isMyActiveTask(task):
+            return "● Your task — %s" % label
+        return label
 
     def _fillTasks(self) -> None:
         self.taskList.clear()
         if not self._tasks:
             self.taskList.addItem("No task yet.")
             return
-        for task in self._tasks:
-            self.taskList.addItem(self._task_list_label(task))
-        self.taskList.clearSelection()
-        self.taskList.setCurrentRow(-1)
+        mine_row = -1
+        accent = qt.QColor(ACCENT_ICE or "#5b9fd4")
+        for index, task in enumerate(self._tasks):
+            item = qt.QListWidgetItem(self._task_list_label(task))
+            if self._isMyActiveTask(task):
+                mine_row = index
+                try:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(accent)
+                except (AttributeError, TypeError, RuntimeError):
+                    pass
+            self.taskList.addItem(item)
+        if mine_row >= 0:
+            self.taskList.setCurrentRow(mine_row)
+        else:
+            self.taskList.clearSelection()
+            self.taskList.setCurrentRow(-1)
 
     def _canCancelSelected(self) -> bool:
         if not self._can_assign:
@@ -1592,11 +1620,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.segmentationSelector.connect("currentNodeChanged(vtkMRMLNode*)", self._onSegmentationAssetChanged)
 
     def _buildMessagesSection(self) -> None:
-        self.juniorTaskBanner = qt.QLabel("")
-        self.juniorTaskBanner.setWordWrap(True)
-        self.juniorTaskBanner.setStyleSheet(DIALOG_HINT_STYLE)
-        self.juniorTaskBanner.setVisible(False)
-        self.layout.addWidget(self.juniorTaskBanner)
+        self.messagesTaskButton = qt.QPushButton("Tasks")
+        self.messagesTaskButton.setStyleSheet(BTN_SECONDARY)
+        self.messagesTaskButton.setMinimumHeight(32)
+        self.messagesTaskButton.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+        self.messagesTaskButton.setEnabled(False)
+        self.messagesTaskButton.setToolTip("Connect with GitHub first.")
+        self.layout.addWidget(self.messagesTaskButton)
+        self.taskBadge = qt.QLabel(self.messagesTaskButton)
+        self.taskBadge.setAlignment(qt.Qt.AlignCenter)
+        self.taskBadge.setFixedSize(16, 16)
+        self.taskBadge.setStyleSheet(NOTIFICATIONS_BADGE_STYLE)
+        try:
+            self.taskBadge.setAttribute(qt.Qt.WA_TransparentForMouseEvents, True)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+        self.taskBadge.hide()
 
         messagesButton = qt.QPushButton("Messages")
         messagesButton.setCheckable(True)
@@ -1630,12 +1669,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         messagesLayout.setSpacing(6)
         messagesLayout.setContentsMargins(0, 6, 0, 0)
 
-        self.messagesTaskButton = qt.QPushButton("Task")
-        self.messagesTaskButton.setStyleSheet(BTN_SECONDARY)
-        self.messagesTaskButton.setMinimumHeight(32)
-        self.messagesTaskButton.setEnabled(False)
-        messagesLayout.addWidget(self.messagesTaskButton)
-
         self.messagesView = qt.QTextEdit()
         self.messagesView.setReadOnly(True)
         self.messagesView.setStyleSheet(MESSAGES_VIEW_STYLE)
@@ -1663,10 +1696,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         messagesLayout.addWidget(compose)
         messagesBody.hide()
         self.layout.addWidget(messagesBody)
+
         self._renderMessagesView()
         self._setMessagesComposerEnabled(False)
+        self._updateTaskButtonUi()
         messagesButton.connect("toggled(bool)", self._onMessagesToggled)
         qt.QTimer.singleShot(0, self._positionMessagesBadge)
+        qt.QTimer.singleShot(0, self._positionTaskBadge)
 
     def _configureDataNodeSelector(self, selector, node_types, none_enabled=False, hide_labelmaps=False) -> None:
         """Existing scene nodes only (no create/delete entries). Default selection is None."""
@@ -2215,15 +2251,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         button = getattr(self, "messagesButton", None)
         if button is not None:
             button.setEnabled(bool(enabled))
+        task_button = getattr(self, "messagesTaskButton", None)
+        if task_button is not None:
+            # Same as other action buttons: clickable when connected, even with no project.
+            task_button.setEnabled(bool(enabled))
         if not enabled:
             self._setMessagesComposerEnabled(False)
+        self._updateTaskButtonUi()
 
     def _setMessagesComposerEnabled(self, enabled: bool) -> None:
         can_write = bool(enabled and self._connected and self._hasSelectedProject())
-        for name in ("messagesInput", "messagesSend", "messagesTaskButton"):
+        for name in ("messagesInput", "messagesSend"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(can_write)
+        self._updateTaskButtonUi()
 
     def _canOpenDependencyGraph(self) -> bool:
         if not self._connected:
@@ -4581,7 +4623,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messages_project = project or ""
         self._renderMessagesView()
         self._updateMessagesBadge()
-        self._updateJuniorTaskBanner()
+        self._updateTaskButtonUi()
 
     def _syncMessagesPolling(self) -> None:
         name = self._currentProjectName() if self._connected and self._hasSelectedProject() else ""
@@ -4787,6 +4829,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         else:
             unread = 0
             for item in messages:
+                if str((item or {}).get("kind") or "") == "task":
+                    continue
                 author = str(item.get("author") or "").lower()
                 stamp = str(item.get("at") or "")
                 if not stamp or author == me:
@@ -4797,7 +4841,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messages = self._mergePendingMessages(messages)
         self._renderMessagesView()
         self._updateMessagesBadge()
-        self._updateJuniorTaskBanner()
+        self._updateTaskButtonUi()
 
     def _markMessagesRead(self) -> None:
         project = self._currentProjectName() if self._hasSelectedProject() else ""
@@ -4875,6 +4919,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "%d %s %s" % (local.day, month, time_part)
         return "%d %s %d %s" % (local.day, month, local.year, time_part)
 
+    def _isChatMessage(self, item: dict) -> bool:
+        return str((item or {}).get("kind") or "") != "task"
+
+    def _chatMessages(self):
+        return [
+            item
+            for item in (getattr(self, "_messages", []) or [])
+            if self._isChatMessage(item)
+        ]
+
     def _formatMessageHtml(self, item: dict) -> str:
         raw_author = str(item.get("author") or "Someone")
         author = html.escape(raw_author)
@@ -4882,19 +4936,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         when = html.escape(self._formatMessageTime(item.get("at") or ""))
         mine = raw_author.lower() == (self._githubLogin() or "").lower()
         pending = bool(item.get("pending"))
-        system = str(item.get("kind") or "") == "task"
-        name_color = TEXT_MUTED if pending or system else (ACCENT_ICE if mine else TEXT_SECONDARY)
+        name_color = TEXT_MUTED if pending else (ACCENT_ICE if mine else TEXT_SECONDARY)
         time_html = (
             ' <span style="color:%s;font-size:10px;">%s</span>' % (TEXT_MUTED, when)
             if when
             else ""
         )
-        body_style = ' style="color:%s;font-style:italic;"' % TEXT_MUTED if system else ""
         return (
             '<p style="margin:0 0 8px 0;">'
             '<span style="color:%s;font-weight:600;">%s</span>%s<br>'
-            "<span%s>%s</span></p>"
-        ) % (name_color, author, time_html, body_style, body)
+            "<span>%s</span></p>"
+        ) % (name_color, author, time_html, body)
 
     def _messagesScrollBar(self):
         view = getattr(self, "messagesView", None)
@@ -4934,7 +4986,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         view = getattr(self, "messagesView", None)
         if view is None or not _qt_widget_is_valid(view):
             return
-        messages = getattr(self, "_messages", []) or []
+        messages = self._chatMessages()
         if not messages:
             markup = '<span style="color:%s">%s</span>' % (
                 TEXT_MUTED,
@@ -5473,7 +5525,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messages_unread = 0
         self._renderMessagesView(force_bottom=True)
         self._updateMessagesBadge()
-        self._updateJuniorTaskBanner()
+        self._updateTaskButtonUi()
         queue = list(getattr(self, "_messageSendQueue", []) or [])
         queue.append(message)
         self._messageSendQueue = queue
@@ -5481,16 +5533,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._startNextQueuedSend()
 
     def onOpenTask(self) -> None:
-        if not self._connected or not self._hasSelectedProject():
+        if not self._connected:
+            self._appendFeed("Connect with GitHub first.", error=True)
+            return
+        if not self._hasSelectedProject():
             self._appendFeed("Select a project first.", error=True)
             return
         can_assign = self._canAssignTask()
+        title = "Tasks" if can_assign else "My task"
         people = []
         button = getattr(self, "messagesTaskButton", None)
         if button is not None:
             button.setEnabled(False)
         if can_assign:
-            self._openProgress("Task", "Reading who is on this project…")
+            self._openProgress(title, "Reading who is on this project…")
             try:
                 self._updateProgress("Reading who is on this project…")
                 people = list_project_people(self._currentProjectName())
@@ -5498,6 +5554,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._closeProgress()
                 if button is not None:
                     button.setEnabled(True)
+                self._updateTaskButtonUi()
                 self._appendFeed(str(error).split("\n")[0], error=True)
                 return
             self._closeProgress()
@@ -5512,6 +5569,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except Exception as error:
             if button is not None:
                 button.setEnabled(True)
+            self._updateTaskButtonUi()
             self._appendFeed("Could not open tasks. %s" % str(error).split("\n")[0], error=True)
             return
         if can_assign:
@@ -5524,6 +5582,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._task_dialog_open = False
             if button is not None:
                 button.setEnabled(True)
+            self._updateTaskButtonUi()
 
     def _onAssignTaskChosen(self, dialog, junior: str, description: str) -> None:
         senior = self._githubLogin()
@@ -6255,29 +6314,81 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             "before you can Submit."
         )
 
-    def _updateJuniorTaskBanner(self) -> None:
-        banner = getattr(self, "juniorTaskBanner", None)
-        if banner is None:
+    def _positionTaskBadge(self) -> None:
+        button = getattr(self, "messagesTaskButton", None)
+        badge = getattr(self, "taskBadge", None)
+        if button is None or badge is None or not _qt_widget_is_valid(button):
             return
+        try:
+            width = button.width
+            if callable(width):
+                width = width()
+            badge.move(max(8, int(width) - 22), 8)
+            badge.raise_()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+    def _taskButtonAccentStyle(self) -> str:
+        accent = ACCENT_ICE or "#5b9fd4"
+        return (
+            "QPushButton {"
+            " background-color: palette(button); color: palette(button-text);"
+            " border: 2px solid %s; font-weight: 700;"
+            " border-radius: 4px; padding: 6px 10px;"
+            "}"
+            "QPushButton:hover { border-color: %s; color: %s; }"
+            "QPushButton:pressed { background-color: palette(midlight); }"
+            % (accent, accent, accent)
+        )
+
+    def _updateTaskButtonUi(self) -> None:
+        button = getattr(self, "messagesTaskButton", None)
+        badge = getattr(self, "taskBadge", None)
+        if button is None:
+            return
+        if not self._connected:
+            button.setText("Tasks")
+            button.setStyleSheet(BTN_SECONDARY)
+            button.setToolTip("Connect with GitHub first.")
+            if badge is not None:
+                badge.hide()
+            return
+        button.setStyleSheet(self._taskButtonAccentStyle())
+        # Default label is Tasks; only a project Junior sees My task.
+        show_my_task = bool(self._hasSelectedProject() and not self._canAssignTask())
+        if not show_my_task:
+            button.setText("Tasks")
+            button.setToolTip(
+                "Tasks" if self._hasSelectedProject() else "Select a project first."
+            )
+            if badge is not None:
+                badge.hide()
+            return
+        button.setText("My task")
         task = self._activeTaskAsJunior()
         if task is None:
-            banner.setText("")
-            banner.setVisible(False)
+            button.setToolTip("No task assigned")
+            if badge is not None:
+                badge.hide()
             return
         excerpt = _task_excerpt(
             task.get("submitted_description") or task.get("description") or ""
         )
         senior = str(task.get("senior") or "").strip()
         if excerpt and senior:
-            text = "Your task: %s (Assigned by %s)" % (excerpt, senior)
+            tip = "%s (Assigned by %s)" % (excerpt, senior)
         elif excerpt:
-            text = "Your task: %s" % excerpt
+            tip = excerpt
         elif senior:
-            text = "You have an active task (Assigned by %s)." % senior
+            tip = "Assigned by %s" % senior
         else:
-            text = "You have an active task."
-        banner.setText(text)
-        banner.setVisible(True)
+            tip = "You have an active task"
+        button.setToolTip(tip)
+        if badge is not None:
+            badge.setText("1")
+            badge.show()
+            badge.raise_()
+            self._positionTaskBadge()
 
     def onOpenProject(self) -> None:
         if not self._canOpenProject():
