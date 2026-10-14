@@ -419,13 +419,18 @@ def _draw_tree_edge(scene, parent, child, color=None, width=2):
     scene.addLine(cx, py, cx, child["y"], pen)
 
 
+# Reserved for compare-dialog diff outline + pointer (not used as normal node/branch colors).
+COMPARE_DIFF_COLOR = "#dc2626"  # red
+
+
 def _branch_color(branch):
     if branch == "main":
         return MAIN_COLOR
+    # No green/red here — those are reserved for only-local / only-shared compare highlights.
     palette = [
         _ui.ACCENT_ICE,
         _ui.ACCENT_AMBER,
-        _ui.ACCENT_MINT,
+        _ui.ACCENT_INDIGO,
         "#ea580c" if not _ui.IS_DARK else "#fb923c",
         "#a78bfa" if not _ui.IS_DARK else "#c4b5fd",
         "#ec4899" if not _ui.IS_DARK else "#f9a8d4",
@@ -666,7 +671,7 @@ def _draw_version_box_node(scene, node, font_size=7):
     label.setPos(x + (w - bounds.width()) / 2.0, y + (h - bounds.height()) / 2.0)
 
 
-def _draw_checkout_pointer(scene, node):
+def _draw_checkout_pointer(scene, node, color=None):
     x, y, h = node["x"], node["y"], node["h"]
     tip_x = x - 6
     mid_y = y + h / 2.0
@@ -675,11 +680,179 @@ def _draw_checkout_pointer(scene, node):
         qt.QPointF(tip_x - 10, mid_y - 7),
         qt.QPointF(tip_x - 10, mid_y + 7),
     ]
+    pointer = color or _ui.ACCENT_INDIGO or "#818cf8"
     scene.addPolygon(
         qt.QPolygonF(points),
-        qt.QPen(qt.QColor(_ui.ACCENT_MINT), 1),
-        qt.QBrush(qt.QColor(_ui.ACCENT_MINT)),
+        qt.QPen(qt.QColor(pointer), 1),
+        qt.QBrush(qt.QColor(pointer)),
     )
+
+
+def _build_one_diff_caption(node_id, commit_history_by_id, side):
+    """Short label for a single diff node: when / who (shared only)."""
+    info = (commit_history_by_id or {}).get(node_id) or {}
+    author = str(info.get("author") or "").strip() or "a colleague"
+    when = str(info.get("date") or "").strip() or "recently"
+    side = str(side or "").strip().lower()
+    if side == "local":
+        return "Saved · not shared yet\n%s" % when
+    return "Shared by %s\n%s" % (author, when)
+
+
+def _measure_caption_size(text, font_size=8):
+    font = qt.QFont("Arial", font_size)
+    metrics = qt.QFontMetrics(font)
+    lines = [line for line in str(text or "").split("\n") if line] or [""]
+    widths = []
+    for line in lines:
+        if hasattr(metrics, "horizontalAdvance"):
+            advance = metrics.horizontalAdvance(line)
+            widths.append(float(advance() if callable(advance) else advance))
+        else:
+            widths.append(float(metrics.width(line)))
+    line_h = metrics.lineSpacing()
+    if callable(line_h):
+        line_h = line_h()
+    return max(widths) if widths else 0.0, float(line_h) * len(lines)
+
+
+def _rect_overlap_area(a, b):
+    x0 = max(a.left(), b.left())
+    y0 = max(a.top(), b.top())
+    x1 = min(a.right(), b.right())
+    y1 = min(a.bottom(), b.bottom())
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return float(x1 - x0) * float(y1 - y0)
+
+
+def _annotation_collision_score(rects, obstacles):
+    score = 0.0
+    for rect in rects:
+        for obs in obstacles:
+            score += _rect_overlap_area(rect, obs)
+    return score
+
+
+def _diff_annotation_layout(box, text_w, text_h, side):
+    """Return (pointer_poly_points, pointer_bounds, label_pos, label_bounds) for left/right."""
+    mid_y = box.center().y()
+    if side == "right":
+        tip_x = box.right() + 4
+        outer_x = tip_x + 12
+        points = [
+            qt.QPointF(tip_x, mid_y),
+            qt.QPointF(outer_x, mid_y - 8),
+            qt.QPointF(outer_x, mid_y + 8),
+        ]
+        pointer_bounds = qt.QRectF(tip_x, mid_y - 8, outer_x - tip_x, 16)
+        label_x = outer_x + 8
+        label_y = mid_y - text_h / 2.0
+    else:
+        tip_x = box.left() - 4
+        outer_x = tip_x - 12
+        points = [
+            qt.QPointF(tip_x, mid_y),
+            qt.QPointF(outer_x, mid_y - 8),
+            qt.QPointF(outer_x, mid_y + 8),
+        ]
+        pointer_bounds = qt.QRectF(outer_x, mid_y - 8, tip_x - outer_x, 16)
+        label_x = outer_x - text_w - 8
+        label_y = mid_y - text_h / 2.0
+    label_bounds = qt.QRectF(label_x, label_y, text_w, text_h)
+    return points, pointer_bounds, (label_x, label_y), label_bounds
+
+
+def _pick_diff_annotation_side(box, text_w, text_h, obstacles):
+    """Prefer the side where pointer + caption do not cover other nodes."""
+    best = None
+    for side in ("left", "right"):
+        points, pointer_bounds, label_pos, label_bounds = _diff_annotation_layout(
+            box, text_w, text_h, side
+        )
+        score = _annotation_collision_score(
+            (pointer_bounds, label_bounds), obstacles
+        )
+        # Slight preference for left when both are clear (stable reading).
+        tie = 0.0 if side == "left" else 0.01
+        candidate = (score + tie, side, points, pointer_bounds, label_pos, label_bounds)
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    return best[1:]
+
+
+def _draw_diff_region(
+    scene, positions, diff_ids, commit_history_by_id=None, diff_side=""
+):
+    """Dashed red box + pointer + caption per diff node.
+
+    One box per diff node. Each has its own arrow and text, placed on the
+    left or right so they avoid overlapping other version nodes (and each other).
+
+    Returns a QRectF covering boxes + pointers + captions (for fitInView), or None.
+    """
+    diff_id_list = [
+        node_id for node_id in (diff_ids or ()) if node_id in positions
+    ]
+    if not diff_id_list:
+        return None
+    pad = 10
+    red = COMPARE_DIFF_COLOR
+    pen = qt.QPen(qt.QColor(red), 2, qt.Qt.DashLine)
+    node_obstacles = {}
+    for nid, node in positions.items():
+        node_obstacles[nid] = qt.QRectF(
+            float(node["x"]) - 4,
+            float(node["y"]) - 4,
+            float(node["w"]) + 8,
+            float(node["h"]) + 8,
+        )
+    placed_annotations = []
+
+    fit = None
+    # Top-to-bottom so stacked diffs pick free sides consistently.
+    ordered = sorted(
+        diff_id_list,
+        key=lambda nid: (
+            float(positions[nid]["y"]),
+            float(positions[nid]["x"]),
+            str(nid),
+        ),
+    )
+    for node_id in ordered:
+        node = positions[node_id]
+        x0 = float(node["x"]) - pad
+        y0 = float(node["y"]) - pad
+        x1 = float(node["x"]) + float(node["w"]) + pad
+        y1 = float(node["y"]) + float(node["h"]) + pad
+        box = qt.QRectF(x0, y0, x1 - x0, y1 - y0)
+        scene.addRect(box, pen, qt.QBrush(qt.Qt.NoBrush))
+        fit = box if fit is None else fit.united(box)
+
+        text = _build_one_diff_caption(node_id, commit_history_by_id, diff_side)
+        text_w, text_h = _measure_caption_size(text, font_size=8)
+        blockers = [
+            rect for nid, rect in node_obstacles.items() if nid != node_id
+        ]
+        blockers.extend(placed_annotations)
+        _side, points, pointer_bounds, label_pos, label_bounds = (
+            _pick_diff_annotation_side(box, text_w, text_h, blockers)
+        )
+        scene.addPolygon(
+            qt.QPolygonF(points),
+            qt.QPen(qt.QColor(red), 1),
+            qt.QBrush(qt.QColor(red)),
+        )
+        fit = fit.united(pointer_bounds)
+        if text:
+            label = scene.addText(text)
+            label.setFont(qt.QFont("Arial", 8))
+            label.setDefaultTextColor(qt.QColor(_ui.GRAPH_NODE_TEXT or "#eeeeee"))
+            label.setPos(label_pos[0], label_pos[1])
+            fit = fit.united(label_bounds)
+            placed_annotations.append(pointer_bounds)
+            placed_annotations.append(label_bounds.adjusted(-4, -2, 4, 2))
+    return fit
 
 
 def _wheel_delta(event):
@@ -725,15 +898,36 @@ class InteractiveGraphView(qt.QGraphicsView):
         )
 
     def reset_view(self):
-        self.resetTransform()
-        self._zoom_level = 1.0
-        rect = self._graphe_scene.sceneRect
-        if rect.width() <= 0 or rect.height() <= 0:
+        # Guard against fitInView ↔ scrollbar ↔ resize feedback loops.
+        if getattr(self, "_fitting", False):
             return
-        vp = self.viewport()
-        if vp.width <= 0 or vp.height <= 0:
-            return
-        self.fitInView(rect, qt.Qt.KeepAspectRatio)
+        self._fitting = True
+        try:
+            self.resetTransform()
+            self._zoom_level = 1.0
+            vp = self.viewport()
+            if vp.width <= 0 or vp.height <= 0:
+                return
+            # Compare-with-shared only: tight fit on nodes (+ pointer caption).
+            # Normal Version tree: classic fit on full sceneRect (unchanged).
+            if getattr(self, "fit_tight", False):
+                rect = getattr(self, "_content_fit_rect", None)
+                if rect is None or rect.width() <= 0 or rect.height() <= 0:
+                    rect = self._graphe_scene.sceneRect
+                if rect.width() <= 0 or rect.height() <= 0:
+                    return
+                try:
+                    rect = rect.adjusted(-28, -28, 28, 28)
+                except (AttributeError, TypeError, RuntimeError):
+                    pass
+                self.fitInView(rect, qt.Qt.KeepAspectRatio)
+                return
+            rect = self._graphe_scene.sceneRect
+            if rect.width() <= 0 or rect.height() <= 0:
+                return
+            self.fitInView(rect, qt.Qt.KeepAspectRatio)
+        finally:
+            self._fitting = False
 
     def zoom_in(self):
         self._apply_zoom(self.ZOOM_STEP)
@@ -811,6 +1005,12 @@ class VersionHistoryCanvas(InteractiveGraphView):
         active_version_id=None,
         commit_history_by_id=None,
         parent=None,
+        read_only=False,
+        highlight_ids=None,
+        conflict_ids=None,
+        diff_side=None,
+        minimum_height=480,
+        fit_tight=False,
     ):
         InteractiveGraphView.__init__(self, parent)
         self.logic = logic
@@ -819,6 +1019,13 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.graph_description = graph_description or ""
         self.active_version_id = active_version_id
         self.commit_history_by_id = dict(commit_history_by_id or {})
+        self.read_only = bool(read_only)
+        # id -> "local_only" | "remote_only" (legacy; unused for node fill now)
+        self.highlight_ids = dict(highlight_ids or {})
+        self.conflict_ids = set(conflict_ids or ())
+        # "local" | "shared" — caption wording next to the red diff pointer
+        self.diff_side = str(diff_side or "").strip().lower()
+        self.fit_tight = bool(fit_tight)
         self._specs_by_id = {spec["id"]: spec for spec in self.version_specs}
         self._nodes_by_id = {}
         self._pending_node_id = None
@@ -831,11 +1038,37 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self._graphe_scene = graphe_scene
         self.setRenderHints(qt.QPainter.Antialiasing | qt.QPainter.TextAntialiasing)
         self.setStyleSheet("background-color: palette(base); border: none;")
-        self.setMinimumHeight(480)
+        self.setMinimumHeight(int(minimum_height) if minimum_height else 480)
+        try:
+            self.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Expanding)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
         self._setup_interaction()
         self.draw()
-        self._pad_scene_rect()
+        # Compare views: less empty pad so fitInView can zoom in more.
+        self._pad_scene_rect(margin=36 if self.fit_tight else 100)
         self.reset_view()
+
+    def sizeHint(self):
+        # Compare dialogs: do not advertise scene size (huge graphs blow the window off-screen).
+        if getattr(self, "fit_tight", False):
+            min_h = max(int(self.minimumHeight() or 0), 200)
+            min_w = max(int(self.minimumWidth() or 0), 320)
+            return qt.QSize(min_w, min_h)
+        try:
+            return InteractiveGraphView.sizeHint(self)
+        except (AttributeError, TypeError, RuntimeError):
+            return qt.QSize(640, 480)
+
+    def minimumSizeHint(self):
+        if getattr(self, "fit_tight", False):
+            min_h = max(int(self.minimumHeight() or 0), 160)
+            min_w = max(int(self.minimumWidth() or 0), 240)
+            return qt.QSize(min_w, min_h)
+        try:
+            return InteractiveGraphView.minimumSizeHint(self)
+        except (AttributeError, TypeError, RuntimeError):
+            return qt.QSize(240, 160)
 
     def set_active_version_id(self, version_id):
         if version_id == self.active_version_id:
@@ -844,8 +1077,44 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.draw()
         self._pad_scene_rect()
 
+    def set_compare_content(
+        self,
+        version_specs=None,
+        graph_title=None,
+        graph_description=None,
+        active_version_id=None,
+        commit_history_by_id=None,
+        highlight_ids=None,
+        conflict_ids=None,
+        diff_side=None,
+    ):
+        """Replace graph contents (used by the compare result preview)."""
+        if version_specs is not None:
+            self.version_specs = list(version_specs)
+            self._specs_by_id = {spec["id"]: spec for spec in self.version_specs}
+        if graph_title is not None:
+            self.graph_title = graph_title
+        if graph_description is not None:
+            self.graph_description = graph_description
+        if active_version_id is not None:
+            self.active_version_id = active_version_id
+        if commit_history_by_id is not None:
+            self.commit_history_by_id = dict(commit_history_by_id)
+        if highlight_ids is not None:
+            self.highlight_ids = dict(highlight_ids)
+        if conflict_ids is not None:
+            self.conflict_ids = set(conflict_ids)
+        if diff_side is not None:
+            self.diff_side = str(diff_side or "").strip().lower()
+        self.draw()
+        self._pad_scene_rect()
+        self.reset_view()
+
     def create_toolbar(self):
-        hint = qt.QLabel("Click a node to check out · Double-click for details")
+        if self.read_only:
+            hint = qt.QLabel("Read-only · Double-click for details")
+        else:
+            hint = qt.QLabel("Click a node to check out · Double-click for details")
         hint.setStyleSheet("color: %s; font-size: 10px;" % _ui.GRAPH_HINT)
         return InteractiveGraphView.create_toolbar(self, leading_widgets=[hint])
 
@@ -854,13 +1123,16 @@ class VersionHistoryCanvas(InteractiveGraphView):
         if not spec:
             return
         history = self.commit_history_by_id.get(node_id, {})
+        actions = {} if self.read_only else self._review_actions(spec, history)
         dialog = _VersionInfoDialog(
             self,
             spec,
             history,
-            actions=self._review_actions(spec, history),
+            actions=actions,
         )
         if dialog.exec_() != qt.QDialog.Accepted or not dialog.chosen:
+            return
+        if self.read_only:
             return
         if hasattr(self.logic, "onVersionReviewAction"):
             self.logic.onVersionReviewAction(dialog.chosen, spec)
@@ -877,13 +1149,20 @@ class VersionHistoryCanvas(InteractiveGraphView):
     def _on_single_click_timeout(self):
         node_id = self._pending_node_id
         self._pending_node_id = None
-        if not node_id:
+        if not node_id or self.read_only:
             return
         if hasattr(self.logic, "onVersionCheckedOut"):
             self.logic.onVersionCheckedOut(node_id)
 
     def showEvent(self, event):
         qt.QGraphicsView.showEvent(self, event)
+        if getattr(self, "fit_tight", False):
+            # Compare dialog: one deferred fit after layout.
+            try:
+                qt.QTimer.singleShot(0, self.reset_view)
+            except (AttributeError, TypeError, RuntimeError):
+                self.reset_view()
+            return
         self.reset_view()
 
     def _node_at_scene_pos(self, scene_pos):
@@ -894,6 +1173,9 @@ class VersionHistoryCanvas(InteractiveGraphView):
             scene_pos = self.mapToScene(_qt_event_pos(event))
             node_id = self._node_at_scene_pos(scene_pos)
             if node_id:
+                if self.read_only:
+                    event.accept()
+                    return
                 self._pending_node_id = node_id
                 self._click_timer.start()
                 event.accept()
@@ -921,9 +1203,11 @@ class VersionHistoryCanvas(InteractiveGraphView):
             hint.setPos(MARGIN, MARGIN)
             self._graphe_scene.setSceneRect(0, 0, 400, 200)
             self._nodes_by_id = {}
+            self._content_fit_rect = None
             return
 
         positions, edges = _layout_version_graph(self.version_specs)
+        # Node green/red highlights removed — diffs use dashed red boxes only.
         self._nodes_by_id = positions
         nodes_by_id = positions
         trunk_order = _main_trunk_order(self.version_specs)
@@ -948,8 +1232,68 @@ class VersionHistoryCanvas(InteractiveGraphView):
 
         for node in nodes_by_id.values():
             _draw_version_box_node(self._graphe_scene, node, font_size=7)
-            if self.active_version_id and node["id"] == self.active_version_id:
-                _draw_checkout_pointer(self._graphe_scene, node)
+
+        if self.fit_tight:
+            # Compare-with-shared: center nodes; include pointer caption via symmetric pad.
+            max_x = max(node["x"] + node["w"] for node in nodes_by_id.values())
+            max_y = max(node["y"] + node["h"] for node in nodes_by_id.values())
+            min_x = min(node["x"] for node in nodes_by_id.values())
+            min_y = min(node["y"] for node in nodes_by_id.values())
+            node_rect = qt.QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
+            self._content_fit_rect = qt.QRectF(node_rect)
+
+            diff_bounds = None
+            if self.conflict_ids:
+                diff_bounds = _draw_diff_region(
+                    self._graphe_scene,
+                    nodes_by_id,
+                    self.conflict_ids,
+                    commit_history_by_id=self.commit_history_by_id,
+                    diff_side=self.diff_side,
+                )
+            elif self.active_version_id and self.active_version_id in nodes_by_id:
+                _draw_checkout_pointer(
+                    self._graphe_scene, nodes_by_id[self.active_version_id]
+                )
+
+            if diff_bounds is not None:
+                left_extra = max(0.0, node_rect.left() - diff_bounds.left())
+                right_extra = max(0.0, diff_bounds.right() - node_rect.right())
+                top_extra = max(0.0, node_rect.top() - diff_bounds.top())
+                bottom_extra = max(0.0, diff_bounds.bottom() - node_rect.bottom())
+                h_pad = max(left_extra, right_extra)
+                v_pad = max(top_extra, bottom_extra)
+                self._content_fit_rect = node_rect.adjusted(
+                    -h_pad, -v_pad, h_pad, v_pad
+                )
+
+            fit = self._content_fit_rect
+            scene_left = min(0.0, fit.left() - 20)
+            scene_top = min(0.0, fit.top() - 20)
+            scene_right = max(940.0, max_x + MARGIN + 40.0, fit.right() + 20)
+            scene_bottom = max(max_y + 40.0, fit.bottom() + 20)
+            self._graphe_scene.setSceneRect(
+                scene_left,
+                scene_top,
+                scene_right - scene_left,
+                scene_bottom - scene_top,
+            )
+            return
+
+        # Normal Version tree — classic layout (no auto enlarge / special centering).
+        self._content_fit_rect = None
+        if self.conflict_ids:
+            _draw_diff_region(
+                self._graphe_scene,
+                nodes_by_id,
+                self.conflict_ids,
+                commit_history_by_id=self.commit_history_by_id,
+                diff_side=self.diff_side,
+            )
+        elif self.active_version_id and self.active_version_id in nodes_by_id:
+            _draw_checkout_pointer(
+                self._graphe_scene, nodes_by_id[self.active_version_id]
+            )
 
         max_x = max(node["x"] + node["w"] for node in nodes_by_id.values())
         max_y = max(node["y"] for node in nodes_by_id.values())
@@ -1044,7 +1388,12 @@ class _VersionInfoDialog(qt.QDialog):
         layout.addLayout(form)
 
         allowed = actions or {}
-        has_action = bool(allowed.get("submit") or allowed.get("accept") or allowed.get("decline"))
+        has_action = bool(
+            allowed.get("submit")
+            or allowed.get("merge")
+            or allowed.get("accept")
+            or allowed.get("decline")
+        )
         if has_action:
             actions_row = qt.QHBoxLayout()
             actions_row.setSpacing(16)
@@ -1061,6 +1410,8 @@ class _VersionInfoDialog(qt.QDialog):
 
             if allowed.get("submit"):
                 add_action("Submit", self._chooseSubmit, _ui.BTN_CREATE)
+            if allowed.get("merge"):
+                add_action("Merge", self._chooseMerge, _ui.BTN_CREATE)
             if allowed.get("accept"):
                 add_action("Accept", self._chooseAccept, _ui.BTN_CREATE)
             if allowed.get("decline"):
@@ -1081,6 +1432,9 @@ class _VersionInfoDialog(qt.QDialog):
 
     def _chooseSubmit(self):
         self._choose("submit")
+
+    def _chooseMerge(self):
+        self._choose("merge")
 
     def _chooseAccept(self):
         self._choose("accept")

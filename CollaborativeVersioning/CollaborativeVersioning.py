@@ -1,3 +1,4 @@
+import copy
 import html
 import importlib
 import logging
@@ -80,8 +81,15 @@ from CollaborativeVersioningLib.GitHubAuth import (
     open_delete_permission_window,
     open_login_window,
     open_or_update_local_project,
+    fetch_remote_updates,
+    adopt_shared_main,
+    integrate_shared_linear,
+    capture_remote_sync_caps,
+    derive_remote_sync_caps_from_history,
+    save_remote_sync_caps,
     people_access_for,
     read_project_history,
+    read_compare_project_histories,
     remove_project_colleague,
     cancel_project_invitation,
     set_wait_callback,
@@ -328,6 +336,9 @@ class ProjectConfigDialog(qt.QDialog):
         }
 
 
+_VERSIONS_SYNC_ACTIVITY_KINDS = frozenset(("share", "accept"))
+
+
 def _notification_list_label(item: dict) -> str:
     kind = str((item or {}).get("kind") or "")
     project = str((item or {}).get("full_name") or "").strip()
@@ -341,21 +352,88 @@ def _notification_list_label(item: dict) -> str:
     return _notification_text(label, _NOTIFICATION_TEXT_LEN)
 
 
+def _notification_detail_title(item: dict) -> str:
+    kind = str((item or {}).get("kind") or "")
+    if kind == "invite":
+        return "Invitation"
+    activity_kind = str((item or {}).get("activity_kind") or "").strip().lower()
+    titles = {
+        "share": "New share",
+        "accept": "New accept",
+        "submit": "New submit",
+        "assign": "New task",
+        "cancel": "Task cancelled",
+        "decline": "Review declined",
+        "join": "New join",
+        "people_add": "People update",
+        "people_remove": "People update",
+    }
+    return titles.get(activity_kind, "Notification")
+
+
 class NotificationsDialog(qt.QDialog):
     """Bell list: unread rows stand out; click opens the detail."""
 
-    def __init__(self, parent=None, items=None, empty_text="", unread_keys=None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        items=None,
+        empty_text="",
+        unread_keys=None,
+        lagging_keys=None,
+        sync_status_text="",
+        show_sync_button: bool = False,
+    ) -> None:
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("Notifications")
         self.setMinimumWidth(420)
-        self.setMaximumHeight(520)
+        self.setMaximumHeight(560)
         self.setModal(True)
         self.chosen = None
         self.mark_all = False
+        self.compare_requested = False
+        self.sync_requested = False  # alias kept for older call sites
         self._items = list(items or [])
         unread = set(unread_keys or [])
+        lagging = set(lagging_keys or [])
         layout = qt.QVBoxLayout(self)
         layout.setSpacing(8)
+        if sync_status_text:
+            status = qt.QLabel(sync_status_text)
+            status.setWordWrap(True)
+            status.setStyleSheet(
+                "color: %s; font-weight: 600;" % (TEXT_SECONDARY or "#c8c8c8")
+            )
+            if show_sync_button:
+                status.setToolTip(
+                    "⚠ means your local project is not aligned with the remote copy."
+                )
+            else:
+                status.setToolTip(
+                    "✅ means this computer is aligned with the shared project."
+                )
+            layout.addWidget(status)
+            if show_sync_button:
+                sync_btn = qt.QPushButton("Compare with shared")
+                accent = ACCENT_ICE or "#5b9fd4"
+                sync_btn.setStyleSheet(
+                    "QPushButton {"
+                    " background-color: palette(button); color: %s;"
+                    " border: 1px solid %s; font-weight: 600;"
+                    " border-radius: 4px; padding: 6px 10px;"
+                    "}"
+                    "QPushButton:hover {"
+                    " background-color: palette(midlight); color: %s;"
+                    " border: 2px solid %s; font-weight: 700;"
+                    "}"
+                    "QPushButton:pressed { background-color: palette(mid); }"
+                    % (accent, accent, accent, accent)
+                )
+                sync_btn.setToolTip(
+                    "Compare your local versions with the shared project before updating."
+                )
+                sync_btn.connect("clicked()", self._onSync)
+                layout.addWidget(sync_btn)
         if not self._items:
             hint = qt.QLabel(empty_text or "No notifications.")
             hint.setWordWrap(True)
@@ -383,11 +461,19 @@ class NotificationsDialog(qt.QDialog):
                     last_section = section
                 key = str(item.get("_key") or "")
                 is_unread = key in unread
+                is_lagging = key in lagging
                 label = _notification_list_label(item)
                 if is_unread:
                     label = "●  %s" % label
+                if is_lagging:
+                    label = "%s  ⚠" % label
                 button = qt.QPushButton(label)
-                tip = "Open invitation" if kind == "invite" else "Open notification"
+                if is_lagging:
+                    tip = "Local project is not aligned with the remote copy"
+                elif kind == "invite":
+                    tip = "Open invitation"
+                else:
+                    tip = "Open notification"
                 button.setToolTip(tip)
                 if is_unread:
                     button.setStyleSheet(
@@ -436,6 +522,15 @@ class NotificationsDialog(qt.QDialog):
     def _onMarkAll(self) -> None:
         self.mark_all = True
         self.chosen = None
+        self.compare_requested = False
+        self.sync_requested = False
+        self.reject()
+
+    def _onSync(self) -> None:
+        self.compare_requested = True
+        self.sync_requested = True
+        self.chosen = None
+        self.mark_all = False
         self.reject()
 
     def _onPick(self, index) -> None:
@@ -446,6 +541,534 @@ class NotificationsDialog(qt.QDialog):
         if 0 <= index < len(self._items):
             self.chosen = self._items[index]
         self.accept()
+
+
+class CompareWithSharedDialog(qt.QDialog):
+    """Compare local vs shared graphs, preview a choice, then Validate to apply."""
+
+    ACTION_NONE = ""
+    ACTION_UPDATE = "update"
+    ACTION_KEEP = "keep"
+    ACTION_RESET = "reset"
+    ACTION_LINEAR = "linear"
+    ACTION_MERGE = "merge"
+    # Backward-compatible aliases (older call sites / mental model).
+    ACTION_TAKE = ACTION_RESET
+    ACTION_COMBINE = ACTION_MERGE
+
+    def __init__(self, parent, compare: dict | None = None) -> None:
+        qt.QDialog.__init__(self, parent)
+        self.setWindowTitle("Compare with shared")
+        self.setModal(True)
+        # Independent window with Minimize / Maximize (Restore) / Close.
+        try:
+            self.setWindowFlags(
+                qt.Qt.Window
+                | qt.Qt.WindowTitleHint
+                | qt.Qt.WindowSystemMenuHint
+                | qt.Qt.WindowMinMaxButtonsHint
+                | qt.Qt.WindowCloseButtonHint
+            )
+        except (AttributeError, TypeError, RuntimeError):
+            self.setWindowFlags(qt.Qt.Window)
+        try:
+            screen = qt.QApplication.primaryScreen()
+            geo = screen.availableGeometry() if screen is not None else None
+            if geo is not None and geo.width() > 0 and geo.height() > 0:
+                # Stay inside the screen even when Result preview adds a third graph.
+                self.setMaximumSize(geo.width(), geo.height())
+                self.resize(
+                    min(geo.width(), max(900, int(geo.width() * 0.85))),
+                    min(geo.height(), max(640, int(geo.height() * 0.85))),
+                )
+            else:
+                self.resize(1280, 820)
+        except (AttributeError, TypeError, RuntimeError):
+            self.resize(1280, 820)
+        self.action = self.ACTION_NONE
+        self._pending = self.ACTION_NONE
+        self._compare = dict(compare or {})
+        self._conflict = bool(self._compare.get("conflict"))
+        self._aligned = bool(self._compare.get("aligned"))
+        self._has_remote = bool(self._compare.get("has_remote_extras"))
+        self._has_local = bool(self._compare.get("has_local_extras"))
+        self._graph_module = None
+
+        layout = qt.QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        import CollaborativeVersioningLib.GraphCanvas as graph_module
+
+        self._graph_module = graph_module
+        logic = _CompareGraphLogic()
+        local_model = self._compare.get("local") or {}
+        remote_model = self._compare.get("remote") or {}
+        # Any differing nodes — not only main-line conflict.
+        diff_local = set(self._compare.get("only_local_ids_local") or set())
+        diff_remote = set(self._compare.get("only_remote_ids_remote") or set())
+
+        graphs_row = qt.QWidget()
+        graphs_layout = qt.QHBoxLayout(graphs_row)
+        graphs_layout.setContentsMargins(0, 0, 0, 0)
+        graphs_layout.setSpacing(8)
+
+        title_style = (
+            "font-size: 15px; font-weight: 800; padding: 6px 0 2px 0;"
+        )
+
+        local_col = qt.QVBoxLayout()
+        local_title = qt.QLabel("Local (this computer)")
+        local_title.setAlignment(qt.Qt.AlignHCenter)
+        local_title.setStyleSheet(title_style)
+        local_col.addWidget(local_title)
+        self._local_canvas = graph_module.VersionHistoryCanvas(
+            logic,
+            version_specs=list(local_model.get("version_specs") or []),
+            graph_title="Local",
+            graph_description="",
+            active_version_id=None,
+            commit_history_by_id=graph_module.commit_history_lookup(
+                local_model.get("commit_history") or []
+            ),
+            read_only=True,
+            highlight_ids={},
+            conflict_ids=diff_local,
+            diff_side="local",
+            minimum_height=200,
+            fit_tight=True,
+        )
+        local_col.addWidget(self._local_canvas, 1)
+        graphs_layout.addLayout(local_col, 1)
+
+        remote_col = qt.QVBoxLayout()
+        remote_title = qt.QLabel("Shared (remote)")
+        remote_title.setAlignment(qt.Qt.AlignHCenter)
+        remote_title.setStyleSheet(title_style)
+        remote_col.addWidget(remote_title)
+        self._remote_canvas = graph_module.VersionHistoryCanvas(
+            logic,
+            version_specs=list(remote_model.get("version_specs") or []),
+            graph_title="Shared",
+            graph_description="",
+            active_version_id=None,
+            commit_history_by_id=graph_module.commit_history_lookup(
+                remote_model.get("commit_history") or []
+            ),
+            read_only=True,
+            highlight_ids={},
+            conflict_ids=diff_remote,
+            diff_side="shared",
+            minimum_height=200,
+            fit_tight=True,
+        )
+        remote_col.addWidget(self._remote_canvas, 1)
+        graphs_layout.addLayout(remote_col, 1)
+        layout.addWidget(graphs_row, 5)
+
+        # Legend under the two graphs, above the Conflicts section.
+        self._diff_legend = qt.QLabel(
+            "The red dashed boxes mark versions that differ "
+            "between this computer and the shared project."
+        )
+        self._diff_legend.setWordWrap(True)
+        self._diff_legend.setAlignment(qt.Qt.AlignHCenter)
+        self._diff_legend.setStyleSheet(DIALOG_HINT_STYLE)
+        if self._aligned or (not diff_local and not diff_remote):
+            self._diff_legend.hide()
+        layout.addWidget(self._diff_legend)
+
+        # Fixed Conflicts section (same place for OK / conflict).
+        ice = ACCENT_ICE or "#5b9fd4"
+        border = BORDER or "#505050"
+        elevated = BG_ELEVATED or "#383838"
+        self._conflicts_box = qt.QFrame()
+        self._conflicts_box.setObjectName("conflictsBox")
+        self._conflicts_box.setStyleSheet(
+            "QFrame#conflictsBox {"
+            " border: 1px solid %s; border-radius: 8px;"
+            " background-color: %s; padding: 4px;"
+            "}"
+            % (border, elevated)
+        )
+        conflicts_layout = qt.QVBoxLayout(self._conflicts_box)
+        conflicts_layout.setContentsMargins(14, 10, 14, 12)
+        conflicts_layout.setSpacing(8)
+        conflicts_header = qt.QLabel("Conflicts")
+        conflicts_header.setAlignment(qt.Qt.AlignHCenter)
+        conflicts_header.setStyleSheet(
+            "font-size: 15px; font-weight: 800; color: %s; border: none;"
+            " background: transparent; padding: 0;"
+            % ice
+        )
+        conflicts_layout.addWidget(conflicts_header)
+        self._conflicts_body = qt.QLabel("")
+        self._conflicts_body.setWordWrap(True)
+        self._conflicts_body.setAlignment(qt.Qt.AlignHCenter)
+        self._conflicts_body.setStyleSheet(
+            "font-size: 12px; font-weight: 500; border: none;"
+            " background: transparent; color: %s;"
+            % (TEXT_SECONDARY or "#b8bcc4")
+        )
+        conflicts_layout.addWidget(self._conflicts_body)
+
+        choice_row = qt.QHBoxLayout()
+        choice_row.setSpacing(10)
+        choice_row.addStretch(1)
+        self._update_choice_btn = qt.QPushButton("Update version tree")
+        self._update_choice_btn.setStyleSheet(BTN_SECONDARY)
+        self._update_choice_btn.setToolTip(
+            "Preview: refresh the version tree from shared (does not replace open assets)."
+        )
+        self._update_choice_btn.connect(
+            "clicked()", lambda: self._selectChoice(self.ACTION_UPDATE)
+        )
+        self._keep_btn = qt.QPushButton("Keep mine")
+        self._keep_btn.setStyleSheet(BTN_SECONDARY)
+        self._keep_btn.setToolTip(
+            "Preview: keep this computer's main tip. Shared tip is not applied."
+        )
+        self._keep_btn.connect("clicked()", lambda: self._selectChoice(self.ACTION_KEEP))
+        self._reset_btn = qt.QPushButton("Reset to shared")
+        self._reset_btn.setStyleSheet(BTN_SECONDARY)
+        self._reset_btn.setToolTip(
+            "Drop this computer's divergent tip and match the shared project exactly."
+        )
+        self._reset_btn.connect(
+            "clicked()", lambda: self._selectChoice(self.ACTION_RESET)
+        )
+        self._linear_btn = qt.QPushButton("Integrate shared (linear)")
+        self._linear_btn.setStyleSheet(BTN_SECONDARY)
+        self._linear_btn.setToolTip(
+            "Put shared versions first, then replay your local work on top."
+        )
+        self._linear_btn.connect(
+            "clicked()", lambda: self._selectChoice(self.ACTION_LINEAR)
+        )
+        self._merge_btn = qt.QPushButton("Integrate shared (merge) — coming")
+        self._merge_btn.setStyleSheet(BTN_SECONDARY)
+        self._merge_btn.setToolTip(
+            "Keep both histories side by side. Not available yet."
+        )
+        self._merge_btn.connect(
+            "clicked()", lambda: self._selectChoice(self.ACTION_MERGE)
+        )
+        choice_row.addWidget(self._update_choice_btn)
+        choice_row.addWidget(self._keep_btn)
+        choice_row.addWidget(self._reset_btn)
+        choice_row.addWidget(self._linear_btn)
+        choice_row.addWidget(self._merge_btn)
+        choice_row.addStretch(1)
+        conflicts_layout.addLayout(choice_row)
+
+        self._conflict_options_help = qt.QLabel(
+            "• Reset to shared — discard your divergent local tip; this computer matches shared.\n"
+            "• Integrate shared (linear) — shared first, then your local work replayed on top.\n"
+            "• Integrate shared (merge) — coming — keep both histories (not available yet)."
+        )
+        self._conflict_options_help.setWordWrap(True)
+        self._conflict_options_help.setAlignment(qt.Qt.AlignLeft | qt.Qt.AlignTop)
+        self._conflict_options_help.setStyleSheet(
+            "font-size: 11px; font-weight: 500; border: none;"
+            " background: transparent; color: %s; padding: 2px 4px;"
+            % (TEXT_SECONDARY or "#b8bcc4")
+        )
+        self._conflict_options_help.hide()
+        conflicts_layout.addWidget(self._conflict_options_help)
+        layout.addWidget(self._conflicts_box)
+
+        self._result_panel = qt.QWidget()
+        result_layout = qt.QVBoxLayout(self._result_panel)
+        result_layout.setContentsMargins(0, 0, 0, 0)
+        result_layout.setSpacing(4)
+        result_title = qt.QLabel("Result (preview)")
+        result_title.setAlignment(qt.Qt.AlignHCenter)
+        result_title.setStyleSheet(
+            "font-size: 15px; font-weight: 800; padding: 6px 0 2px 0;"
+        )
+        result_layout.addWidget(result_title)
+        self._result_canvas = graph_module.VersionHistoryCanvas(
+            logic,
+            version_specs=[],
+            graph_title="Result",
+            graph_description="",
+            read_only=True,
+            minimum_height=200,
+            fit_tight=True,
+        )
+        result_layout.addWidget(self._result_canvas, 1)
+        # Same stretch as the Local | Shared row so graph 3 matches their size.
+        layout.addWidget(self._result_panel, 5)
+
+        bottom = qt.QHBoxLayout()
+        bottom.addStretch(1)
+        self._validate_btn = qt.QPushButton("Validate")
+        self._validate_btn.setStyleSheet(BTN_CREATE)
+        self._validate_btn.setEnabled(False)
+        self._validate_btn.setToolTip("Apply the selected choice to this computer.")
+        self._validate_btn.connect("clicked()", self._onValidate)
+        close_btn = qt.QPushButton("Close")
+        close_btn.setStyleSheet(BTN_SECONDARY)
+        close_btn.connect("clicked()", self.reject)
+        bottom.addWidget(self._validate_btn)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+        self._setupInitialState()
+
+    def _clampDialogToScreen(self) -> None:
+        """Keep the dialog inside the available screen after Result preview appears."""
+        try:
+            screen = None
+            if hasattr(self, "screen"):
+                screen = self.screen()
+            if screen is None:
+                screen = qt.QApplication.primaryScreen()
+            geo = screen.availableGeometry() if screen is not None else None
+            if geo is None or geo.width() <= 0 or geo.height() <= 0:
+                return
+            self.setMaximumSize(geo.width(), geo.height())
+            frame = self.frameGeometry() if hasattr(self, "frameGeometry") else self.geometry()
+            width = min(max(int(self.width()), 640), int(geo.width()))
+            height = min(max(int(self.height()), 480), int(geo.height()))
+            if self.width() != width or self.height() != height:
+                self.resize(width, height)
+            x = int(frame.x()) if frame is not None else int(self.x())
+            y = int(frame.y()) if frame is not None else int(self.y())
+            x = max(int(geo.left()), min(x, int(geo.right()) - width + 1))
+            y = max(int(geo.top()), min(y, int(geo.bottom()) - height + 1))
+            self.move(x, y)
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            pass
+
+    def _fitCompareGraphs(self) -> None:
+        """Scale local / shared / result graphs once to fill the current window."""
+        self._clampDialogToScreen()
+        for canvas in (
+            getattr(self, "_local_canvas", None),
+            getattr(self, "_remote_canvas", None),
+            getattr(self, "_result_canvas", None),
+        ):
+            if canvas is None:
+                continue
+            try:
+                canvas.reset_view()
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+
+    def showEvent(self, event) -> None:
+        qt.QDialog.showEvent(self, event)
+        # Single fit after the dialog is laid out — no resize loop.
+        qt.QTimer.singleShot(0, self._fitCompareGraphs)
+
+    def _choiceButtonStyle(self, selected: bool) -> str:
+        if not selected:
+            return BTN_SECONDARY
+        accent = ACCENT_ICE or "#5b9fd4"
+        return (
+            "QPushButton {"
+            " background-color: palette(midlight); color: %s;"
+            " border: 2px solid %s; font-weight: 700;"
+            " border-radius: 4px; padding: 6px 10px;"
+            "}"
+            % (accent, accent)
+        )
+
+    def _refreshChoiceStyles(self) -> None:
+        self._update_choice_btn.setStyleSheet(
+            self._choiceButtonStyle(self._pending == self.ACTION_UPDATE)
+        )
+        self._keep_btn.setStyleSheet(
+            self._choiceButtonStyle(self._pending == self.ACTION_KEEP)
+        )
+        self._reset_btn.setStyleSheet(
+            self._choiceButtonStyle(self._pending == self.ACTION_RESET)
+        )
+        self._linear_btn.setStyleSheet(
+            self._choiceButtonStyle(self._pending == self.ACTION_LINEAR)
+        )
+        self._merge_btn.setStyleSheet(
+            self._choiceButtonStyle(self._pending == self.ACTION_MERGE)
+        )
+
+    def _hideAllChoiceButtons(self) -> None:
+        self._update_choice_btn.hide()
+        self._keep_btn.hide()
+        self._reset_btn.hide()
+        self._linear_btn.hide()
+        self._merge_btn.hide()
+        help_lbl = getattr(self, "_conflict_options_help", None)
+        if help_lbl is not None:
+            help_lbl.hide()
+
+    def _setConflictsMessage(self, text: str) -> None:
+        body = getattr(self, "_conflicts_body", None)
+        if body is not None:
+            body.setText(str(text or "").strip())
+
+    def _setupInitialState(self) -> None:
+        if self._conflict:
+            self._setConflictsMessage(
+                "Your local project and the shared project have diverged on the same branch.\n"
+                "Choose how to integrate the shared versions, then Validate."
+            )
+            self._update_choice_btn.hide()
+            self._keep_btn.hide()
+            self._reset_btn.show()
+            self._linear_btn.show()
+            self._merge_btn.show()
+            self._conflict_options_help.show()
+            self._result_panel.hide()
+            self._validate_btn.setEnabled(False)
+            return
+
+        self._hideAllChoiceButtons()
+        if self._aligned:
+            self._setConflictsMessage(
+                "No conflicts — local and shared look aligned. You can close this window."
+            )
+            self._result_panel.hide()
+            self._validate_btn.setEnabled(False)
+            return
+        if self._has_remote and not self._has_local:
+            self._setConflictsMessage(
+                "No conflicts — the shared project has newer versions. "
+                "Preview below shows the result after integrating them into your local folder. "
+                "Click Validate to apply."
+            )
+            self._selectChoice(self.ACTION_UPDATE, silent=True)
+            return
+        if self._has_local and not self._has_remote:
+            self._setConflictsMessage(
+                "No conflicts — you have local versions not on the shared project yet. "
+                "Share when you are ready. Preview below keeps your local graph "
+                "(Version tree stays unchanged until you Validate an update)."
+            )
+            self._selectChoice(self.ACTION_KEEP, silent=True)
+            return
+        if self._has_local and self._has_remote:
+            self._setConflictsMessage(
+                "No conflict on main — but each side has versions the other does not "
+                "(for example a shared review branch, and/or local unshared work).\n"
+                "Choose Update version tree (see shared changes in the tree) or Keep mine, then Validate."
+            )
+            self._update_choice_btn.show()
+            self._keep_btn.show()
+            self._reset_btn.hide()
+            self._linear_btn.hide()
+            self._merge_btn.hide()
+            self._result_panel.hide()
+            self._validate_btn.setEnabled(False)
+            return
+        self._setConflictsMessage("No conflicts to resolve. Review the graphs, then close.")
+        self._result_panel.hide()
+        self._validate_btn.setEnabled(False)
+
+    def _modelForChoice(self, choice: str) -> tuple:
+        """Return (model, highlight_dict, title, description) for the result preview."""
+        local_model = self._compare.get("local") or {}
+        remote_model = self._compare.get("remote") or {}
+        linear_model = self._compare.get("linear") or remote_model
+
+        if choice == self.ACTION_KEEP:
+            return (
+                local_model,
+                {},
+                "Result — Keep mine",
+                "Local tip stays; shared tip is not applied",
+            )
+        if choice == self.ACTION_RESET:
+            return (
+                remote_model,
+                {},
+                "Result — Reset to shared",
+                "This computer matches the shared tip; local divergent tip is dropped",
+            )
+        if choice == self.ACTION_UPDATE:
+            return (
+                remote_model,
+                {},
+                "Result — Update from shared",
+                "This computer follows the shared main tip",
+            )
+        if choice == self.ACTION_LINEAR:
+            return (
+                linear_model,
+                {},
+                "Result — Integrate shared (linear)",
+                "Shared versions first, then your local work on top",
+            )
+        return (
+            {},
+            {},
+            "Result — Integrate shared (merge)",
+            "Coming soon",
+        )
+
+    def _selectChoice(self, choice: str, silent: bool = False) -> None:
+        self._pending = choice
+        self._refreshChoiceStyles()
+        if choice == self.ACTION_MERGE:
+            self._result_panel.hide()
+            self._validate_btn.setEnabled(False)
+            self._validate_btn.setToolTip(
+                "Merge integrate is not available yet — choose Reset to shared or Integrate shared (linear)."
+            )
+            if not silent:
+                self._setConflictsMessage(
+                    "Integrate shared (merge) is coming soon.\n"
+                    "Choose Reset to shared or Integrate shared (linear), then Validate."
+                )
+            return
+
+        model, highlight, title, description = self._modelForChoice(choice)
+        gm = self._graph_module
+        self._result_canvas.set_compare_content(
+            version_specs=list(model.get("version_specs") or []),
+            graph_title=title,
+            graph_description=description,
+            active_version_id=model.get("head_id"),
+            commit_history_by_id=gm.commit_history_lookup(
+                model.get("commit_history") or []
+            ),
+            highlight_ids=highlight,
+            conflict_ids=set(),
+        )
+        self._result_panel.show()
+        qt.QTimer.singleShot(0, self._fitCompareGraphs)
+        self._validate_btn.setEnabled(True)
+        self._validate_btn.setToolTip("Apply this choice to this computer.")
+        if not silent:
+            labels = {
+                self.ACTION_KEEP: "Keep mine",
+                self.ACTION_RESET: "Reset to shared",
+                self.ACTION_LINEAR: "Integrate shared (linear)",
+                self.ACTION_UPDATE: "Update version tree",
+            }
+            self._setConflictsMessage(
+                "Preview: %s.\nClick Validate to apply, or pick another option."
+                % labels.get(choice, choice)
+            )
+
+    def _onValidate(self) -> None:
+        if self._pending in (
+            self.ACTION_UPDATE,
+            self.ACTION_KEEP,
+            self.ACTION_RESET,
+            self.ACTION_LINEAR,
+        ):
+            self.action = self._pending
+            self.accept()
+
+
+class _CompareGraphLogic(object):
+    """No-op logic so compare canvases stay read-only."""
+
+    def onVersionCheckedOut(self, node_id) -> None:
+        return
+
+    def reviewActionsForVersion(self, spec, history) -> dict:
+        return {}
 
 
 class NotificationDetailDialog(qt.QDialog):
@@ -466,7 +1089,7 @@ class NotificationDetailDialog(qt.QDialog):
             title = "Invitation"
             body = "You were invited to %s." % (item.get("full_name") or "a project")
         else:
-            title = "Update"
+            title = _notification_detail_title(item)
             body = _notification_text(item.get("text") or "Project update", 120)
         head = qt.QLabel(title)
         head.setStyleSheet("font-weight: 600; font-size: 13px;")
@@ -481,15 +1104,9 @@ class NotificationDetailDialog(qt.QDialog):
             pass
         layout.addWidget(body_label)
 
-        meta_bits = []
-        project = str(item.get("full_name") or "").strip()
         when = str(item.get("when") or item.get("at_label") or "").strip()
-        if project:
-            meta_bits.append(project)
         if when:
-            meta_bits.append(when)
-        if meta_bits:
-            meta = qt.QLabel(" · ".join(meta_bits))
+            meta = qt.QLabel(when)
             meta.setWordWrap(True)
             meta.setStyleSheet(DIALOG_HINT_STYLE)
             layout.addWidget(meta)
@@ -1324,6 +1941,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._rightDock = None
         self._rightDockContainer = None
         self._server_pulled = False
+        self._pending_versions_behind_hint = False
         self._ontology_document = None
         self._ontology_preset_ids = [preset_id for preset_id, _label in preset_choices()]
         self._connected = False
@@ -1482,6 +2100,24 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (AttributeError, TypeError, RuntimeError):
             pass
         self.notificationsBadge.hide()
+        self.notificationsBehindBadge = qt.QLabel(self.notificationsBell)
+        self.notificationsBehindBadge.setAlignment(qt.Qt.AlignCenter)
+        self.notificationsBehindBadge.setFixedSize(16, 16)
+        self.notificationsBehindBadge.move(20, 16)
+        self.notificationsBehindBadge.setText("⚠")
+        self.notificationsBehindBadge.setToolTip(
+            "Local project is not aligned with the remote copy"
+        )
+        self.notificationsBehindBadge.setStyleSheet(
+            "QLabel { background: transparent; color: #f59e0b; font-size: 13px; border: none; }"
+        )
+        try:
+            self.notificationsBehindBadge.setAttribute(
+                qt.Qt.WA_TransparentForMouseEvents, True
+            )
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+        self.notificationsBehindBadge.hide()
         connectButtonsLayout.addWidget(self.connectButton, 1)
         connectButtonsLayout.addWidget(self.notificationsBell, 0)
         self.connectionStatusLabel = qt.QLabel("Not connected")
@@ -2266,7 +2902,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateTaskButtonUi()
 
     def _setMessagesComposerEnabled(self, enabled: bool) -> None:
-        can_write = bool(enabled and self._connected and self._hasSelectedProject())
+        can_write = bool(enabled and self._connected and self._projectDataIsLoaded())
         for name in ("messagesInput", "messagesSend"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -4325,6 +4961,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     self._appendFeed(text)
         self._notification_activity = items
         self._rebuildNotificationsDisplay()
+        if getattr(self, "_pending_versions_behind_hint", False):
+            self._pending_versions_behind_hint = False
+            if self._projectVersionsBehind():
+                slicer.util.infoDisplay(
+                    "Your local project is not aligned with the remote copy.\n\n"
+                    "Open Notifications → Compare with shared to review differences "
+                    "before updating.",
+                    windowTitle="Local project",
+                )
 
     def _clearNotificationsDisplay(self) -> None:
         self._notifications = []
@@ -4377,6 +5022,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         full_name: str,
         activity_at: str = "",
         messages_at: str = "",
+        versions_at: str = "",
         activity_ids=None,
     ) -> None:
         project = str(full_name or "").strip()
@@ -4389,10 +5035,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         entry = dict(by_project.get(project) or {})
         activity_stamp = str(activity_at or "").strip()
         messages_stamp = str(messages_at or "").strip()
+        versions_stamp = str(versions_at or "").strip()
         if activity_stamp and activity_stamp > str(entry.get("activity_at") or ""):
             entry["activity_at"] = activity_stamp
         if messages_stamp and messages_stamp > str(entry.get("messages_at") or ""):
             entry["messages_at"] = messages_stamp
+        if versions_stamp and versions_stamp > str(entry.get("versions_at") or ""):
+            entry["versions_at"] = versions_stamp
         ids = list(entry.get("activity_ids") or []) if isinstance(entry.get("activity_ids"), list) else []
         seen = set(ids)
         for aid in activity_ids or []:
@@ -4413,6 +5062,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         full_name: str,
         activity_at: str = "",
         messages_at: str = "",
+        versions_at: str = "",
         activity_ids=None,
     ) -> None:
         # Update local cursor immediately; push to GitHub async (same path as chat).
@@ -4420,12 +5070,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             full_name,
             activity_at=activity_at,
             messages_at=messages_at,
+            versions_at=versions_at,
             activity_ids=activity_ids,
         )
         self._enqueueReadCursor(
             full_name,
             activity_at=activity_at,
             messages_at=messages_at,
+            versions_at=versions_at,
             activity_ids=activity_ids,
         )
 
@@ -4434,13 +5086,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         full_name: str,
         activity_at: str = "",
         messages_at: str = "",
+        versions_at: str = "",
         activity_ids=None,
     ) -> None:
         project = str(full_name or "").strip()
         activity_stamp = str(activity_at or "").strip()
         messages_stamp = str(messages_at or "").strip()
+        versions_stamp = str(versions_at or "").strip()
         ids = [str(aid).strip() for aid in (activity_ids or []) if str(aid).strip()]
-        if not project or (not activity_stamp and not messages_stamp and not ids):
+        if not project or (
+            not activity_stamp and not messages_stamp and not versions_stamp and not ids
+        ):
             return
 
         def _bump_payload(payload: dict) -> None:
@@ -4448,6 +5104,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 payload["activity_at"] = activity_stamp
             if messages_stamp and messages_stamp > str(payload.get("messages_at") or ""):
                 payload["messages_at"] = messages_stamp
+            if versions_stamp and versions_stamp > str(payload.get("versions_at") or ""):
+                payload["versions_at"] = versions_stamp
             existing = list(payload.get("activity_ids") or [])
             seen = set(existing)
             for aid in ids:
@@ -4480,12 +5138,67 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "activity_at": activity_stamp,
             "messages_at": messages_stamp,
+            "versions_at": versions_stamp,
             "activity_ids": list(ids),
         }
         queue.append(payload)
         self._messageSendQueue = queue
         if not getattr(self, "_sending_message", False):
             self._startNextQueuedSend()
+
+    def _versionsSyncCursor(self, full_name: str = "") -> str:
+        project = str(full_name or "").strip() or (
+            self._currentProjectName() if self._hasSelectedProject() else ""
+        )
+        return str(self._projectReadEntry(project).get("versions_at") or "")
+
+    def _isVersionsSyncRelevant(self, item: dict) -> bool:
+        if str((item or {}).get("kind") or "") != "activity":
+            return False
+        return str((item or {}).get("activity_kind") or "").strip().lower() in (
+            _VERSIONS_SYNC_ACTIVITY_KINDS
+        )
+
+    def _isNotificationLaggingVersions(self, item: dict) -> bool:
+        if not self._isVersionsSyncRelevant(item):
+            return False
+        stamp = str((item or {}).get("at") or "").strip()
+        if not stamp:
+            return False
+        cursor = self._versionsSyncCursor((item or {}).get("full_name") or "")
+        return (not cursor) or stamp > cursor
+
+    def _laggingVersionNotificationKeys(self) -> set:
+        lagging = set()
+        for item in getattr(self, "_notifications", []) or []:
+            if not self._isNotificationLaggingVersions(item):
+                continue
+            key = self._notificationKey(item)
+            if key:
+                lagging.add(key)
+        return lagging
+
+    def _projectVersionsBehind(self) -> bool:
+        return bool(self._laggingVersionNotificationKeys())
+
+    def _newestVersionsSyncStamp(self) -> str:
+        newest = ""
+        for item in getattr(self, "_notification_activity", []) or []:
+            if not self._isVersionsSyncRelevant(item):
+                continue
+            stamp = str(item.get("at") or "").strip()
+            if stamp > newest:
+                newest = stamp
+        if newest:
+            return newest
+        for event in getattr(self, "_project_activity", []) or []:
+            kind = str((event or {}).get("kind") or "").strip().lower()
+            if kind not in _VERSIONS_SYNC_ACTIVITY_KINDS:
+                continue
+            stamp = str((event or {}).get("at") or "").strip()
+            if stamp > newest:
+                newest = stamp
+        return newest
 
     def _markNotificationRead(self, item: dict) -> None:
         kind = str((item or {}).get("kind") or "")
@@ -4548,23 +5261,34 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _updateNotificationsBadge(self) -> None:
         badge = getattr(self, "notificationsBadge", None)
+        behind_badge = getattr(self, "notificationsBehindBadge", None)
         bell = getattr(self, "notificationsBell", None)
         count = self._unreadNotificationCount()
-        if badge is None:
-            return
-        if count <= 0:
-            badge.hide()
-            if bell is not None:
-                bell.setToolTip("Notifications")
-            return
-        badge.setText("9+" if count > 9 else str(count))
-        badge.show()
-        badge.raise_()
-        if bell is not None:
-            if count == 1:
-                bell.setToolTip("1 notification")
+        behind = bool(
+            self._projectDataIsLoaded() and self._projectVersionsBehind()
+        )
+        if badge is not None:
+            if count <= 0:
+                badge.hide()
             else:
-                bell.setToolTip("%d notifications" % count)
+                badge.setText("9+" if count > 9 else str(count))
+                badge.show()
+                badge.raise_()
+        if behind_badge is not None:
+            if behind:
+                behind_badge.show()
+                behind_badge.raise_()
+            else:
+                behind_badge.hide()
+        if bell is not None:
+            tips = []
+            if count == 1:
+                tips.append("1 notification")
+            elif count > 1:
+                tips.append("%d notifications" % count)
+            if behind:
+                tips.append("Local project is not aligned with the remote copy")
+            bell.setToolTip(" · ".join(tips) if tips else "Notifications")
 
     def _setNotificationsEnabled(self, enabled: bool) -> None:
         bell = getattr(self, "notificationsBell", None)
@@ -4614,8 +5338,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateMessagesBadge()
         self._updateTaskButtonUi()
 
+    def _messagesProjectActive(self) -> str:
+        """Only after Open: Messages / project activity / versions sync are for the loaded copy."""
+        if not self._connected or not self._projectDataIsLoaded():
+            return ""
+        return self._currentProjectName()
+
     def _syncMessagesPolling(self) -> None:
-        name = self._currentProjectName() if self._connected and self._hasSelectedProject() else ""
+        name = self._messagesProjectActive()
         changed = name != getattr(self, "_messages_project", "")
         if changed:
             self._resetMessagesState(name)
@@ -4800,6 +5530,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     str(previous.get("messages_at") or ""),
                     str(my_reads.get("messages_at") or ""),
                 ),
+                "versions_at": max(
+                    str(previous.get("versions_at") or ""),
+                    str(my_reads.get("versions_at") or ""),
+                ),
             }
             if ids:
                 merged["activity_ids"] = ids[-200:]
@@ -4878,8 +5612,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _messagesEmptyText(self) -> str:
         if not self._connected:
             return "Connect with GitHub to use messages."
-        if not self._hasSelectedProject():
-            return "Select a project to use messages."
+        if not self._projectDataIsLoaded():
+            return "Select a project and open it to access messages."
         return "No messages yet."
 
     def _formatMessageTime(self, stamp: str) -> str:
@@ -5193,15 +5927,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 entry = dict(merged_reads.get(me) or {})
                 activity_stamp = str(current.get("activity_at") or "").strip()
                 messages_stamp = str(current.get("messages_at") or "").strip()
+                versions_stamp = str(current.get("versions_at") or "").strip()
                 local = (getattr(self, "_reads_by_project", {}) or {}).get(project) or {}
                 if str(local.get("activity_at") or "") > activity_stamp:
                     activity_stamp = str(local.get("activity_at") or "")
                 if str(local.get("messages_at") or "") > messages_stamp:
                     messages_stamp = str(local.get("messages_at") or "")
+                if str(local.get("versions_at") or "") > versions_stamp:
+                    versions_stamp = str(local.get("versions_at") or "")
                 if activity_stamp and activity_stamp > str(entry.get("activity_at") or ""):
                     entry["activity_at"] = activity_stamp
                 if messages_stamp and messages_stamp > str(entry.get("messages_at") or ""):
                     entry["messages_at"] = messages_stamp
+                if versions_stamp and versions_stamp > str(entry.get("versions_at") or ""):
+                    entry["versions_at"] = versions_stamp
                 ids = []
                 seen_ids = set()
                 for source in (
@@ -5397,15 +6136,28 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messageSendPhase = ""
         self._startNextQueuedSend()
 
-    def _recordActivity(self, full_name: str, kind: str, text: str) -> None:
+    def _recordActivity(
+        self,
+        full_name: str,
+        kind: str = "",
+        text: str = "",
+        event: dict | None = None,
+    ) -> None:
         name = str(full_name or "").strip()
         if not name:
             return
         try:
-            publish_project_activity(name, kind, text)
+            publish_project_activity(name, kind, text, event=event)
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             # Activity is secondary: never block Share / People / Join / review.
             return
+
+    def _buildActivityEvent(self, kind: str, text: str):
+        """Freeze activity id/timestamp now (before any slow UI or network)."""
+        try:
+            return build_project_activity(self._githubLogin() or "Someone", kind, text)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            return None
 
     def _canAssignTask(self) -> bool:
         if not self._connected or not self._hasSelectedProject():
@@ -5655,17 +6407,37 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             row = dict(item)
             row["_key"] = self._notificationKey(item)
             items.append(row)
+        project_open = bool(
+            self._hasSelectedProject()
+            and (getattr(self, "_local_project_path", None) or "")
+            and getattr(self, "_server_pulled", False)
+        )
+        behind = bool(project_open and self._projectVersionsBehind())
+        if project_open and behind:
+            sync_status = "⚠  Local project is not aligned with the remote copy."
+        elif project_open:
+            sync_status = "✅  Local project is aligned with the shared project."
+        else:
+            sync_status = ""
         dialog = NotificationsDialog(
             slicer.util.mainWindow(),
             items=items,
             empty_text=self._notificationsEmptyText(),
             unread_keys=self._unreadNotificationKeys(),
+            lagging_keys=self._laggingVersionNotificationKeys() if project_open else set(),
+            sync_status_text=sync_status,
+            show_sync_button=bool(project_open and behind),
         )
         self._notifications_popup_open = True
         try:
             result = dialog.exec_()
         finally:
             self._notifications_popup_open = False
+        if getattr(dialog, "compare_requested", False) or getattr(
+            dialog, "sync_requested", False
+        ):
+            self._openCompareWithShared()
+            return
         if getattr(dialog, "mark_all", False):
             self._markAllNotificationsRead()
             return
@@ -5674,6 +6446,201 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self._markNotificationRead(chosen)
         self._openNotificationDetail(chosen)
+
+    def _openCompareWithShared(self) -> None:
+        """Fetch for compare only — does not refresh the Version tree until Validate."""
+        if not self._hasSelectedProject():
+            self._appendFeed("Select a project first.", error=True)
+            return
+        local_path = getattr(self, "_local_project_path", None) or ""
+        if not local_path or not getattr(self, "_server_pulled", False):
+            self._appendFeed("Open the project first.", error=True)
+            return
+        # Freeze Version tree UI *and* use that exact state as Compare → Local.
+        saved_bundle = copy.deepcopy(getattr(self, "_project_history_bundle", None))
+        saved_version_id = getattr(self, "_currentVersionId", None)
+        saved_unshared = bool(getattr(self, "_unshared_version", False))
+        local_snapshot = saved_bundle
+        peek_caps = None
+        self._openProgress("Compare with shared", "Reading the shared project…")
+        try:
+            if not local_snapshot or not (
+                local_snapshot.get("version_specs") or local_snapshot.get("sha_by_id")
+            ):
+                self._updateProgress("Snapshotting local versions…")
+                local_snapshot = read_project_history(local_path)
+            # Lock Version-tree remote tips to what is already displayed *before* peek-fetch,
+            # so a later Open does not absorb Compare-only origin updates.
+            peek_caps = derive_remote_sync_caps_from_history(local_path, local_snapshot)
+            save_remote_sync_caps(local_path, peek_caps)
+            self._updateProgress("Reading the shared project…")
+            fetch_remote_updates(local_path)
+            self._updateProgress("Building version graphs…")
+            # Local = frozen Version tree; Remote = origin/* after fetch; diff = SHA Δ.
+            compare = read_compare_project_histories(
+                local_path, local_history=local_snapshot
+            )
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        self._closeProgress()
+        # Re-assert frozen UI (fetch must never rewrite the Version tree panel).
+        self._project_history_bundle = saved_bundle
+        self._currentVersionId = saved_version_id
+        self._unshared_version = saved_unshared
+        self._updateCommitHistoryPanel()
+        self._updateVersionActionButtons()
+
+        dialog = CompareWithSharedDialog(slicer.util.mainWindow(), compare)
+        accepted = dialog.exec_() == qt.QDialog.Accepted
+        action = str(getattr(dialog, "action", "") or "") if accepted else ""
+        if action == CompareWithSharedDialog.ACTION_UPDATE:
+            self._applySharedVersionsUpdate(local_path, fetched=True)
+            return
+        if action == CompareWithSharedDialog.ACTION_RESET:
+            self._resetToSharedVersions(local_path)
+            return
+        if action == CompareWithSharedDialog.ACTION_LINEAR:
+            self._integrateSharedLinear(local_path)
+            return
+        # Cancel / Keep / Merge-coming: keep frozen tree + keep peek caps (no new remote tips in UI).
+        if peek_caps is not None:
+            save_remote_sync_caps(local_path, peek_caps)
+        self._project_history_bundle = saved_bundle
+        self._currentVersionId = saved_version_id
+        self._unshared_version = saved_unshared
+        self._updateCommitHistoryPanel()
+        self._updateVersionActionButtons()
+        self._updateNotificationsBadge()
+        if action == CompareWithSharedDialog.ACTION_KEEP:
+            self._appendFeed(
+                "Kept your local versions. Version tree unchanged until you update."
+            )
+
+    def _applySharedVersionsUpdate(self, local_path: str, fetched: bool = False) -> None:
+        """Rebuild the version tree from origin refs; does not change open assets."""
+        project = self._currentProjectName()
+        self._openProgress("Update from shared", "Updating version history…")
+        try:
+            if not fetched:
+                self._updateProgress("Reading the shared project…")
+                fetch_remote_updates(local_path)
+            # Acknowledge current origin tips so Open/Version tree may show them.
+            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
+            self._updateProgress("Updating version history…")
+            history = read_project_history(local_path)
+            self._applyProjectHistoryBundle(history, follow_head=False)
+            stamp = self._newestVersionsSyncStamp() or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            if project and stamp:
+                self._persistReadCursor(project, versions_at=stamp)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        self._closeProgress()
+        unshared = self._historyHasUnsharedVersion(history)
+        self._unshared_version = unshared
+        self._updateCommitHistoryPanel()
+        self._updateVersionActionButtons()
+        self._updateNotificationsBadge()
+        self._appendFeed("Updated the version tree from the shared project.")
+
+    def _resetToSharedVersions(self, local_path: str) -> None:
+        """Adopt origin/main as local main (worktree moves to shared tip)."""
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Reset to shared")
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setText(
+            "Reset this computer to the shared project tip?\n\n"
+            "Your divergent local versions will leave the main line. "
+            "Open assets will follow the shared tip."
+        )
+        box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
+        box.button(qt.QMessageBox.Ok).setText("Reset to shared")
+        box.setDefaultButton(qt.QMessageBox.Cancel)
+        if box.exec_() != qt.QMessageBox.Ok:
+            return
+        project = self._currentProjectName()
+        self._openProgress("Reset to shared", "Moving to the shared tip…")
+        try:
+            self._updateProgress("Moving to the shared tip…")
+            adopt_shared_main(local_path)
+            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
+            self._updateProgress("Updating version history…")
+            history = read_project_history(local_path)
+            version_id = self._applyProjectHistoryBundle(history, follow_head=True)
+            stamp = self._newestVersionsSyncStamp() or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            if project and stamp:
+                self._persistReadCursor(project, versions_at=stamp)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        self._closeProgress()
+        unshared = self._historyHasUnsharedVersion(history)
+        self._unshared_version = unshared
+        self._updateCommitHistoryPanel()
+        self._updateVersionActionButtons()
+        self._updateNotificationsBadge()
+        if version_id:
+            self._appendFeed("Reset to the shared tip (%s)." % version_id)
+        else:
+            self._appendFeed("Reset to the shared tip.")
+
+    def _integrateSharedLinear(self, local_path: str) -> None:
+        """Rebase local-only main commits onto origin/main."""
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Integrate shared (linear)")
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setText(
+            "Integrate the shared tip in a linear history?\n\n"
+            "Shared versions come first; your local work is replayed on top. "
+            "Open assets will follow the new tip."
+        )
+        box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
+        box.button(qt.QMessageBox.Ok).setText("Integrate (linear)")
+        box.setDefaultButton(qt.QMessageBox.Cancel)
+        if box.exec_() != qt.QMessageBox.Ok:
+            return
+        project = self._currentProjectName()
+        self._openProgress("Integrate shared (linear)", "Replaying local work on shared…")
+        try:
+            self._updateProgress("Replaying local work on shared…")
+            integrate_shared_linear(local_path)
+            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
+            self._updateProgress("Updating version history…")
+            history = read_project_history(local_path)
+            version_id = self._applyProjectHistoryBundle(history, follow_head=True)
+            stamp = self._newestVersionsSyncStamp() or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            if project and stamp:
+                self._persistReadCursor(project, versions_at=stamp)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        self._closeProgress()
+        unshared = self._historyHasUnsharedVersion(history)
+        self._unshared_version = unshared
+        self._updateCommitHistoryPanel()
+        self._updateVersionActionButtons()
+        self._updateNotificationsBadge()
+        if version_id:
+            self._appendFeed(
+                "Integrated shared (linear). New tip: %s." % version_id
+            )
+        else:
+            self._appendFeed("Integrated shared (linear).")
+
+    def _getLatestSharedVersions(self) -> None:
+        """Compatibility: open compare flow (preferred) instead of silent fetch-only."""
+        self._openCompareWithShared()
 
     def _openNotificationDetail(self, item: dict) -> None:
         detail = NotificationDetailDialog(slicer.util.mainWindow(), item)
@@ -5748,8 +6715,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             return None
 
+    def _isOwnReviewLane(self, lane: str) -> bool:
+        me = (self._githubLogin() or "").strip()
+        mine = review_lane_slug(me)
+        key = str(lane or "").strip().lower()
+        return bool(me and mine and key and key == mine.lower() and key != "main")
+
     def _reviewActionsForVersion(self, spec, history) -> dict:
-        role = self._taskRoleForLane(str((spec or {}).get("branch") or ""))
+        lane = str((spec or {}).get("branch") or "")
+        # Owner / senior: merge their own shared line onto main (no task required).
+        if self._canAssignTask() and self._isOwnReviewLane(lane):
+            return {"merge": True}
+        role = self._taskRoleForLane(lane)
         if not role:
             return {}
         kind, task = role
@@ -5774,6 +6751,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def onVersionReviewAction(self, action: str, spec) -> None:
         lane = str((spec or {}).get("branch") or "")
         role = self._taskRoleForLane(lane)
+        if action == "merge":
+            if not self._canAssignTask() or not self._isOwnReviewLane(lane):
+                self._appendFeed("You can merge only your own line.", error=True)
+                return
+            self._mergeOwnReviewLine()
+            return
         if action == "submit":
             if not role or role[0] != "submit":
                 self._appendFeed("You can submit only your own line.", error=True)
@@ -5812,6 +6795,32 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 return
             self._declineReviewedShareRequest(request)
         self._updateActiveVersionIndicators()
+
+    def _mergeOwnReviewLine(self) -> None:
+        """Senior/owner: put their own shared line onto main (same merge as Accept)."""
+        me = (self._githubLogin() or "").strip()
+        if not me or not self._canAssignTask():
+            self._appendFeed("Only a senior can merge their line onto main.", error=True)
+            return
+        confirmed = slicer.util.confirmYesNoDisplay(
+            "Merge your line onto main?",
+            windowTitle="Merge",
+        )
+        if not confirmed:
+            return
+        request = {
+            "full_name": self._currentProjectName(),
+            "branch": review_branch_for(me),
+            "number": None,
+            "author": me,
+        }
+        if self._acceptReviewedShareRequest(request):
+            self._recordActivity(
+                self._currentProjectName(),
+                "accept",
+                "%s merged their line onto main." % (me or "Someone"),
+            )
+            self._updateActiveVersionIndicators()
 
     def _submitOwnReviewLine(self) -> None:
         role = self._taskRoleForLane(review_lane_slug(self._githubLogin()))
@@ -5923,6 +6932,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._unshared_version = unshared
         self._updateVersionActionButtons()
         self._armLoadSettle()
+        if full_name:
+            self._persistReadCursor(
+                full_name,
+                versions_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            )
         self._appendFeed("Accepted the version from %s. It is now on the project." % author)
         self._runNotificationChecks(announce=False)
         return True
@@ -6233,17 +7247,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._refreshUiState()
         self._unshared_version = unshared
         self._updateVersionActionButtons()
-        me = self._githubLogin() or "Someone"
-        self._recordActivity(
-            self._currentProjectName(),
-            "share",
-            "%s shared versions on main." % me,
-        )
         self._appendFeed("Project shared on main.")
         if self._unsaved_changes:
             self._appendFeed(
                 "Unsaved changes are still on this computer. Save a version if you want them shared later."
             )
+        # Timestamp frozen at Share success; network publish after UI feedback.
+        me = self._githubLogin() or "Someone"
+        share_event = self._buildActivityEvent(
+            "share", "%s shared versions on main." % me
+        )
+        if share_event:
+            self._recordActivity(self._currentProjectName(), event=share_event)
 
     def _shareAsBranch(self, local_path: str) -> None:
         self._appendFeed("Sharing on a branch beside main…")
@@ -6268,16 +7283,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._unshared_version = unshared
         self._updateVersionActionButtons()
         me = self._githubLogin() or "Someone"
-        self._recordActivity(
-            self._currentProjectName(),
-            "share",
-            "%s shared versions on their line." % me,
+        # Freeze notif time at Share success (before popup / network publish).
+        share_event = self._buildActivityEvent(
+            "share", "%s shared versions on their line." % me
         )
         self._appendFeed("Shared on your line.")
         slicer.util.infoDisplay(
             self._shareLineNextStepMessage(),
             windowTitle="Share",
         )
+        if share_event:
+            self._recordActivity(self._currentProjectName(), event=share_event)
 
     def _activeTaskAsJunior(self):
         me = (self._githubLogin() or "").strip().lower()
@@ -6294,6 +7310,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return self._activeTaskAsJunior() is not None
 
     def _shareLineNextStepMessage(self) -> str:
+        if self._canAssignTask():
+            return (
+                "Shared on your line. If you want to put it on main, open your line "
+                "in the version tree and Merge."
+            )
         if self._hasActiveTaskAsJunior():
             return (
                 "Shared on your line. Next: open your line in the version tree → Submit."
@@ -6386,17 +7407,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed(reason, error=True)
             return
         full_name = self._currentProjectName()
-        choice = self._promptOpenUnsharedChoice(full_name)
-        if choice == "cancel":
-            self._appendFeed("Open cancelled.")
-            self._updateVersionActionButtons()
-            return
+        # Already cloned → open local only (no silent fetch). Remote updates go via
+        # notifications → Compare with shared. First time → clone.
+        try:
+            local_exists = bool(inspect_local_project(full_name).get("exists"))
+        except GitHubAuthError:
+            local_exists = False
+        choice = "local" if local_exists else "update"
         self.openButton.setEnabled(False)
         self._appendFeed("Opening project %s…" % full_name)
         if choice == "local":
             progress_label = "Opening this computer's work…"
-        elif choice == "replace":
-            progress_label = "Getting the shared project…"
         else:
             progress_label = "Opening %s…" % full_name
         self._openProgress("Open project", progress_label)
@@ -6431,16 +7452,23 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._suppress_asset_ui_updates -= 1
             self._suppress_dirty -= 1
         self._closeProgress()
+        # First Messages poll after Open may show behind — hint once in the feed.
+        self._pending_versions_behind_hint = True
         self._refreshUiState()
         self._clearChangeFlags()
         self._unshared_version = unshared
         self._updateVersionActionButtons()
         self._armLoadSettle()
+        # First clone fetched shared refs — mark versions sync current.
+        if choice != "local" and full_name:
+            self._persistReadCursor(
+                full_name,
+                versions_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            )
         self._appendFeed("Project opened: %s" % full_name)
-        if choice == "local":
-            self._appendFeed("Opened this computer's work — some versions are not shared yet.")
-        elif choice == "replace":
-            self._appendFeed("Opened the shared project. Unshared versions from this computer were discarded.")
+        self._appendFeed("Opened this computer's copy.")
+        if unshared:
+            self._appendFeed("Some versions on this computer are not shared yet.")
         if loaded.get("volume"):
             self._appendFeed("Volume loaded: %s" % loaded["volume"])
         if loaded.get("segmentation"):
@@ -6473,7 +7501,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         from_snapshot = volume_folder is not None
         files = manager.discover_project_files(folder)
         volume_path = files.get("volume")
-        if not volume_path and volume_folder:
+        # Same folder was already scanned — only look elsewhere if volume is missing there.
+        if (
+            not volume_path
+            and volume_folder
+            and os.path.normpath(volume_folder) != os.path.normpath(folder)
+        ):
             volume_path = manager.discover_project_files(volume_folder).get("volume")
         volume_node = self._reusableVolumeNode(volume_path)
         if volume_node is None and not volume_path:
@@ -6675,15 +7708,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 checkout_local_version(local_path, sha, lane)
                 # Load from the project folder (volume untouched; seg/ontology restored above).
                 # volume_folder=local_path keeps soft reload: reuse volume + inject seg, no temp copy.
+                # Ontology combo is set inside _loadOpenedProjectAssets — no second discover.
                 self._loadOpenedProjectAssets(local_path, volume_folder=local_path)
-                clone_files = DataManager().discover_project_files(local_path)
-                clone_ontologies = clone_files.get("ontologies") or []
-                if clone_ontologies:
-                    self._suppress_dirty += 1
-                    try:
-                        self._setOntologyComboLoadedFilename(filename=clone_ontologies[0])
-                    finally:
-                        self._suppress_dirty -= 1
                 self._syncAssetDataObservers()
                 self._clearDirtyAssets()
             except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:

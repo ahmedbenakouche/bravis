@@ -576,10 +576,10 @@ def git_branch_for_history_lane(lane: str) -> str:
 
 
 def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
-    """Point HEAD at this version and sync the full worktree (Switch / Open).
+    """Point HEAD at this version and sync the full worktree (Switch).
 
-    Uses one git reset --hard (full checkout). Git skips rewriting blobs that
-    are unchanged (e.g. a fixed volume). Faster to measure vs mixed+restore.
+    Uses one git reset --hard. Must always move to the target sha — even when
+    that commit is an ancestor of current HEAD (switching to an older version).
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -589,14 +589,6 @@ def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
     head = _git_rev_parse(repo_dir, "HEAD")
     current = _current_branch_name(repo_dir)
     if head == sha and current == branch:
-        return
-    # Already continuing past this version on the same line — keep HEAD.
-    if (
-        current == branch
-        and head
-        and head != sha
-        and _is_ancestor(repo_dir, sha, head)
-    ):
         return
     _checkout_branch_at(repo_dir, branch, sha)
 
@@ -1265,12 +1257,19 @@ def inspect_local_project(full_name: str) -> dict[str, Any]:
     }
 
 
-def _update_local_from_origin(repo_dir: str) -> None:
-    """Update main from GitHub even if this computer is on a review line with no tracking."""
+def fetch_remote_updates(repo_dir: str) -> None:
+    """Fetch remote refs into .git only. Does not change HEAD or the worktree."""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
     fetch = _run_git(["fetch", "origin"], cwd=repo_dir, timeout=180)
     if fetch.returncode != 0:
         detail = (fetch.stderr or fetch.stdout or "").strip()
-        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+        raise GitHubAuthError("Could not get the latest shared versions.\n%s" % detail[:400])
+
+
+def _update_local_from_origin(repo_dir: str) -> None:
+    """Update main from GitHub even if this computer is on a review line with no tracking."""
+    fetch_remote_updates(repo_dir)
     origin_main = _git_rev_parse(repo_dir, "origin/main")
     if not origin_main:
         raise GitHubAuthError("Could not update the local project.")
@@ -1349,9 +1348,19 @@ def _history_refs(repo_dir: str) -> list[str]:
     return refs
 
 
-def _review_tips(repo_dir: str) -> dict[str, list[str]]:
+def _review_tips(
+    repo_dir: str,
+    *,
+    local_only: bool = False,
+    remote_only: bool = False,
+) -> dict[str, list[str]]:
+    """Tips for cv-review lanes. Optionally restrict to local heads or origin remotes."""
     tips: dict[str, list[str]] = {}
     for ref in _history_refs(repo_dir):
+        if local_only and not ref.startswith("refs/heads/cv-review"):
+            continue
+        if remote_only and not ref.startswith("refs/remotes/origin/cv-review"):
+            continue
         login = _review_login_from_ref(ref)
         if not login:
             continue
@@ -1608,27 +1617,30 @@ def build_project_history_model(
     }
 
 
-def read_project_history(repo_dir: str) -> dict[str, Any]:
-    """Read saved versions, including review lines, as a DAG."""
-    empty = {
+def _empty_history_model() -> dict[str, Any]:
+    return {
         "commit_history": [],
         "version_specs": [],
         "tags_by_id": {},
         "sha_by_id": {},
         "head_id": None,
     }
+
+
+def _read_repo_commits(repo_dir: str) -> dict[str, dict[str, Any]]:
+    """Load commit metadata for history / compare views."""
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
-        return empty
+        return {}
     refs = _history_log_refs(repo_dir)
     if not refs:
-        return empty
+        return {}
     result = _run_git(
         ["log", "--parents", "--reverse", "--format=%H%x1f%P%x1f%cI%x1f%an%x1f%s", *refs],
         cwd=repo_dir,
         timeout=60,
     )
     if result.returncode != 0:
-        return empty
+        return {}
     commit_by_sha: dict[str, dict[str, Any]] = {}
     for line in (result.stdout or "").splitlines():
         if not line.strip():
@@ -1644,9 +1656,187 @@ def read_project_history(repo_dir: str) -> dict[str, Any]:
             "author": author,
             "message": message,
         }
-    main_tip = _git_rev_parse(repo_dir, "origin/main") or _git_rev_parse(repo_dir, "main")
+    return commit_by_sha
+
+
+_UI_SYNC_CAPS_FILE = ".cv_ui_sync_caps.json"
+
+
+def _ensure_ui_sync_caps_gitignored(repo_dir: str) -> None:
+    """Keep .cv_ui_sync_caps.json local — never Share/push it to GitHub."""
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return
+    gitignore = os.path.join(repo_dir, ".gitignore")
+    marker = _UI_SYNC_CAPS_FILE
+    try:
+        existing = ""
+        if os.path.isfile(gitignore):
+            with open(gitignore, encoding="utf-8") as handle:
+                existing = handle.read()
+        lines = existing.splitlines()
+        if any(line.strip() == marker for line in lines):
+            return
+        suffix = "" if (not existing or existing.endswith("\n")) else "\n"
+        with open(gitignore, "a", encoding="utf-8") as handle:
+            handle.write("%s# Collaborative Versioning — local UI only\n%s\n" % (suffix, marker))
+    except OSError:
+        return
+    # If it was staged earlier, unstage without deleting the file.
+    _run_git(["rm", "--cached", "-f", "--ignore-unmatch", marker], cwd=repo_dir, timeout=20)
+
+
+def capture_remote_sync_caps(repo_dir: str) -> dict[str, Any]:
+    """Snapshot origin/main + origin review tips (for Version-tree display caps)."""
+    origin = _git_rev_parse(repo_dir, "origin/main") or ""
+    review = {}
+    for login, tips in sorted(_review_tips(repo_dir, remote_only=True).items()):
+        tip = ""
+        for candidate in tips:
+            if candidate:
+                tip = candidate
+        if tip:
+            review[str(login).strip().lower()] = tip
+    return {"origin_main": origin, "review_tips": review}
+
+
+def save_remote_sync_caps(repo_dir: str, caps: dict[str, Any] | None) -> None:
+    """Persist which remote tips the Version tree is allowed to show until Update."""
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return
+    _ensure_ui_sync_caps_gitignored(repo_dir)
+    path = os.path.join(repo_dir, _UI_SYNC_CAPS_FILE)
+    payload = {
+        "origin_main": str((caps or {}).get("origin_main") or "").strip(),
+        "review_tips": dict((caps or {}).get("review_tips") or {}),
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except OSError:
+        pass
+
+
+def load_remote_sync_caps(repo_dir: str) -> dict[str, Any] | None:
+    if not repo_dir:
+        return None
+    path = os.path.join(repo_dir, _UI_SYNC_CAPS_FILE)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    tips = payload.get("review_tips")
+    if tips is not None and not isinstance(tips, dict):
+        tips = {}
+    return {
+        "origin_main": str(payload.get("origin_main") or "").strip(),
+        "review_tips": {
+            str(login).strip().lower(): str(sha).strip()
+            for login, sha in (tips or {}).items()
+            if str(login).strip() and str(sha).strip()
+        },
+    }
+
+
+def _cap_remote_tip(repo_dir: str, stored: str, current: str) -> str:
+    """If the user has not Validated Update, keep showing the last acknowledged tip."""
+    stored = str(stored or "").strip()
+    current = str(current or "").strip()
+    if not stored:
+        return current
+    if not current or stored == current:
+        return stored
+    # current ahead of stored → hide newer commits until Update
+    if _is_ancestor(repo_dir, stored, current):
+        return stored
+    return current
+
+
+def derive_remote_sync_caps_from_history(
+    repo_dir: str, history: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Build UI caps from versions already shown (Version tree / Compare Local snapshot).
+
+    Used before a Compare peek-fetch so Open does not suddenly show newer origin tips
+    that were only fetched for the compare dialog.
+    """
+    known = _history_shas(history)
+    commit_by_sha = _read_repo_commits(repo_dir)
+    origin = _git_rev_parse(repo_dir, "origin/main") or ""
+
+    def _newest_known_on_chain(tip: str) -> str:
+        if not tip:
+            return ""
+        for sha in _first_parent_chain(commit_by_sha, tip):
+            if sha in known:
+                return sha
+        return ""
+
+    origin_cap = _newest_known_on_chain(origin) or origin
+    review: dict[str, str] = {}
+    for login, tips in sorted(_review_tips(repo_dir, remote_only=True).items()):
+        current = ""
+        for candidate in tips:
+            if candidate:
+                current = candidate
+        capped = _newest_known_on_chain(current)
+        if capped:
+            review[str(login).strip().lower()] = capped
+        elif current and current in known:
+            review[str(login).strip().lower()] = current
+    return {"origin_main": origin_cap, "review_tips": review}
+
+
+def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[str, Any]:
+    """Read saved versions, including review lines, as a DAG.
+
+    When ``apply_ui_caps`` is True (default for the Version tree UI), remote tips
+    are capped to the last Validate Update / Take / explicit sync — so a Compare
+    peek-fetch alone does not rewrite the Version tree on the next Open.
+    """
+    empty = _empty_history_model()
+    commit_by_sha = _read_repo_commits(repo_dir)
+    if not commit_by_sha:
+        return empty
+    origin = _git_rev_parse(repo_dir, "origin/main")
+    local_main = _git_rev_parse(repo_dir, "main")
     head_sha = _git_rev_parse(repo_dir, "HEAD")
-    review_tips = _review_tips(repo_dir)
+    local_tips = _review_tips(repo_dir, local_only=True)
+    remote_tips = _review_tips(repo_dir, remote_only=True)
+    main_tip = origin or local_main
+
+    if apply_ui_caps:
+        caps = load_remote_sync_caps(repo_dir)
+        if caps:
+            main_tip = (
+                _cap_remote_tip(repo_dir, caps.get("origin_main") or "", origin or "")
+                or local_main
+            )
+            stored_review = caps.get("review_tips") or {}
+            capped_remote: dict[str, list[str]] = {}
+            for login, tips in remote_tips.items():
+                current = ""
+                for candidate in tips:
+                    if candidate:
+                        current = candidate
+                key = str(login).strip().lower()
+                use = _cap_remote_tip(repo_dir, stored_review.get(key) or "", current)
+                if use:
+                    capped_remote[login] = [use]
+            remote_tips = capped_remote
+
+    review_tips: dict[str, list[str]] = dict(remote_tips)
+    for login, tips in local_tips.items():
+        bucket = review_tips.setdefault(login, [])
+        for tip in tips:
+            if tip and tip not in bucket:
+                bucket.append(tip)
+
     unpushed = _unpushed_commit_shas(repo_dir)
     model = build_project_history_model(
         commit_by_sha,
@@ -1659,6 +1849,302 @@ def read_project_history(repo_dir: str) -> dict[str, Any]:
     if not model.get("version_specs"):
         return empty
     return model
+
+
+def _first_parent_merge_base(commit_by_sha: dict[str, dict], tip_a: str, tip_b: str) -> str:
+    """Approximate merge-base using first-parent chains (main-line compare)."""
+    if not tip_a or not tip_b:
+        return ""
+    a_set = set(_first_parent_chain(commit_by_sha, tip_a))
+    for sha in _first_parent_chain(commit_by_sha, tip_b):
+        if sha in a_set:
+            return sha
+    return ""
+
+
+def _history_shas(model: dict[str, Any] | None) -> set[str]:
+    return {str(sha) for sha in ((model or {}).get("sha_by_id") or {}).values() if sha}
+
+
+def read_compare_project_histories(
+    repo_dir: str,
+    local_history: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build local vs shared graphs for Compare (call after fetch for the remote side).
+
+    Does not change HEAD / worktree.
+
+    - ``local_history``: frozen Version-tree bundle from *before* fetch (exact UI state).
+      If omitted, falls back to a local-only rebuild (main/HEAD + local review heads).
+    - Shared graph: ``origin/main`` + ``origin/cv-review/*`` after fetch.
+    - Diff (dashed boxes): SHA set difference between the two graphs
+      (e.g. hemido214/1 already in local ⇒ not marked on remote; only /2 is).
+    - ``conflict``: local main tip vs origin/main diverged.
+    """
+    empty = _empty_history_model()
+    commit_by_sha = _read_repo_commits(repo_dir)
+    origin = _git_rev_parse(repo_dir, "origin/main")
+    local_main = _git_rev_parse(repo_dir, "refs/heads/main")
+    head_sha = _git_rev_parse(repo_dir, "HEAD")
+    unpushed = _unpushed_commit_shas(repo_dir)
+    declined = _load_declined_shas(repo_dir)
+    local_review_tips = _review_tips(repo_dir, local_only=True)
+    remote_review_tips = _review_tips(repo_dir, remote_only=True)
+
+    remote_main_shas: set[str] = (
+        set(_first_parent_chain(commit_by_sha, origin)) if origin else set()
+    )
+    local_main_shas: set[str] = (
+        set(_first_parent_chain(commit_by_sha, local_main)) if local_main else set()
+    )
+
+    # Shared = what GitHub has now (after fetch).
+    remote_model = empty
+    if (origin or remote_review_tips) and commit_by_sha:
+        remote_model = build_project_history_model(
+            commit_by_sha,
+            origin or "",
+            origin or "",
+            remote_review_tips,
+            set(),
+            declined_shas=declined,
+        )
+
+    # Local = frozen Version tree when provided (same as what the user sees).
+    local_model = empty
+    if isinstance(local_history, dict) and (local_history.get("version_specs") or local_history.get("sha_by_id")):
+        local_model = dict(local_history)
+    else:
+        local_tip = head_sha or local_main
+        if local_tip and commit_by_sha:
+            local_model = build_project_history_model(
+                commit_by_sha,
+                local_main or local_tip,
+                head_sha or local_tip,
+                local_review_tips,
+                unpushed,
+                declined_shas=declined,
+            )
+
+    local_shas = _history_shas(local_model)
+    remote_shas = _history_shas(remote_model)
+    only_remote_shas = remote_shas - local_shas
+    only_local_shas = local_shas - remote_shas
+    only_remote_main = remote_main_shas - local_main_shas
+    only_local_main = local_main_shas - remote_main_shas
+    has_remote_extras = bool(only_remote_shas)
+    has_local_extras = bool(only_local_shas)
+    aligned = not has_remote_extras and not has_local_extras
+
+    conflict = False
+    main_base = ""
+    conflict_local_shas: set[str] = set()
+    conflict_remote_shas: set[str] = set()
+    if local_main and origin and local_main != origin and commit_by_sha:
+        main_base = _first_parent_merge_base(commit_by_sha, local_main, origin)
+        local_is_anc = local_main in remote_main_shas or main_base == local_main
+        origin_is_anc = origin in local_main_shas or main_base == origin
+        conflict = not local_is_anc and not origin_is_anc
+        if conflict and main_base:
+            conflict_local_shas = {
+                sha
+                for sha in _first_parent_chain(commit_by_sha, local_main)
+                if sha != main_base and sha not in remote_main_shas
+            }
+            conflict_remote_shas = {
+                sha
+                for sha in _first_parent_chain(commit_by_sha, origin)
+                if sha != main_base and sha not in local_main_shas
+            }
+        elif conflict:
+            conflict_local_shas = set(only_local_main)
+            conflict_remote_shas = set(only_remote_main)
+
+    # Result preview: pedagogical union (merge coming — not applied).
+    result_model = empty
+    if commit_by_sha:
+        merged_tips = dict(remote_review_tips)
+        for login, tips in local_review_tips.items():
+            bucket = merged_tips.setdefault(login, [])
+            for tip in tips:
+                if tip not in bucket:
+                    bucket.append(tip)
+        result_model = build_project_history_model(
+            commit_by_sha,
+            origin or local_main or head_sha,
+            head_sha or origin or local_main,
+            merged_tips,
+            unpushed,
+            declined_shas=declined,
+        )
+
+    linear_model = _build_linear_integrate_preview(
+        commit_by_sha,
+        origin or "",
+        local_main or "",
+        remote_model,
+        only_local_main,
+    )
+
+    def _ids_for_shas(model: dict[str, Any], shas: set[str]) -> set[str]:
+        sha_by_id = model.get("sha_by_id") or {}
+        return {vid for vid, sha in sha_by_id.items() if sha in shas}
+
+    return {
+        "local": local_model,
+        "remote": remote_model,
+        "result": result_model,
+        "linear": linear_model,
+        "only_local_shas": only_local_shas,
+        "only_remote_shas": only_remote_shas,
+        "only_local_ids_local": _ids_for_shas(local_model, only_local_shas),
+        "only_remote_ids_remote": _ids_for_shas(remote_model, only_remote_shas),
+        "only_local_ids_result": _ids_for_shas(result_model, only_local_shas),
+        "only_remote_ids_result": _ids_for_shas(result_model, only_remote_shas),
+        "conflict_ids_local": _ids_for_shas(local_model, conflict_local_shas),
+        "conflict_ids_remote": _ids_for_shas(remote_model, conflict_remote_shas),
+        "has_local_extras": has_local_extras,
+        "has_remote_extras": has_remote_extras,
+        "has_local_main_extras": bool(only_local_main),
+        "has_remote_main_extras": bool(only_remote_main),
+        "conflict": conflict,
+        "aligned": aligned,
+        "origin_sha": origin or "",
+        "head_sha": head_sha or "",
+        "local_main_sha": local_main or "",
+        "main_merge_base": main_base or "",
+    }
+
+
+def _build_linear_integrate_preview(
+    commit_by_sha: dict[str, dict[str, Any]],
+    origin: str,
+    local_main: str,
+    remote_model: dict[str, Any],
+    only_local_main: set[str],
+) -> dict[str, Any]:
+    """Pedagogical preview: shared main first, then local-only main commits on top."""
+    if not remote_model or not (remote_model.get("version_specs") or remote_model.get("sha_by_id")):
+        return dict(remote_model or _empty_history_model())
+    if not origin or not only_local_main:
+        return dict(remote_model)
+
+    remote_main_set = set(_first_parent_chain(commit_by_sha, origin))
+    local_only: list[str] = []
+    if local_main:
+        for sha in reversed(_first_parent_chain(commit_by_sha, local_main)):
+            if sha in only_local_main and sha not in remote_main_set:
+                local_only.append(sha)
+    if not local_only:
+        return dict(remote_model)
+
+    sha_by_id = dict(remote_model.get("sha_by_id") or {})
+    id_by_sha = {sha: vid for vid, sha in sha_by_id.items()}
+    specs_by_id = {spec["id"]: dict(spec) for spec in (remote_model.get("version_specs") or [])}
+    tags = dict(remote_model.get("tags_by_id") or {})
+    history_rows = [list(row) for row in (remote_model.get("commit_history") or [])]
+    existing_ids = {row[0] for row in history_rows if row}
+
+    parent_id = id_by_sha.get(origin)
+    main_count = sum(1 for vid in specs_by_id if str(vid).startswith("main/"))
+    tip_sha = origin
+    for sha in local_only:
+        if sha in id_by_sha:
+            parent_id = id_by_sha[sha]
+            tip_sha = sha
+            continue
+        main_count += 1
+        version_id = "main/%d" % main_count
+        specs_by_id[version_id] = {
+            "id": version_id,
+            "parent": parent_id,
+            "branch": "main",
+            "tag": version_id,
+            "merge": False,
+        }
+        id_by_sha[sha] = version_id
+        sha_by_id[version_id] = sha
+        tags[version_id] = version_id
+        if version_id not in existing_ids:
+            record = commit_by_sha.get(sha) or {}
+            history_rows.append(
+                [
+                    version_id,
+                    _format_git_date(str(record.get("date") or "")),
+                    str(record.get("author") or ""),
+                    str(record.get("message") or ""),
+                    "local",
+                ]
+            )
+            existing_ids.add(version_id)
+        parent_id = version_id
+        tip_sha = sha
+
+    specs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for spec in remote_model.get("version_specs") or []:
+        version_id = spec.get("id")
+        if version_id and version_id not in seen and version_id in specs_by_id:
+            specs.append(specs_by_id[version_id])
+            seen.add(version_id)
+    for sha in local_only:
+        version_id = id_by_sha.get(sha)
+        if version_id and version_id not in seen:
+            specs.append(specs_by_id[version_id])
+            seen.add(version_id)
+
+    return {
+        "commit_history": history_rows,
+        "version_specs": specs,
+        "tags_by_id": tags,
+        "sha_by_id": sha_by_id,
+        "head_id": id_by_sha.get(tip_sha),
+    }
+
+
+def adopt_shared_main(repo_dir: str) -> None:
+    """Point local main (and worktree) at origin/main. Prefer calling after fetch."""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    origin = _git_rev_parse(repo_dir, "origin/main")
+    if not origin:
+        raise GitHubAuthError("Could not find the shared project tip.")
+    login = current_login()
+    if login:
+        _configure_repo_identity(repo_dir, login)
+    _run_git(["update-ref", "refs/heads/main", origin], cwd=repo_dir, timeout=20)
+    checkout_local_version(repo_dir, origin, "main")
+    _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
+    _run_git(["update-ref", "refs/remotes/origin/main", origin], cwd=repo_dir, timeout=20)
+
+
+def integrate_shared_linear(repo_dir: str) -> None:
+    """Replay local-only main commits onto origin/main (linear integrate / rebase)."""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    origin = _git_rev_parse(repo_dir, "origin/main")
+    local_main = _git_rev_parse(repo_dir, "refs/heads/main")
+    if not origin:
+        raise GitHubAuthError("Could not find the shared project tip.")
+    if not local_main:
+        raise GitHubAuthError("Could not find this computer's main tip.")
+    login = current_login()
+    if login:
+        _configure_repo_identity(repo_dir, login)
+    checkout_local_version(repo_dir, local_main, "main")
+    rebase = _run_git(["rebase", "origin/main"], cwd=repo_dir, timeout=180)
+    if rebase.returncode != 0:
+        _run_git(["rebase", "--abort"], cwd=repo_dir, timeout=30)
+        detail = (rebase.stderr or rebase.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not integrate shared versions in a linear history.\n"
+            "Your files may need a manual merge — try again later or Reset to shared.\n"
+            "%s" % (detail[:400] if detail else "")
+        )
+    new_tip = _git_rev_parse(repo_dir, "HEAD") or _git_rev_parse(repo_dir, "refs/heads/main")
+    if new_tip:
+        checkout_local_version(repo_dir, new_tip, "main")
+    _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
 
 
 def delete_owned_repository(full_name: str) -> None:
@@ -2110,7 +2596,7 @@ def _normalize_stored_reads(document) -> dict[str, dict]:
         if not login or not isinstance(value, dict):
             continue
         entry: dict = {}
-        for field in ("activity_at", "messages_at"):
+        for field in ("activity_at", "messages_at", "versions_at"):
             stamp = str(value.get(field) or "").strip()
             if stamp:
                 entry[field] = stamp
@@ -2254,15 +2740,27 @@ def is_project_messages_conflict(stdout: str = "", stderr: str = "") -> bool:
     return _is_contents_conflict("%s\n%s" % (stderr or "", stdout or ""))
 
 
-def publish_project_activity(full_name: str, kind: str, text: str) -> None:
-    """Append one project activity event. Safe to call after Share / People / Join."""
+def publish_project_activity(
+    full_name: str,
+    kind: str = "",
+    text: str = "",
+    event: dict | None = None,
+) -> None:
+    """Append one project activity event. Safe to call after Share / People / Join.
+
+    Pass a pre-built event to keep its timestamp (e.g. built at Share time, published
+    after a UI popup so the network wait does not delay the dialog).
+    """
     if not full_name:
         return
     try:
         ensure_project_info_branch(full_name)
     except (GitHubAuthError, OSError, ValueError):
         pass
-    event = build_project_activity(current_login() or "Someone", kind, text)
+    if event is None:
+        event = build_project_activity(current_login() or "Someone", kind, text)
+    elif not isinstance(event, dict) or not str(event.get("id") or "").strip():
+        return
     last_error = ""
     for _attempt in range(4):
         fetch = _run_gh(project_messages_fetch_args(full_name), timeout=40)

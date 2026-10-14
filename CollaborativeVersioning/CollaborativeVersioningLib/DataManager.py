@@ -574,30 +574,19 @@ class DataManager:
         return volume_path, likely_seg
 
     def _labelmap_likelihood(self, path: str) -> float:
-        """Higher score = more likely a labelmap (narrow integer range)."""
+        """Cheap guess without reading voxels (name hints + smaller file ≈ labelmap)."""
+        score = 0.0
+        lower = os.path.basename(path).lower()
+        for hint in ("seg", "label", "mask", "annot"):
+            if hint in lower:
+                score += 10.0
         try:
-            import vtk
-
-            reader = vtk.vtkNIFTIImageReader()
-            reader.SetFileName(path)
-            reader.Update()
-            data = reader.GetOutput()
-            if data is None:
-                return 0.0
-            scalar_min, scalar_max = data.GetScalarRange()
-            span = float(scalar_max) - float(scalar_min)
-            score = 0.0
-            if data.GetScalarType() not in (vtk.VTK_FLOAT, vtk.VTK_DOUBLE):
-                score += 2.0
-            if span <= 1:
-                score += 8.0
-            elif span <= 255:
-                score += 5.0
-            elif span <= 1024:
-                score += 1.0
-            return score
-        except Exception:
-            return 0.0
+            # Volumes are usually much larger than labelmaps / segmentations.
+            size_mib = float(os.path.getsize(path)) / (1024.0 * 1024.0)
+            score += 1.0 / (1.0 + size_mib)
+        except OSError:
+            pass
+        return score
 
     def load_dicom(self, dicom_path: str) -> list[Any]:
         from DICOMLib import DICOMUtils
