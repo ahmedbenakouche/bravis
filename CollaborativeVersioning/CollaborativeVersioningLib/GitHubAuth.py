@@ -142,12 +142,15 @@ def _run_captured(
     cwd: str | None,
     timeout_label: str,
     stdin_text: str | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["GH_PAGER"] = ""
     env["GIT_PAGER"] = ""
     env["GH_PROMPT_DISABLED"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if env_extra:
+        env.update(env_extra)
     stdin = subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL
     try:
         process = subprocess.Popen(
@@ -496,11 +499,24 @@ def _configure_repo_identity(repo_dir: str, login: str) -> None:
         )
 
 
-def _run_git(args: list[str], cwd: str, timeout: int = 120) -> subprocess.CompletedProcess:
+def _run_git(
+    args: list[str],
+    cwd: str,
+    timeout: int = 120,
+    stdin_text: str | None = None,
+    env_extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     git = find_git()
     if not git:
         raise GitHubAuthError(missing_tools_message())
-    return _run_captured([git, *args], timeout, cwd, "Git")
+    return _run_captured(
+        [git, *args],
+        timeout,
+        cwd,
+        "Git",
+        stdin_text=stdin_text,
+        env_extra=env_extra,
+    )
 
 
 def connect_session() -> dict[str, Any]:
@@ -602,7 +618,8 @@ def _share_failure_message(detail: str) -> str:
     ):
         return (
             "Could not share. The shared project has versions that are not on this computer.\n\n"
-            "Open the project and choose Open shared project first, then share again."
+            "Open Compare with shared first (bell / notifications), resolve the differences, "
+            "then share again."
         )
     if "permission" in lower or "403" in lower or "write access" in lower:
         return "Could not share. This project is read-only for your account."
@@ -1292,7 +1309,7 @@ def _update_local_from_origin(repo_dir: str) -> None:
     else:
         raise GitHubAuthError(
             "Could not update the local project. The shared project has versions that are not on this computer.\n\n"
-            "Open the project and choose Open shared project first."
+            "Open Compare with shared first (bell / notifications) and resolve the differences."
         )
     _checkout_branch_at(repo_dir, "main", target)
     _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
@@ -2118,8 +2135,87 @@ def adopt_shared_main(repo_dir: str) -> None:
     _run_git(["update-ref", "refs/remotes/origin/main", origin], cwd=repo_dir, timeout=20)
 
 
+def _local_only_main_commits(repo_dir: str, origin: str, local_main: str) -> list[str]:
+    """Oldest-first first-parent commits on local main that are not on origin/main."""
+    if not origin or not local_main:
+        return []
+    result = _run_git(
+        ["rev-list", "--reverse", "--first-parent", "%s..%s" % (origin, local_main)],
+        cwd=repo_dir,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _replay_snapshot_on_head(repo_dir: str, source_sha: str) -> str:
+    """Create a new commit on HEAD with the full tree of source_sha (no 3-way merge).
+
+    Matches Collaborative Versioning snapshots: each local version is replayed as-is
+    on top of shared, avoiding binary/rebase conflicts.
+    """
+    tree = _run_git(
+        ["rev-parse", "%s^{tree}" % source_sha], cwd=repo_dir, timeout=30
+    )
+    if tree.returncode != 0:
+        detail = (tree.stderr or tree.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not add shared versions then yours.\n%s" % detail[:400]
+        )
+    tree_sha = (tree.stdout or "").strip()
+    head = _git_rev_parse(repo_dir, "HEAD")
+    if not tree_sha or not head:
+        raise GitHubAuthError("Could not add shared versions then yours.")
+    meta = _run_git(
+        ["log", "-1", "--format=%an%n%ae%n%aI%n%B", source_sha],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    if meta.returncode != 0:
+        detail = (meta.stderr or meta.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not add shared versions then yours.\n%s" % detail[:400]
+        )
+    lines = (meta.stdout or "").splitlines()
+    author = (lines[0] if len(lines) > 0 else "").strip() or "Collaborative Versioning"
+    email = (lines[1] if len(lines) > 1 else "").strip() or "collaborative@versioning.local"
+    date = (lines[2] if len(lines) > 2 else "").strip()
+    message = "\n".join(lines[3:]).strip() or "Saved version"
+    if not message.endswith("\n"):
+        message += "\n"
+    env_extra = {
+        "GIT_AUTHOR_NAME": author,
+        "GIT_AUTHOR_EMAIL": email,
+    }
+    if date:
+        env_extra["GIT_AUTHOR_DATE"] = date
+    created = _run_git(
+        ["commit-tree", tree_sha, "-p", head],
+        cwd=repo_dir,
+        timeout=60,
+        stdin_text=message,
+        env_extra=env_extra,
+    )
+    if created.returncode != 0:
+        detail = (created.stderr or created.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not add shared versions then yours.\n%s" % detail[:400]
+        )
+    new_sha = (created.stdout or "").strip()
+    if not new_sha:
+        raise GitHubAuthError("Could not add shared versions then yours.")
+    reset = _run_git(["reset", "--hard", new_sha], cwd=repo_dir, timeout=180)
+    if reset.returncode != 0:
+        detail = (reset.stderr or reset.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not add shared versions then yours.\n%s" % detail[:400]
+        )
+    return new_sha
+
+
 def integrate_shared_linear(repo_dir: str) -> None:
-    """Replay local-only main commits onto origin/main (linear integrate / rebase)."""
+    """Put origin/main first, then replay local-only main snapshots on top."""
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
     origin = _git_rev_parse(repo_dir, "origin/main")
@@ -2131,19 +2227,17 @@ def integrate_shared_linear(repo_dir: str) -> None:
     login = current_login()
     if login:
         _configure_repo_identity(repo_dir, login)
-    checkout_local_version(repo_dir, local_main, "main")
-    rebase = _run_git(["rebase", "origin/main"], cwd=repo_dir, timeout=180)
-    if rebase.returncode != 0:
-        _run_git(["rebase", "--abort"], cwd=repo_dir, timeout=30)
-        detail = (rebase.stderr or rebase.stdout or "").strip()
-        raise GitHubAuthError(
-            "Could not integrate shared versions in a linear history.\n"
-            "Your files may need a manual merge — try again later or Reset to shared.\n"
-            "%s" % (detail[:400] if detail else "")
-        )
-    new_tip = _git_rev_parse(repo_dir, "HEAD") or _git_rev_parse(repo_dir, "refs/heads/main")
-    if new_tip:
-        checkout_local_version(repo_dir, new_tip, "main")
+    local_only = _local_only_main_commits(repo_dir, origin, local_main)
+    if not local_only:
+        # Already aligned or only shared is ahead — match shared tip.
+        adopt_shared_main(repo_dir)
+        return
+    # Start from shared tip, then replay each local snapshot in order.
+    checkout_local_version(repo_dir, origin, "main")
+    tip = origin
+    for sha in local_only:
+        tip = _replay_snapshot_on_head(repo_dir, sha)
+    checkout_local_version(repo_dir, tip, "main")
     _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
 
 

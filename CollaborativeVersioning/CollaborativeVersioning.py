@@ -732,23 +732,24 @@ class CompareWithSharedDialog(qt.QDialog):
         self._reset_btn = qt.QPushButton("Reset to shared")
         self._reset_btn.setStyleSheet(BTN_SECONDARY)
         self._reset_btn.setToolTip(
-            "Drop this computer's divergent tip and match the shared project exactly."
+            "Replace your local work with the shared work. "
+            "Conflicting local versions leave the main line."
         )
         self._reset_btn.connect(
             "clicked()", lambda: self._selectChoice(self.ACTION_RESET)
         )
-        self._linear_btn = qt.QPushButton("Integrate shared (linear)")
+        self._linear_btn = qt.QPushButton("Add shared, then mine")
         self._linear_btn.setStyleSheet(BTN_SECONDARY)
         self._linear_btn.setToolTip(
-            "Put shared versions first, then replay your local work on top."
+            "Take the shared versions first, then keep your local work on top of them."
         )
         self._linear_btn.connect(
             "clicked()", lambda: self._selectChoice(self.ACTION_LINEAR)
         )
-        self._merge_btn = qt.QPushButton("Integrate shared (merge) — coming")
+        self._merge_btn = qt.QPushButton("Keep both (merge) — coming")
         self._merge_btn.setStyleSheet(BTN_SECONDARY)
         self._merge_btn.setToolTip(
-            "Keep both histories side by side. Not available yet."
+            "Keep both sides by merging annotations. Not available yet."
         )
         self._merge_btn.connect(
             "clicked()", lambda: self._selectChoice(self.ACTION_MERGE)
@@ -762,9 +763,13 @@ class CompareWithSharedDialog(qt.QDialog):
         conflicts_layout.addLayout(choice_row)
 
         self._conflict_options_help = qt.QLabel(
-            "• Reset to shared — discard your divergent local tip; this computer matches shared.\n"
-            "• Integrate shared (linear) — shared first, then your local work replayed on top.\n"
-            "• Integrate shared (merge) — coming — keep both histories (not available yet)."
+            "• Reset to shared — your local work is replaced by the shared work, "
+            "so this computer matches the shared project. "
+            "Warning: your conflicting saved versions will be removed from the main line.\n"
+            "• Add shared, then mine — take the shared versions, then keep your local work on top. "
+            "Warning: your versions will be placed after the shared versions.\n"
+            "• Keep both (merge) — coming — keep both sides by merging annotations "
+            "(not available yet)."
         )
         self._conflict_options_help.setWordWrap(True)
         self._conflict_options_help.setAlignment(qt.Qt.AlignLeft | qt.Qt.AlignTop)
@@ -787,6 +792,15 @@ class CompareWithSharedDialog(qt.QDialog):
             "font-size: 15px; font-weight: 800; padding: 6px 0 2px 0;"
         )
         result_layout.addWidget(result_title)
+        self._result_legend = qt.QLabel(
+            "Green dashed boxes show what this choice applies "
+            "(from shared and/or yours on top)."
+        )
+        self._result_legend.setWordWrap(True)
+        self._result_legend.setAlignment(qt.Qt.AlignHCenter)
+        self._result_legend.setStyleSheet(DIALOG_HINT_STYLE)
+        self._result_legend.hide()
+        result_layout.addWidget(self._result_legend)
         self._result_canvas = graph_module.VersionHistoryCanvas(
             logic,
             version_specs=[],
@@ -964,6 +978,51 @@ class CompareWithSharedDialog(qt.QDialog):
         self._result_panel.hide()
         self._validate_btn.setEnabled(False)
 
+    def _idsForShas(self, model: dict, shas) -> set:
+        sha_by_id = (model or {}).get("sha_by_id") or {}
+        wanted = set(shas or ())
+        return {vid for vid, sha in sha_by_id.items() if sha in wanted}
+
+    def _resultMarksForChoice(self, choice: str, model: dict) -> tuple:
+        """Green marks for Result: (result_ids, result_roles)."""
+        only_remote = set(self._compare.get("only_remote_shas") or ())
+        only_local = set(self._compare.get("only_local_shas") or ())
+        local_model = self._compare.get("local") or {}
+        local_sha_by_id = local_model.get("sha_by_id") or {}
+        conflict_local_ids = set(self._compare.get("conflict_ids_local") or ())
+        conflict_local_shas = {
+            local_sha_by_id[vid]
+            for vid in conflict_local_ids
+            if vid in local_sha_by_id and local_sha_by_id[vid]
+        }
+        roles = {}
+        if choice == self.ACTION_RESET:
+            # Same as Shared reds → green (taking shared).
+            mark_shas = only_remote
+            if not mark_shas:
+                remote_model = self._compare.get("remote") or {}
+                remote_sha_by_id = remote_model.get("sha_by_id") or {}
+                for vid in set(self._compare.get("conflict_ids_remote") or ()):
+                    sha = remote_sha_by_id.get(vid)
+                    if sha:
+                        mark_shas.add(sha)
+            for vid in self._idsForShas(model, mark_shas):
+                roles[vid] = "shared"
+        elif choice == self.ACTION_LINEAR:
+            # Shared reds + local versions kept on top.
+            local_mark = conflict_local_shas or only_local
+            for vid in self._idsForShas(model, only_remote):
+                roles[vid] = "shared"
+            for vid in self._idsForShas(model, local_mark):
+                roles[vid] = "local"
+        elif choice == self.ACTION_UPDATE:
+            for vid in self._idsForShas(model, only_remote):
+                roles[vid] = "shared"
+        elif choice == self.ACTION_KEEP:
+            for vid in self._idsForShas(model, only_local):
+                roles[vid] = "local"
+        return set(roles.keys()), roles
+
     def _modelForChoice(self, choice: str) -> tuple:
         """Return (model, highlight_dict, title, description) for the result preview."""
         local_model = self._compare.get("local") or {}
@@ -982,7 +1041,7 @@ class CompareWithSharedDialog(qt.QDialog):
                 remote_model,
                 {},
                 "Result — Reset to shared",
-                "This computer matches the shared tip; local divergent tip is dropped",
+                "This computer matches shared; conflicting local versions leave the main line",
             )
         if choice == self.ACTION_UPDATE:
             return (
@@ -995,13 +1054,13 @@ class CompareWithSharedDialog(qt.QDialog):
             return (
                 linear_model,
                 {},
-                "Result — Integrate shared (linear)",
+                "Result — Add shared, then mine",
                 "Shared versions first, then your local work on top",
             )
         return (
             {},
             {},
-            "Result — Integrate shared (merge)",
+            "Result — Keep both (merge)",
             "Coming soon",
         )
 
@@ -1010,18 +1069,23 @@ class CompareWithSharedDialog(qt.QDialog):
         self._refreshChoiceStyles()
         if choice == self.ACTION_MERGE:
             self._result_panel.hide()
+            legend = getattr(self, "_result_legend", None)
+            if legend is not None:
+                legend.hide()
             self._validate_btn.setEnabled(False)
             self._validate_btn.setToolTip(
-                "Merge integrate is not available yet — choose Reset to shared or Integrate shared (linear)."
+                "Keep both (merge) is not available yet — "
+                "choose Reset to shared or Add shared, then mine."
             )
             if not silent:
                 self._setConflictsMessage(
-                    "Integrate shared (merge) is coming soon.\n"
-                    "Choose Reset to shared or Integrate shared (linear), then Validate."
+                    "Keep both (merge) is coming soon.\n"
+                    "Choose Reset to shared or Add shared, then mine, then Validate."
                 )
             return
 
         model, highlight, title, description = self._modelForChoice(choice)
+        result_ids, result_roles = self._resultMarksForChoice(choice, model)
         gm = self._graph_module
         self._result_canvas.set_compare_content(
             version_specs=list(model.get("version_specs") or []),
@@ -1033,7 +1097,15 @@ class CompareWithSharedDialog(qt.QDialog):
             ),
             highlight_ids=highlight,
             conflict_ids=set(),
+            result_ids=result_ids,
+            result_roles=result_roles,
         )
+        legend = getattr(self, "_result_legend", None)
+        if legend is not None:
+            if result_ids:
+                legend.show()
+            else:
+                legend.hide()
         self._result_panel.show()
         qt.QTimer.singleShot(0, self._fitCompareGraphs)
         self._validate_btn.setEnabled(True)
@@ -1042,7 +1114,7 @@ class CompareWithSharedDialog(qt.QDialog):
             labels = {
                 self.ACTION_KEEP: "Keep mine",
                 self.ACTION_RESET: "Reset to shared",
-                self.ACTION_LINEAR: "Integrate shared (linear)",
+                self.ACTION_LINEAR: "Add shared, then mine",
                 self.ACTION_UPDATE: "Update version tree",
             }
             self._setConflictsMessage(
@@ -2602,8 +2674,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         layout.addWidget(self.historyPlaceholder)
 
         self.historyTableWidget = qt.QTableWidget()
-        self.historyTableWidget.setColumnCount(5)
-        self.historyTableWidget.setHorizontalHeaderLabels(["Version", "Date", "Author", "Message", "Status"])
+        self.historyTableWidget.setColumnCount(4)
+        self.historyTableWidget.setHorizontalHeaderLabels(["Version", "Date", "Author", "Message"])
         self.historyTableWidget.setAlternatingRowColors(True)
         self.historyTableWidget.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
         self.historyTableWidget.setSelectionMode(qt.QAbstractItemView.SingleSelection)
@@ -6554,9 +6626,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.setWindowTitle("Reset to shared")
         box.setIcon(qt.QMessageBox.Warning)
         box.setText(
-            "Reset this computer to the shared project tip?\n\n"
-            "Your divergent local versions will leave the main line. "
-            "Open assets will follow the shared tip."
+            "Replace your local work with the shared work?\n\n"
+            "Warning: your conflicting saved versions will be removed from the main line."
         )
         box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
         box.button(qt.QMessageBox.Ok).setText("Reset to shared")
@@ -6595,22 +6666,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _integrateSharedLinear(self, local_path: str) -> None:
         """Rebase local-only main commits onto origin/main."""
         box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Integrate shared (linear)")
+        box.setWindowTitle("Add shared, then mine")
         box.setIcon(qt.QMessageBox.Warning)
         box.setText(
-            "Integrate the shared tip in a linear history?\n\n"
-            "Shared versions come first; your local work is replayed on top. "
-            "Open assets will follow the new tip."
+            "Add the shared versions, then keep your local work on top?\n\n"
+            "Warning: your versions will be placed after the shared versions."
         )
         box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
-        box.button(qt.QMessageBox.Ok).setText("Integrate (linear)")
+        box.button(qt.QMessageBox.Ok).setText("Add shared, then mine")
         box.setDefaultButton(qt.QMessageBox.Cancel)
         if box.exec_() != qt.QMessageBox.Ok:
             return
         project = self._currentProjectName()
-        self._openProgress("Integrate shared (linear)", "Replaying local work on shared…")
+        self._openProgress("Add shared, then mine", "Adding shared, then your work…")
         try:
-            self._updateProgress("Replaying local work on shared…")
+            self._updateProgress("Adding shared, then your work…")
             integrate_shared_linear(local_path)
             save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
@@ -6623,7 +6693,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._persistReadCursor(project, versions_at=stamp)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            detail = str(error).strip()
+            first = detail.split("\n")[0]
+            self._appendFeed(first, error=True)
+            # Second line often has the real git reason.
+            rest = "\n".join(detail.split("\n")[1:]).strip()
+            if rest:
+                self._appendFeed(rest.split("\n")[0], error=True)
             return
         self._closeProgress()
         unshared = self._historyHasUnsharedVersion(history)
@@ -6633,10 +6709,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateNotificationsBadge()
         if version_id:
             self._appendFeed(
-                "Integrated shared (linear). New tip: %s." % version_id
+                "Added shared, then yours. New tip: %s." % version_id
             )
         else:
-            self._appendFeed("Integrated shared (linear).")
+            self._appendFeed("Added shared, then yours.")
 
     def _getLatestSharedVersions(self) -> None:
         """Compatibility: open compare flow (preferred) instead of silent fetch-only."""
@@ -7850,12 +7926,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             item.setFont(font)
         elif column == 2:
             item.setForeground(qt.QColor(TEXT_SECONDARY))
-        elif column == 4:
-            color = COMMIT_STATUS_COLORS.get(status.lower(), TEXT_SECONDARY)
-            item.setForeground(qt.QColor(color))
-            font = item.font()
-            font.setBold(True)
-            item.setFont(font)
 
     def _refreshHistoryTable(self) -> None:
         bundle = getattr(self, "_project_history_bundle", None) or {}
@@ -7864,7 +7934,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         for row_index, row_values in enumerate(commit_history):
             status = row_values[4] if len(row_values) > 4 else ""
             version_id = row_values[0]
-            for column_index, value in enumerate(row_values):
+            # Table shows Version / Date / Author / Message only (status = dashed box on graph).
+            for column_index, value in enumerate(row_values[:4]):
                 if column_index == 0:
                     display = self._versionDisplayTag(version_id)
                     item = qt.QTableWidgetItem(display)

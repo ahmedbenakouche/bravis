@@ -419,8 +419,9 @@ def _draw_tree_edge(scene, parent, child, color=None, width=2):
     scene.addLine(cx, py, cx, child["y"], pen)
 
 
-# Reserved for compare-dialog diff outline + pointer (not used as normal node/branch colors).
-COMPARE_DIFF_COLOR = "#dc2626"  # red
+# Reserved for compare-dialog outlines (not used as normal node/branch colors).
+COMPARE_DIFF_COLOR = "#dc2626"  # red — Local / Shared diffs
+COMPARE_RESULT_COLOR = "#16a34a"  # green — Result preview (what this choice applies)
 
 
 def _branch_color(branch):
@@ -652,13 +653,21 @@ def _draw_main_trunk(scene, positions, trunk_order):
         scene.addLine(lx, ly + lower["h"] / 2.0, ux, uy - upper["h"] / 2.0, pen)
 
 
+def _node_is_unshared(node_id, commit_history_by_id):
+    """True when Status is local (saved here, not shared yet)."""
+    info = (commit_history_by_id or {}).get(node_id) or {}
+    return str(info.get("status") or "").strip().lower() == "local"
+
+
 def _draw_version_box_node(scene, node, font_size=7):
     x, y, w, h = node["x"], node["y"], node["w"], node["h"]
     color = node["color"]
     border = 3 if node.get("merge") else 2
+    # Dashed border = saved on this computer, not shared yet (Status: local).
+    style = qt.Qt.DashLine if node.get("unshared") else qt.Qt.SolidLine
     scene.addRect(
         x, y, w, h,
-        qt.QPen(qt.QColor(color), border),
+        qt.QPen(qt.QColor(color), border, style),
         qt.QBrush(qt.QColor(_ui.GRAPH_NODE_FILL)),
     )
     text = node["label"]
@@ -669,6 +678,21 @@ def _draw_version_box_node(scene, node, font_size=7):
     label.setDefaultTextColor(qt.QColor(_ui.GRAPH_NODE_TEXT))
     bounds = label.boundingRect()
     label.setPos(x + (w - bounds.width()) / 2.0, y + (h - bounds.height()) / 2.0)
+
+
+def _draw_share_status_legend(scene, x, y):
+    """Tiny legend: solid = shared, dashed = not shared yet.
+
+    Returns scene QRectF covering the legend text.
+    """
+    text = scene.addText(
+        "Solid box = shared    ·    Dashed box = saved here · not shared yet"
+    )
+    text.setFont(qt.QFont("Arial", 8))
+    text.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT or _ui.GRAPH_TITLE or "#888888"))
+    text.setPos(x, y)
+    bounds = text.boundingRect()
+    return qt.QRectF(float(x), float(y), float(bounds.width()), float(bounds.height()))
 
 
 def _draw_checkout_pointer(scene, node, color=None):
@@ -697,6 +721,16 @@ def _build_one_diff_caption(node_id, commit_history_by_id, side):
     if side == "local":
         return "Saved · not shared yet\n%s" % when
     return "Shared by %s\n%s" % (author, when)
+
+
+def _build_one_result_caption(node_id, commit_history_by_id, role):
+    """Short label for a Result green mark: from shared vs yours on top."""
+    info = (commit_history_by_id or {}).get(node_id) or {}
+    when = str(info.get("date") or "").strip() or "recently"
+    role = str(role or "").strip().lower()
+    if role == "local":
+        return "Yours on top\n%s" % when
+    return "From shared\n%s" % when
 
 
 def _measure_caption_size(text, font_size=8):
@@ -782,11 +816,18 @@ def _pick_diff_annotation_side(box, text_w, text_h, obstacles):
 
 
 def _draw_diff_region(
-    scene, positions, diff_ids, commit_history_by_id=None, diff_side=""
+    scene,
+    positions,
+    diff_ids,
+    commit_history_by_id=None,
+    diff_side="",
+    color=None,
+    caption_mode="diff",
+    result_roles=None,
 ):
-    """Dashed red box + pointer + caption per diff node.
+    """Dashed box + pointer + caption per marked node (red diff or green result).
 
-    One box per diff node. Each has its own arrow and text, placed on the
+    One box per node. Each has its own arrow and text, placed on the
     left or right so they avoid overlapping other version nodes (and each other).
 
     Returns a QRectF covering boxes + pointers + captions (for fitInView), or None.
@@ -797,8 +838,9 @@ def _draw_diff_region(
     if not diff_id_list:
         return None
     pad = 10
-    red = COMPARE_DIFF_COLOR
-    pen = qt.QPen(qt.QColor(red), 2, qt.Qt.DashLine)
+    mark = str(color or COMPARE_DIFF_COLOR)
+    pen = qt.QPen(qt.QColor(mark), 2, qt.Qt.DashLine)
+    roles = dict(result_roles or {})
     node_obstacles = {}
     for nid, node in positions.items():
         node_obstacles[nid] = qt.QRectF(
@@ -810,7 +852,7 @@ def _draw_diff_region(
     placed_annotations = []
 
     fit = None
-    # Top-to-bottom so stacked diffs pick free sides consistently.
+    # Top-to-bottom so stacked marks pick free sides consistently.
     ordered = sorted(
         diff_id_list,
         key=lambda nid: (
@@ -829,7 +871,11 @@ def _draw_diff_region(
         scene.addRect(box, pen, qt.QBrush(qt.Qt.NoBrush))
         fit = box if fit is None else fit.united(box)
 
-        text = _build_one_diff_caption(node_id, commit_history_by_id, diff_side)
+        if str(caption_mode or "").strip().lower() == "result":
+            role = roles.get(node_id) or diff_side or "shared"
+            text = _build_one_result_caption(node_id, commit_history_by_id, role)
+        else:
+            text = _build_one_diff_caption(node_id, commit_history_by_id, diff_side)
         text_w, text_h = _measure_caption_size(text, font_size=8)
         blockers = [
             rect for nid, rect in node_obstacles.items() if nid != node_id
@@ -840,8 +886,8 @@ def _draw_diff_region(
         )
         scene.addPolygon(
             qt.QPolygonF(points),
-            qt.QPen(qt.QColor(red), 1),
-            qt.QBrush(qt.QColor(red)),
+            qt.QPen(qt.QColor(mark), 1),
+            qt.QBrush(qt.QColor(mark)),
         )
         fit = fit.united(pointer_bounds)
         if text:
@@ -1025,6 +1071,9 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.conflict_ids = set(conflict_ids or ())
         # "local" | "shared" — caption wording next to the red diff pointer
         self.diff_side = str(diff_side or "").strip().lower()
+        # Result preview: green dashed marks (id -> "shared" | "local")
+        self.result_ids = set()
+        self.result_roles = {}
         self.fit_tight = bool(fit_tight)
         self._specs_by_id = {spec["id"]: spec for spec in self.version_specs}
         self._nodes_by_id = {}
@@ -1087,6 +1136,8 @@ class VersionHistoryCanvas(InteractiveGraphView):
         highlight_ids=None,
         conflict_ids=None,
         diff_side=None,
+        result_ids=None,
+        result_roles=None,
     ):
         """Replace graph contents (used by the compare result preview)."""
         if version_specs is not None:
@@ -1106,6 +1157,10 @@ class VersionHistoryCanvas(InteractiveGraphView):
             self.conflict_ids = set(conflict_ids)
         if diff_side is not None:
             self.diff_side = str(diff_side or "").strip().lower()
+        if result_ids is not None:
+            self.result_ids = set(result_ids or ())
+        if result_roles is not None:
+            self.result_roles = dict(result_roles or {})
         self.draw()
         self._pad_scene_rect()
         self.reset_view()
@@ -1230,7 +1285,12 @@ class VersionHistoryCanvas(InteractiveGraphView):
                 width=2,
             )
 
+        any_unshared = False
         for node in nodes_by_id.values():
+            unshared = _node_is_unshared(node["id"], self.commit_history_by_id)
+            node["unshared"] = unshared
+            if unshared:
+                any_unshared = True
             _draw_version_box_node(self._graphe_scene, node, font_size=7)
 
         if self.fit_tight:
@@ -1241,9 +1301,21 @@ class VersionHistoryCanvas(InteractiveGraphView):
             min_y = min(node["y"] for node in nodes_by_id.values())
             node_rect = qt.QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
             self._content_fit_rect = qt.QRectF(node_rect)
+            # Compare dialog: dashed boxes stay; share-status legend only on Version tree.
 
             diff_bounds = None
-            if self.conflict_ids:
+            if self.result_ids:
+                diff_bounds = _draw_diff_region(
+                    self._graphe_scene,
+                    nodes_by_id,
+                    self.result_ids,
+                    commit_history_by_id=self.commit_history_by_id,
+                    diff_side="shared",
+                    color=COMPARE_RESULT_COLOR,
+                    caption_mode="result",
+                    result_roles=self.result_roles,
+                )
+            elif self.conflict_ids:
                 diff_bounds = _draw_diff_region(
                     self._graphe_scene,
                     nodes_by_id,
@@ -1282,7 +1354,18 @@ class VersionHistoryCanvas(InteractiveGraphView):
 
         # Normal Version tree — classic layout (no auto enlarge / special centering).
         self._content_fit_rect = None
-        if self.conflict_ids:
+        if self.result_ids:
+            _draw_diff_region(
+                self._graphe_scene,
+                nodes_by_id,
+                self.result_ids,
+                commit_history_by_id=self.commit_history_by_id,
+                diff_side="shared",
+                color=COMPARE_RESULT_COLOR,
+                caption_mode="result",
+                result_roles=self.result_roles,
+            )
+        elif self.conflict_ids:
             _draw_diff_region(
                 self._graphe_scene,
                 nodes_by_id,
@@ -1299,7 +1382,10 @@ class VersionHistoryCanvas(InteractiveGraphView):
         max_y = max(node["y"] for node in nodes_by_id.values())
         scene_w = max(940, max_x + MARGIN + 40)
         scene_h = max_y + NODE_H + 40
-        self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + 28)
+        footer_h = 28
+        if any_unshared:
+            footer_h = 48
+        self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + footer_h)
 
         title_text = "%s — %d version(s)" % (
             self.graph_title,
@@ -1318,6 +1404,8 @@ class VersionHistoryCanvas(InteractiveGraphView):
         title.setFont(qt.QFont("Arial", 8))
         title.setDefaultTextColor(qt.QColor(_ui.GRAPH_TITLE))
         title.setPos(MARGIN, scene_h + 4)
+        if any_unshared:
+            _draw_share_status_legend(self._graphe_scene, MARGIN, scene_h + 22)
 
 
 def _compute_scene_bounds(nodes, padding=30):
