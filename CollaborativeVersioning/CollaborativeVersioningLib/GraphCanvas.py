@@ -1052,7 +1052,6 @@ class VersionHistoryCanvas(InteractiveGraphView):
         commit_history_by_id=None,
         parent=None,
         read_only=False,
-        highlight_ids=None,
         conflict_ids=None,
         diff_side=None,
         minimum_height=480,
@@ -1066,8 +1065,6 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.active_version_id = active_version_id
         self.commit_history_by_id = dict(commit_history_by_id or {})
         self.read_only = bool(read_only)
-        # id -> "local_only" | "remote_only" (legacy; unused for node fill now)
-        self.highlight_ids = dict(highlight_ids or {})
         self.conflict_ids = set(conflict_ids or ())
         # "local" | "shared" — caption wording next to the red diff pointer
         self.diff_side = str(diff_side or "").strip().lower()
@@ -1133,7 +1130,6 @@ class VersionHistoryCanvas(InteractiveGraphView):
         graph_description=None,
         active_version_id=None,
         commit_history_by_id=None,
-        highlight_ids=None,
         conflict_ids=None,
         diff_side=None,
         result_ids=None,
@@ -1151,8 +1147,6 @@ class VersionHistoryCanvas(InteractiveGraphView):
             self.active_version_id = active_version_id
         if commit_history_by_id is not None:
             self.commit_history_by_id = dict(commit_history_by_id)
-        if highlight_ids is not None:
-            self.highlight_ids = dict(highlight_ids)
         if conflict_ids is not None:
             self.conflict_ids = set(conflict_ids)
         if diff_side is not None:
@@ -1262,7 +1256,6 @@ class VersionHistoryCanvas(InteractiveGraphView):
             return
 
         positions, edges = _layout_version_graph(self.version_specs)
-        # Node green/red highlights removed — diffs use dashed red boxes only.
         self._nodes_by_id = positions
         nodes_by_id = positions
         trunk_order = _main_trunk_order(self.version_specs)

@@ -33,7 +33,6 @@ GRAPH_NODE_TEXT = ""
 GRAPH_EDGE = ""
 GRAPH_HINT = ""
 GRAPH_TITLE = ""
-COMMIT_STATUS_COLORS = {}
 
 DOCK_STYLE = ""
 DOCK_LOCKED_STYLE = ""
@@ -271,14 +270,6 @@ def apply_theme(force_dark=None) -> bool:
     palette = _palette_dark() if dark else _palette_light()
     globals().update(palette)
     globals()["IS_DARK"] = dark
-    globals()["COMMIT_STATUS_COLORS"] = {
-        "pushed": palette["ACCENT_MINT"],
-        "merged": palette["ACCENT_INDIGO"],
-        "accepted": palette["ACCENT_INDIGO"],
-        "to review": palette["ACCENT_AMBER"],
-        "declined": palette["TEXT_MUTED"],
-        "local": palette["TEXT_MUTED"],
-    }
     _rebuild_styles(dark)
     return dark
 

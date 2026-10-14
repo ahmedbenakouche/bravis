@@ -545,24 +545,6 @@ def _stage_and_commit(repo_dir: str, message: str, fail_prefix: str) -> None:
         raise GitHubAuthError("%s\n%s" % (fail_prefix, detail[:400]))
 
 
-def _commit_path_is_volume(path: str) -> bool:
-    name = os.path.basename((path or "").replace("\\", "/")).lower()
-    return "_volume" in name or "_reference" in name
-
-
-def _list_commit_paths(repo_dir: str, sha: str) -> list[str]:
-    result = _run_git(["ls-tree", "--name-only", "-r", sha], cwd=repo_dir, timeout=30)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise GitHubAuthError("Could not switch version.\n%s" % detail[:400])
-    paths = []
-    for line in (result.stdout or "").splitlines():
-        path = line.strip().replace("\\", "/")
-        if path:
-            paths.append(path)
-    return paths
-
-
 def head_can_update_shared_project(repo_dir: str) -> bool:
     """True when Share can add this computer's versions onto the shared project line."""
     head = _git_rev_parse(repo_dir, "HEAD")
@@ -1013,16 +995,6 @@ def _checkout_branch_at(repo_dir: str, branch: str, sha: str) -> None:
     reset = _run_git(["reset", "--hard", sha], cwd=repo_dir, timeout=180)
     if reset.returncode != 0:
         detail = (reset.stderr or reset.stdout or "").strip()
-        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
-
-
-def _restore_non_volume_worktree(repo_dir: str, sha: str) -> None:
-    paths = [path for path in _list_commit_paths(repo_dir, sha) if not _commit_path_is_volume(path)]
-    if not paths:
-        return
-    restored = _run_git(["checkout", sha, "--", *paths], cwd=repo_dir, timeout=60)
-    if restored.returncode != 0:
-        detail = (restored.stderr or restored.stdout or "").strip()
         raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
 
 
@@ -2016,20 +1988,12 @@ def read_compare_project_histories(
         "only_remote_shas": only_remote_shas,
         "only_local_ids_local": _ids_for_shas(local_model, only_local_shas),
         "only_remote_ids_remote": _ids_for_shas(remote_model, only_remote_shas),
-        "only_local_ids_result": _ids_for_shas(result_model, only_local_shas),
-        "only_remote_ids_result": _ids_for_shas(result_model, only_remote_shas),
         "conflict_ids_local": _ids_for_shas(local_model, conflict_local_shas),
         "conflict_ids_remote": _ids_for_shas(remote_model, conflict_remote_shas),
         "has_local_extras": has_local_extras,
         "has_remote_extras": has_remote_extras,
-        "has_local_main_extras": bool(only_local_main),
-        "has_remote_main_extras": bool(only_remote_main),
         "conflict": conflict,
         "aligned": aligned,
-        "origin_sha": origin or "",
-        "head_sha": head_sha or "",
-        "local_main_sha": local_main or "",
-        "main_merge_base": main_base or "",
     }
 
 

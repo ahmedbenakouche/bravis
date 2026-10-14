@@ -4,7 +4,6 @@ import importlib
 import logging
 import os
 import re
-import shutil
 import sys
 import time
 from datetime import datetime
@@ -135,7 +134,6 @@ from CollaborativeVersioningLib.UiStyles import (
     BTN_SECONDARY,
     BTN_NOTIFICATIONS,
     CHECKED_OUT_LABEL_STYLE,
-    COMMIT_STATUS_COLORS,
     DIALOG_HINT_STYLE,
     DOCK_LOCK_BANNER_STYLE,
     DOCK_BTN_LOCKED_STYLE,
@@ -192,7 +190,6 @@ _STYLE_EXPORTS = (
     "BTN_SECONDARY",
     "BTN_NOTIFICATIONS",
     "CHECKED_OUT_LABEL_STYLE",
-    "COMMIT_STATUS_COLORS",
     "DIALOG_HINT_STYLE",
     "DOCK_LOCK_BANNER_STYLE",
     "DOCK_BTN_LOCKED_STYLE",
@@ -552,9 +549,6 @@ class CompareWithSharedDialog(qt.QDialog):
     ACTION_RESET = "reset"
     ACTION_LINEAR = "linear"
     ACTION_MERGE = "merge"
-    # Backward-compatible aliases (older call sites / mental model).
-    ACTION_TAKE = ACTION_RESET
-    ACTION_COMBINE = ACTION_MERGE
 
     def __init__(self, parent, compare: dict | None = None) -> None:
         qt.QDialog.__init__(self, parent)
@@ -632,7 +626,6 @@ class CompareWithSharedDialog(qt.QDialog):
                 local_model.get("commit_history") or []
             ),
             read_only=True,
-            highlight_ids={},
             conflict_ids=diff_local,
             diff_side="local",
             minimum_height=200,
@@ -656,7 +649,6 @@ class CompareWithSharedDialog(qt.QDialog):
                 remote_model.get("commit_history") or []
             ),
             read_only=True,
-            highlight_ids={},
             conflict_ids=diff_remote,
             diff_side="shared",
             minimum_height=200,
@@ -1024,7 +1016,7 @@ class CompareWithSharedDialog(qt.QDialog):
         return set(roles.keys()), roles
 
     def _modelForChoice(self, choice: str) -> tuple:
-        """Return (model, highlight_dict, title, description) for the result preview."""
+        """Return (model, title, description) for the result preview."""
         local_model = self._compare.get("local") or {}
         remote_model = self._compare.get("remote") or {}
         linear_model = self._compare.get("linear") or remote_model
@@ -1032,33 +1024,28 @@ class CompareWithSharedDialog(qt.QDialog):
         if choice == self.ACTION_KEEP:
             return (
                 local_model,
-                {},
                 "Result — Keep mine",
                 "Local tip stays; shared tip is not applied",
             )
         if choice == self.ACTION_RESET:
             return (
                 remote_model,
-                {},
                 "Result — Reset to shared",
                 "This computer matches shared; conflicting local versions leave the main line",
             )
         if choice == self.ACTION_UPDATE:
             return (
                 remote_model,
-                {},
                 "Result — Update from shared",
                 "This computer follows the shared main tip",
             )
         if choice == self.ACTION_LINEAR:
             return (
                 linear_model,
-                {},
                 "Result — Add shared, then mine",
                 "Shared versions first, then your local work on top",
             )
         return (
-            {},
             {},
             "Result — Keep both (merge)",
             "Coming soon",
@@ -1084,7 +1071,7 @@ class CompareWithSharedDialog(qt.QDialog):
                 )
             return
 
-        model, highlight, title, description = self._modelForChoice(choice)
+        model, title, description = self._modelForChoice(choice)
         result_ids, result_roles = self._resultMarksForChoice(choice, model)
         gm = self._graph_module
         self._result_canvas.set_compare_content(
@@ -1095,7 +1082,6 @@ class CompareWithSharedDialog(qt.QDialog):
             commit_history_by_id=gm.commit_history_lookup(
                 model.get("commit_history") or []
             ),
-            highlight_ids=highlight,
             conflict_ids=set(),
             result_ids=result_ids,
             result_roles=result_roles,
@@ -6714,10 +6700,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         else:
             self._appendFeed("Added shared, then yours.")
 
-    def _getLatestSharedVersions(self) -> None:
-        """Compatibility: open compare flow (preferred) instead of silent fetch-only."""
-        self._openCompareWithShared()
-
     def _openNotificationDetail(self, item: dict) -> None:
         detail = NotificationDetailDialog(slicer.util.mainWindow(), item)
         detail.exec_()
@@ -7910,7 +7892,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return version_id
         return self._normalizeHistoryVersionId(item.text())
 
-    def _styleHistoryCell(self, item: qt.QTableWidgetItem, column: int, status: str = "", version_id: str = "") -> None:
+    def _styleHistoryCell(self, item: qt.QTableWidgetItem, column: int, version_id: str = "") -> None:
         if column == 0:
             branch = self._normalizeHistoryVersionId(
                 version_id or item.data(qt.Qt.UserRole) or item.text()
@@ -7932,7 +7914,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         commit_history = bundle.get("commit_history", [])
         self.historyTableWidget.setRowCount(len(commit_history))
         for row_index, row_values in enumerate(commit_history):
-            status = row_values[4] if len(row_values) > 4 else ""
             version_id = row_values[0]
             # Table shows Version / Date / Author / Message only (status = dashed box on graph).
             for column_index, value in enumerate(row_values[:4]):
@@ -7942,7 +7923,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     item.setData(qt.Qt.UserRole, version_id)
                 else:
                     item = qt.QTableWidgetItem(str(value))
-                self._styleHistoryCell(item, column_index, status, version_id=version_id)
+                self._styleHistoryCell(item, column_index, version_id=version_id)
                 self.historyTableWidget.setItem(row_index, column_index, item)
         self.historyTableWidget.resizeColumnsToContents()
         if self._currentVersionId:
