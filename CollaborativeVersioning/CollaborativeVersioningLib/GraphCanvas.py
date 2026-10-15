@@ -425,8 +425,10 @@ COMPARE_RESULT_COLOR = "#16a34a"  # green — Result preview (what this choice a
 
 
 def _branch_color(branch):
+    """Color for a version-tree lane (main + side branches). Shared with Version history."""
     if branch == "main":
-        return MAIN_COLOR
+        # Read theme live (MAIN_COLOR is only an import-time fallback).
+        return _ui.ACCENT_INDIGO or MAIN_COLOR or "#818cf8"
     # No green/red here — those are reserved for only-local / only-shared compare highlights.
     palette = [
         _ui.ACCENT_ICE,
@@ -440,6 +442,11 @@ def _branch_color(branch):
     for char in str(branch or ""):
         acc = (acc * 33 + ord(char)) % 2147483647
     return palette[acc % len(palette)]
+
+
+def branch_color(branch):
+    """Public alias used by Version history (must match Version tree boxes/edges)."""
+    return _branch_color(branch)
 
 
 def _ranges_overlap(first, second):
@@ -704,7 +711,8 @@ def _draw_checkout_pointer(scene, node, color=None):
         qt.QPointF(tip_x - 10, mid_y - 7),
         qt.QPointF(tip_x - 10, mid_y + 7),
     ]
-    pointer = color or _ui.ACCENT_INDIGO or "#818cf8"
+    # Checkout "cursor": mint green (same family as former HEAD_COLOR #6ee7b7).
+    pointer = color or _ui.ACCENT_MINT or "#6ee7b7"
     scene.addPolygon(
         qt.QPolygonF(points),
         qt.QPen(qt.QColor(pointer), 1),
@@ -1490,7 +1498,7 @@ class _VersionInfoDialog(qt.QDialog):
                 actions_row.addWidget(button)
 
             if allowed.get("submit"):
-                add_action("Submit", self._chooseSubmit, _ui.BTN_CREATE)
+                add_action("Request review", self._chooseSubmit, _ui.BTN_CREATE)
             if allowed.get("merge"):
                 add_action("Merge", self._chooseMerge, _ui.BTN_CREATE)
             if allowed.get("accept"):

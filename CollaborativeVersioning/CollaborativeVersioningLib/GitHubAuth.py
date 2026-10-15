@@ -2309,6 +2309,8 @@ _ACTIVITY_KINDS = frozenset(
     (
         "join",
         "assign",
+        "propose",
+        "claim",
         "cancel",
         "submit",
         "accept",
@@ -2552,9 +2554,18 @@ def _normalize_stored_tasks(document) -> list[dict[str, str]]:
             continue
         junior = normalize_github_username(str(item.get("junior") or ""))
         senior = normalize_github_username(str(item.get("senior") or ""))
-        if not junior or not senior:
+        if not junior:
             continue
-        tid = str(item.get("id") or "").strip() or ("%s-%s" % (junior, senior))
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind not in ("assigned", "voluntary"):
+            # Legacy tasks always had a senior → assigned.
+            kind = "voluntary" if not senior else "assigned"
+        # Assigned tasks need a senior; voluntary may be unclaimed (empty senior).
+        if kind == "assigned" and not senior:
+            continue
+        tid = str(item.get("id") or "").strip() or (
+            "%s-%s" % (junior, senior) if senior else "voluntary-%s" % junior
+        )
         key = tid.lower()
         if key in seen:
             continue
@@ -2566,6 +2577,7 @@ def _normalize_stored_tasks(document) -> list[dict[str, str]]:
             "id": tid,
             "junior": junior,
             "senior": senior,
+            "kind": kind,
             "description": normalize_task_title(item.get("description") or item.get("task") or ""),
             "status": status,
         }
