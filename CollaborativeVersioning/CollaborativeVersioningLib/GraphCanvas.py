@@ -409,12 +409,22 @@ def _draw_tree_edge(scene, parent, child, color=None, width=2):
         child_branch == "main" and parent_branch != "main"
     )
     if merge_in:
+        # Branch → main (Accept): arrive a bit above center on main.
         start_y = parent["y"] + parent["h"] if py <= cy else parent["y"]
+        shift = min(10.0, max(6.0, child["h"] * 0.22))
+        end_y = cy - shift
         end_x = child["x"] + child["w"] if px > cx else child["x"]
-        scene.addLine(px, start_y, px, cy, pen)
-        scene.addLine(px, cy, end_x, cy, pen)
+        scene.addLine(px, start_y, px, end_y, pen)
+        scene.addLine(px, end_y, end_x, end_y, pen)
         return
     start_x = parent["x"] + parent["w"] if cx > px else parent["x"]
+    # Main → branch (fork): leave a bit below center on main.
+    if parent_branch == "main" and child_branch != "main":
+        shift = min(10.0, max(6.0, parent["h"] * 0.22))
+        start_y = py + shift
+        scene.addLine(start_x, start_y, cx, start_y, pen)
+        scene.addLine(cx, start_y, cx, child["y"], pen)
+        return
     scene.addLine(start_x, py, cx, py, pen)
     scene.addLine(cx, py, cx, child["y"], pen)
 
@@ -429,19 +439,39 @@ def _branch_color(branch):
     if branch == "main":
         # Read theme live (MAIN_COLOR is only an import-time fallback).
         return _ui.ACCENT_INDIGO or MAIN_COLOR or "#818cf8"
-    # No green/red here — those are reserved for only-local / only-shared compare highlights.
-    palette = [
-        _ui.ACCENT_ICE,
-        _ui.ACCENT_AMBER,
-        _ui.ACCENT_INDIGO,
-        "#ea580c" if not _ui.IS_DARK else "#fb923c",
-        "#a78bfa" if not _ui.IS_DARK else "#c4b5fd",
-        "#ec4899" if not _ui.IS_DARK else "#f9a8d4",
-    ]
+    # Side branches: strong hue separation. Never reuse main indigo/violet, ice-blue,
+    # or compare red/green (diff / result outlines).
+    if getattr(_ui, "IS_DARK", True):
+        palette = [
+            "#f59e0b",  # amber
+            "#fb923c",  # orange
+            "#f472b6",  # pink
+            "#22d3ee",  # cyan
+            "#eab308",  # yellow
+            "#2dd4bf",  # teal
+            "#fdba74",  # peach
+            "#e879f9",  # magenta (far from indigo)
+            "#38bdf8",  # sky
+            "#fcd34d",  # gold
+        ]
+    else:
+        palette = [
+            "#d97706",  # amber
+            "#ea580c",  # orange
+            "#db2777",  # pink
+            "#0891b2",  # cyan
+            "#ca8a04",  # yellow
+            "#0f766e",  # teal
+            "#c2410c",  # burnt orange
+            "#a21caf",  # magenta
+            "#0284c7",  # sky
+            "#b45309",  # brown-gold
+        ]
     acc = 0
     for char in str(branch or ""):
         acc = (acc * 33 + ord(char)) % 2147483647
-    return palette[acc % len(palette)]
+    # Spread consecutive hash buckets around the palette (not just % len).
+    return palette[(acc * 7) % len(palette)]
 
 
 def branch_color(branch):
@@ -1454,7 +1484,7 @@ class _VersionInfoDialog(qt.QDialog):
 
         add_row("Version:", str(spec.get("tag", "")))
         line = spec.get("branch") or ""
-        add_row("Line:", "main" if line == "main" else str(line))
+        add_row("Branch:", "main" if line == "main" else str(line))
         add_row("Message:", message)
         add_row("Date:", history.get("date", ""))
         add_row("Author:", history.get("author", ""))

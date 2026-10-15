@@ -81,8 +81,8 @@ from CollaborativeVersioningLib.GitHubAuth import (
     open_login_window,
     open_or_update_local_project,
     fetch_remote_updates,
-    adopt_shared_main,
-    integrate_shared_linear,
+    adopt_shared_lanes,
+    integrate_shared_lanes,
     capture_remote_sync_caps,
     derive_remote_sync_caps_from_history,
     save_remote_sync_caps,
@@ -92,16 +92,18 @@ from CollaborativeVersioningLib.GitHubAuth import (
     remove_project_colleague,
     cancel_project_invitation,
     set_wait_callback,
-    share_local_versions,
-    publish_review_branch,
+    publish_current_line,
+    start_local_review_branch,
     accept_share_request,
     decline_share_request,
     suggest_github_usernames,
     work_is_on_review_branch,
-    review_lane_slug,
     review_branch_for,
+    current_review_branch_slug,
+    normalize_branch_slug,
     submit_review_line,
     find_open_review_request,
+    find_open_review_request_for_branch,
     PEOPLE_ACCESS_SENIOR,
     PEOPLE_ACCESS_JUNIOR,
 )
@@ -587,6 +589,22 @@ class CompareWithSharedDialog(qt.QDialog):
         self._pending = self.ACTION_NONE
         self._compare = dict(compare or {})
         self._conflict = bool(self._compare.get("conflict"))
+        self._conflict_lanes = [
+            str(name).strip()
+            for name in (self._compare.get("conflict_lanes") or ())
+            if str(name).strip()
+        ]
+        self._obsolete_merged = bool(self._compare.get("obsolete_merged"))
+        self._obsolete_merged_lanes = [
+            str(name).strip()
+            for name in (self._compare.get("obsolete_merged_lanes") or ())
+            if str(name).strip()
+        ]
+        self._reset_lanes = [
+            str(name).strip()
+            for name in (self._compare.get("reset_lanes") or ())
+            if str(name).strip()
+        ]
         self._aligned = bool(self._compare.get("aligned"))
         self._has_remote = bool(self._compare.get("has_remote_extras"))
         self._has_local = bool(self._compare.get("has_local_extras"))
@@ -728,8 +746,8 @@ class CompareWithSharedDialog(qt.QDialog):
         self._reset_btn = qt.QPushButton("Reset to shared")
         self._reset_btn.setStyleSheet(BTN_SECONDARY)
         self._reset_btn.setToolTip(
-            "Replace your local work with the shared work. "
-            "Conflicting local versions leave the main line."
+            "Replace conflicting local branches with the shared tips. "
+            "Other local branches stay. Conflicting local versions leave those lines."
         )
         self._reset_btn.connect(
             "clicked()", lambda: self._selectChoice(self.ACTION_RESET)
@@ -737,7 +755,8 @@ class CompareWithSharedDialog(qt.QDialog):
         self._linear_btn = qt.QPushButton("Add shared, then mine")
         self._linear_btn.setStyleSheet(BTN_SECONDARY)
         self._linear_btn.setToolTip(
-            "Take the shared versions first, then keep your local work on top of them."
+            "On conflicting branches only: take the shared versions first, "
+            "then keep your local work on top. Other local branches stay."
         )
         self._linear_btn.connect(
             "clicked()", lambda: self._selectChoice(self.ACTION_LINEAR)
@@ -759,11 +778,10 @@ class CompareWithSharedDialog(qt.QDialog):
         conflicts_layout.addLayout(choice_row)
 
         self._conflict_options_help = qt.QLabel(
-            "• Reset to shared — your local work is replaced by the shared work, "
-            "so this computer matches the shared project. "
-            "Warning: your conflicting saved versions will be removed from the main line.\n"
-            "• Add shared, then mine — take the shared versions, then keep your local work on top. "
-            "Warning: your versions will be placed after the shared versions.\n"
+            "• Reset to shared — conflicting branches match shared; other local branches stay. "
+            "Warning: conflicting saved versions leave those branch lines.\n"
+            "• Add shared, then mine — on conflicting branches only, take shared first, "
+            "then keep your local work on top. Other local branches stay.\n"
             "• Keep both (merge) — coming — keep both sides by merging annotations "
             "(not available yet)."
         )
@@ -916,11 +934,29 @@ class CompareWithSharedDialog(qt.QDialog):
         if body is not None:
             body.setText(str(text or "").strip())
 
+    def _lanesLabel(self, lanes) -> str:
+        names = [str(name).strip() for name in (lanes or ()) if str(name).strip()]
+        if not names:
+            return "the same branch"
+        if len(names) == 1:
+            return names[0]
+        if len(names) == 2:
+            return "%s and %s" % (names[0], names[1])
+        return "%s, and %s" % (", ".join(names[:-1]), names[-1])
+
+    def _conflictLanesLabel(self) -> str:
+        return self._lanesLabel(self._conflict_lanes)
+
     def _setupInitialState(self) -> None:
+        # Handled flows: tip conflict (3 buttons), obsolete merged branch (Reset),
+        # shared ahead with no tip conflict (Update — local unshared may also exist).
+        # Anything else: not handled yet.
         if self._conflict:
             self._setConflictsMessage(
-                "Your local project and the shared project have diverged on the same branch.\n"
-                "Choose how to integrate the shared versions, then Validate."
+                "Local and shared have diverged on: %s.\n"
+                "Reset / Add shared only change those branches; other local versions stay.\n"
+                "Choose how to integrate, then Validate."
+                % self._conflictLanesLabel()
             )
             self._update_choice_btn.hide()
             self._keep_btn.hide()
@@ -933,44 +969,46 @@ class CompareWithSharedDialog(qt.QDialog):
             return
 
         self._hideAllChoiceButtons()
-        if self._aligned:
+        if self._obsolete_merged:
+            branches = self._lanesLabel(self._obsolete_merged_lanes)
+            many = len(self._obsolete_merged_lanes) > 1
             self._setConflictsMessage(
-                "No conflicts — local and shared look aligned. You can close this window."
+                (
+                    "Branches %s were already merged onto main on the shared project.\n"
+                    "Your local versions on those branches are obsolete.\n"
+                    "Preview: Reset to shared. Click Validate to apply."
+                    if many
+                    else "Branch %s was already merged onto main on the shared project.\n"
+                    "Your local versions on that branch are obsolete.\n"
+                    "Preview: Reset to shared. Click Validate to apply."
+                )
+                % branches
             )
-            self._result_panel.hide()
-            self._validate_btn.setEnabled(False)
+            self._reset_btn.show()
+            self._selectChoice(self.ACTION_RESET, silent=True)
             return
-        if self._has_remote and not self._has_local:
-            self._setConflictsMessage(
-                "No conflicts — the shared project has newer versions. "
-                "Preview below shows the result after integrating them into your local folder. "
-                "Click Validate to apply."
-            )
+        if self._has_remote:
+            # No tip fork: show shared updates in the Version tree. Local unshared stay.
+            if self._has_local:
+                self._setConflictsMessage(
+                    "No tip conflict — the shared project has newer versions, "
+                    "and you also have local versions not shared yet.\n"
+                    "Preview: Update version tree (your local unshared versions stay). "
+                    "Click Validate to apply."
+                )
+            else:
+                self._setConflictsMessage(
+                    "No conflicts — the shared project has newer versions. "
+                    "Preview below shows the result after integrating them into your local folder. "
+                    "Click Validate to apply."
+                )
             self._selectChoice(self.ACTION_UPDATE, silent=True)
             return
-        if self._has_local and not self._has_remote:
-            self._setConflictsMessage(
-                "No conflicts — you have local versions not on the shared project yet. "
-                "Share when you are ready. Preview below keeps your local graph "
-                "(Version tree stays unchanged until you Validate an update)."
-            )
-            self._selectChoice(self.ACTION_KEEP, silent=True)
-            return
-        if self._has_local and self._has_remote:
-            self._setConflictsMessage(
-                "No conflict on main — but each side has versions the other does not "
-                "(for example a shared review branch, and/or local unshared work).\n"
-                "Choose Update version tree (see shared changes in the tree) or Keep mine, then Validate."
-            )
-            self._update_choice_btn.show()
-            self._keep_btn.show()
-            self._reset_btn.hide()
-            self._linear_btn.hide()
-            self._merge_btn.hide()
-            self._result_panel.hide()
-            self._validate_btn.setEnabled(False)
-            return
-        self._setConflictsMessage("No conflicts to resolve. Review the graphs, then close.")
+
+        self._setConflictsMessage(
+            "This case is not handled yet.\n"
+            "Ask the developer to integrate it."
+        )
         self._result_panel.hide()
         self._validate_btn.setEnabled(False)
 
@@ -1012,8 +1050,11 @@ class CompareWithSharedDialog(qt.QDialog):
             for vid in self._idsForShas(model, local_mark):
                 roles[vid] = "local"
         elif choice == self.ACTION_UPDATE:
+            # Shared tips acknowledged + local unshared kept.
             for vid in self._idsForShas(model, only_remote):
                 roles[vid] = "shared"
+            for vid in self._idsForShas(model, only_local):
+                roles[vid] = "local"
         elif choice == self.ACTION_KEEP:
             for vid in self._idsForShas(model, only_local):
                 roles[vid] = "local"
@@ -1023,7 +1064,11 @@ class CompareWithSharedDialog(qt.QDialog):
         """Return (model, title, description) for the result preview."""
         local_model = self._compare.get("local") or {}
         remote_model = self._compare.get("remote") or {}
+        # Union preview: shared tips + local review tips (Update keeps unshared).
+        update_model = self._compare.get("result") or remote_model
         linear_model = self._compare.get("linear") or remote_model
+        reset_model = self._compare.get("reset") or remote_model
+        lanes = self._conflictLanesLabel()
 
         if choice == self.ACTION_KEEP:
             return (
@@ -1032,22 +1077,32 @@ class CompareWithSharedDialog(qt.QDialog):
                 "Local tip stays; shared tip is not applied",
             )
         if choice == self.ACTION_RESET:
+            reset_lanes = self._lanesLabel(
+                self._reset_lanes or self._conflict_lanes or self._obsolete_merged_lanes
+            )
             return (
-                remote_model,
+                reset_model,
                 "Result — Reset to shared",
-                "This computer matches shared; conflicting local versions leave the main line",
+                "Branches (%s) match shared; other local versions stay" % reset_lanes,
             )
         if choice == self.ACTION_UPDATE:
+            if self._has_local:
+                return (
+                    update_model,
+                    "Result — Update from shared",
+                    "Shared versions added; your local unshared versions stay",
+                )
             return (
                 remote_model,
                 "Result — Update from shared",
-                "This computer follows the shared main tip",
+                "This computer follows the shared tips",
             )
         if choice == self.ACTION_LINEAR:
             return (
                 linear_model,
                 "Result — Add shared, then mine",
-                "Shared versions first, then your local work on top",
+                "On %s: shared first, then your local work; other branches stay"
+                % lanes,
             )
         return (
             {},
@@ -1270,7 +1325,7 @@ class PeopleDialog(qt.QDialog):
             "They will receive an invitation. After they accept, the project appears in their list.\n"
             "Senior: can assign Tasks, claim Voluntary tasks, share onto main, "
             "and Accept / Decline a junior's review request.\n"
-            "Junior: can work on the project, share on their own line beside main, "
+            "Junior: can work on the project, share on their own branch, "
             "and Propose a Voluntary task (or wait for a Task) before Request review."
         )
         owner_hint.setWordWrap(True)
@@ -2499,8 +2554,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.peopleButton.setToolTip("See who is on this project")
         self.deleteButton.setToolTip("Delete this project (owner only)")
         self.openButton.setToolTip("Open a selected project that is not loaded yet")
-        self.saveVersionButton.setToolTip("Save a version when the current work has changed")
-        self.shareButton.setToolTip("Share a saved version that is not shared yet")
+        self.saveVersionButton.setToolTip(
+            "Save a version locally (on main or another branch)"
+        )
+        self.shareButton.setToolTip(
+            "Publish the current branch to the shared project"
+        )
         for btn in (self.createButton, self.peopleButton, self.deleteButton):
             btn.setEnabled(False)
             btn.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
@@ -3001,22 +3060,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.exec_()
         return box.clickedButton() == switch_btn
 
-    def _promptShareDestination(self, on_branch: bool) -> str:
+    def _promptSaveDestination(self) -> str:
+        """When saving from main: Put on main / Create a branch / cancel."""
         box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Share")
-        box.setText("Share these versions?")
-        if on_branch:
-            box.setInformativeText(
-                "Put them on main, or update your branch beside main."
-            )
-            branch_label = "Update branch"
-        else:
-            box.setInformativeText(
-                "Put them on main, or create a branch beside main."
-            )
-            branch_label = "Create a branch"
+        box.setWindowTitle("Save version")
+        box.setText("Where should this version be saved?")
+        box.setInformativeText(
+            "Put on main — save on main.\n"
+            "Create a branch — create a new branch and save your changes there."
+        )
         main_btn = box.addButton("Put on main", qt.QMessageBox.AcceptRole)
-        branch_btn = box.addButton(branch_label, qt.QMessageBox.ActionRole)
+        branch_btn = box.addButton("Create a branch", qt.QMessageBox.ActionRole)
         box.addButton("Cancel", qt.QMessageBox.RejectRole)
         box.setDefaultButton(main_btn)
         box.exec_()
@@ -3026,6 +3080,51 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if clicked == branch_btn:
             return "branch"
         return "cancel"
+
+    def _promptBranchName(self) -> str:
+        """Ask for a branch name (Create a branch). Empty = cancelled."""
+        name, ok = _qt_input_text(
+            slicer.util.mainWindow(),
+            "Branch name",
+            "Name for this branch:",
+            "",
+        )
+        if not ok:
+            return ""
+        slug = normalize_branch_slug(name)
+        if not slug:
+            self._appendFeed("Enter a valid branch name.", error=True)
+            return ""
+        return slug
+
+    def _confirmShareCurrentLine(self, local_path: str) -> bool:
+        """Explain exactly what Share will publish on the current branch."""
+        on_branch = False
+        slug = ""
+        try:
+            on_branch = work_is_on_review_branch(local_path)
+            slug = current_review_branch_slug(local_path) if on_branch else ""
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            on_branch = False
+            slug = ""
+        branch = slug or "main"
+        tip = str(getattr(self, "_currentVersionId", None) or "").strip() or "the current tip"
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Share")
+        box.setIcon(qt.QMessageBox.Question)
+        box.setText("Publish this branch to the shared project?")
+        box.setInformativeText(
+            "Branch: %s\n"
+            "Up to: %s\n\n"
+            "This shares all unshared versions on this branch up to that tip.\n"
+            "Other local branches are not shared."
+            % (branch, tip)
+        )
+        share_btn = box.addButton("Share", qt.QMessageBox.AcceptRole)
+        box.addButton("Cancel", qt.QMessageBox.RejectRole)
+        box.setDefaultButton(share_btn)
+        box.exec_()
+        return box.clickedButton() == share_btn
 
     def _githubLogin(self) -> str:
         session = getattr(self, "_github_session", None) or {}
@@ -3589,10 +3688,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.shareButton.setEnabled(True)
         if not share_ok:
             self.shareButton.setToolTip(self._shareDisabledReason())
-        elif self._shareNeedsApproval():
-            self.shareButton.setToolTip("Share on your branch beside main")
         else:
-            self.shareButton.setToolTip("Share to main or create a branch")
+            self.shareButton.setToolTip(
+                "Publish the current branch (main or another branch) to the shared project"
+            )
         can_people = self._canOpenPeople()
         self.peopleButton.setStyleSheet(BTN_PEOPLE)
         self.peopleButton.setEnabled(True)
@@ -3689,7 +3788,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _historyHasUnsharedVersion(self, history: dict | None = None) -> bool:
         bundle = history if history is not None else getattr(self, "_project_history_bundle", None)
         for row in (bundle or {}).get("commit_history") or []:
-            if len(row) > 4 and str(row[4]).lower() in ("local", "to review"):
+            if len(row) > 4 and str(row[4]).lower() == "local":
                 return True
         return False
 
@@ -6880,11 +6979,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if action == CompareWithSharedDialog.ACTION_UPDATE:
             self._applySharedVersionsUpdate(local_path, fetched=True)
             return
+        conflict_lanes = list(getattr(dialog, "_conflict_lanes", None) or [])
+        if not conflict_lanes:
+            conflict_lanes = list((compare or {}).get("conflict_lanes") or [])
+        reset_lanes = list(getattr(dialog, "_reset_lanes", None) or [])
+        if not reset_lanes:
+            reset_lanes = list((compare or {}).get("reset_lanes") or conflict_lanes)
         if action == CompareWithSharedDialog.ACTION_RESET:
-            self._resetToSharedVersions(local_path)
+            self._resetToSharedVersions(local_path, reset_lanes or conflict_lanes)
             return
         if action == CompareWithSharedDialog.ACTION_LINEAR:
-            self._integrateSharedLinear(local_path)
+            self._integrateSharedLinear(local_path, conflict_lanes)
             return
         # Cancel / Keep / Merge-coming: keep frozen tree + keep peek caps (no new remote tips in UI).
         if peek_caps is not None:
@@ -6930,14 +7035,23 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateNotificationsBadge()
         self._appendFeed("Updated the version tree from the shared project.")
 
-    def _resetToSharedVersions(self, local_path: str) -> None:
-        """Adopt origin/main as local main (worktree moves to shared tip)."""
+    def _resetToSharedVersions(self, local_path: str, conflict_lanes=None) -> None:
+        """Adopt shared tips for conflicting lanes only (others stay local)."""
+        lanes = [
+            str(name).strip()
+            for name in (conflict_lanes or ())
+            if str(name).strip()
+        ] or ["main"]
+        lanes_label = ", ".join(lanes)
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Reset to shared")
         box.setIcon(qt.QMessageBox.Warning)
         box.setText(
-            "Replace your local work with the shared work?\n\n"
-            "Warning: your conflicting saved versions will be removed from the main line."
+            "Reset conflicting branches to the shared tips?\n\n"
+            "Branches: %s\n"
+            "Other local branches stay unchanged.\n\n"
+            "Warning: conflicting saved versions leave those branch lines."
+            % lanes_label
         )
         box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
         box.button(qt.QMessageBox.Ok).setText("Reset to shared")
@@ -6945,10 +7059,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if box.exec_() != qt.QMessageBox.Ok:
             return
         project = self._currentProjectName()
-        self._openProgress("Reset to shared", "Moving to the shared tip…")
+        self._openProgress("Reset to shared", "Moving conflicting branches to shared…")
         try:
-            self._updateProgress("Moving to the shared tip…")
-            adopt_shared_main(local_path)
+            self._updateProgress("Moving conflicting branches to shared…")
+            adopt_shared_lanes(local_path, lanes)
             save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
@@ -6969,18 +7083,29 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateVersionActionButtons()
         self._updateNotificationsBadge()
         if version_id:
-            self._appendFeed("Reset to the shared tip (%s)." % version_id)
+            self._appendFeed(
+                "Reset conflicting branches (%s). Tip: %s." % (lanes_label, version_id)
+            )
         else:
-            self._appendFeed("Reset to the shared tip.")
+            self._appendFeed("Reset conflicting branches (%s)." % lanes_label)
 
-    def _integrateSharedLinear(self, local_path: str) -> None:
-        """Rebase local-only main commits onto origin/main."""
+    def _integrateSharedLinear(self, local_path: str, conflict_lanes=None) -> None:
+        """Linear-integrate conflicting lanes only onto their shared tips."""
+        lanes = [
+            str(name).strip()
+            for name in (conflict_lanes or ())
+            if str(name).strip()
+        ] or ["main"]
+        lanes_label = ", ".join(lanes)
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Add shared, then mine")
         box.setIcon(qt.QMessageBox.Warning)
         box.setText(
-            "Add the shared versions, then keep your local work on top?\n\n"
-            "Warning: your versions will be placed after the shared versions."
+            "On conflicting branches, add shared versions then keep yours on top?\n\n"
+            "Branches: %s\n"
+            "Other local branches stay unchanged.\n\n"
+            "Warning: on those branches, your versions will be placed after the shared versions."
+            % lanes_label
         )
         box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
         box.button(qt.QMessageBox.Ok).setText("Add shared, then mine")
@@ -6991,7 +7116,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._openProgress("Add shared, then mine", "Adding shared, then your work…")
         try:
             self._updateProgress("Adding shared, then your work…")
-            integrate_shared_linear(local_path)
+            integrate_shared_lanes(local_path, lanes)
             save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
@@ -7019,10 +7144,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateNotificationsBadge()
         if version_id:
             self._appendFeed(
-                "Added shared, then yours. New tip: %s." % version_id
+                "Added shared, then yours on %s. Tip: %s." % (lanes_label, version_id)
             )
         else:
-            self._appendFeed("Added shared, then yours.")
+            self._appendFeed("Added shared, then yours on %s." % lanes_label)
 
     def _openNotificationDetail(self, item: dict) -> None:
         detail = NotificationDetailDialog(slicer.util.mainWindow(), item)
@@ -7051,6 +7176,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._markNotificationRead(invitation)
         self._openNotificationDetail(invitation)
 
+    def _currentNamedBranchSlug(self) -> str:
+        local_path = getattr(self, "_local_project_path", None) or ""
+        if not local_path:
+            return ""
+        try:
+            return current_review_branch_slug(local_path) or ""
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            return ""
+
     def _taskRoleForLane(self, lane: str):
         lane_key = str(lane or "").strip().lower()
         if not lane_key or lane_key == "main":
@@ -7058,31 +7192,59 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         me = (self._githubLogin() or "").strip().lower()
         if not me:
             return None
+        current_slug = self._currentNamedBranchSlug().lower()
         own = None
         review = None
+        full_name = self._currentProjectName()
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "") == "accepted":
                 continue
             junior = str(task.get("junior") or "").strip()
             senior = str(task.get("senior") or "").strip()
-            if review_lane_slug(junior).lower() != lane_key:
+            if not junior:
                 continue
-            if junior.lower() == me:
-                own = task
-            elif senior.lower() == me:
+            junior_key = junior.lower()
+            if junior_key == me:
+                if current_slug and lane_key == current_slug:
+                    own = task
+                continue
+            if senior.lower() != me:
+                continue
+            try:
+                req = find_open_review_request_for_branch(full_name, lane_key)
+            except (GitHubAuthError, OSError, RuntimeError, ValueError):
+                req = None
+            if req and str(req.get("author") or "").strip().lower() == junior_key:
                 review = task
+                continue
+            try:
+                req2 = find_open_review_request(full_name, junior)
+            except (GitHubAuthError, OSError, RuntimeError, ValueError):
+                req2 = None
+            if req2:
+                head = str(req2.get("branch") or "").strip()
+                head_slug = head.split("/")[-1].lower() if head else ""
+                if head_slug == lane_key:
+                    review = task
         if own:
             return ("submit", own)
         if review:
             return ("review", review)
         return None
 
-    def _openReviewForJunior(self, junior: str) -> dict | None:
+    def _openReviewForJunior(self, junior: str, lane: str = "") -> dict | None:
         name = str(junior or "").strip()
         if not name:
             return None
         full_name = self._currentProjectName()
-        branch = review_branch_for(name).lower()
+        lane_key = str(lane or "").strip()
+        if lane_key and lane_key.lower() != "main":
+            try:
+                by_lane = find_open_review_request_for_branch(full_name, lane_key)
+            except (GitHubAuthError, OSError, RuntimeError, ValueError):
+                by_lane = None
+            if by_lane:
+                return by_lane
         for item in getattr(self, "_notifications", []) or []:
             if str(item.get("kind") or "") != "review":
                 continue
@@ -7090,18 +7252,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 continue
             author = str(item.get("author") or "").strip().lower()
             item_branch = str(item.get("branch") or "").strip().lower()
-            if author == name.lower() or (branch and item_branch == branch):
-                return item
+            if author == name.lower() and item_branch.startswith("cv-review/"):
+                if not lane_key or item_branch.endswith("/" + lane_key.lower()):
+                    return item
         try:
             return find_open_review_request(full_name, name)
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             return None
 
     def _isOwnReviewLane(self, lane: str) -> bool:
-        me = (self._githubLogin() or "").strip()
-        mine = review_lane_slug(me)
         key = str(lane or "").strip().lower()
-        return bool(me and mine and key and key == mine.lower() and key != "main")
+        if not key or key == "main":
+            return False
+        current = self._currentNamedBranchSlug().lower()
+        return bool(current and current == key)
 
     def _reviewActionsForVersion(self, spec, history) -> dict:
         lane = str((spec or {}).get("branch") or "")
@@ -7123,7 +7287,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if kind == "submit":
             payload["submit"] = True
             return payload
-        request = self._openReviewForJunior(str(task.get("junior") or ""))
+        request = self._openReviewForJunior(str(task.get("junior") or ""), lane=lane)
         if not request:
             return {}
         payload["accept"] = True
@@ -7135,15 +7299,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         role = self._taskRoleForLane(lane)
         if action == "merge":
             if not self._canAssignTask() or not self._isOwnReviewLane(lane):
-                self._appendFeed("You can merge only your own line.", error=True)
+                self._appendFeed("You can merge only your own branch.", error=True)
                 return
-            self._mergeOwnReviewLine()
+            self._mergeOwnReviewLine(lane)
             return
         if action == "submit":
             if not role or role[0] != "submit":
-                self._appendFeed("You can request a review only on your own line.", error=True)
+                self._appendFeed("You can request a review only on your own branch.", error=True)
                 return
-            self._submitOwnReviewLine()
+            self._submitOwnReviewLine(lane)
             return
         if action not in ("accept", "decline"):
             return
@@ -7154,17 +7318,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
             return
         try:
-            request = self._openReviewForJunior(str(role[1].get("junior") or ""))
+            request = self._openReviewForJunior(str(role[1].get("junior") or ""), lane=lane)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
         if not request:
-            self._appendFeed("Nothing is waiting for review on this line.", error=True)
+            self._appendFeed("Nothing is waiting for review on this branch.", error=True)
             return
         junior = str(role[1].get("junior") or "this junior")
         if action == "accept":
             confirmed = slicer.util.confirmYesNoDisplay(
-                "Accept %s's line onto main?" % junior,
+                "Accept %s's version onto main and publish it to the shared project?"
+                % junior,
                 windowTitle="Accept",
             )
             if not confirmed:
@@ -7173,7 +7338,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._markTaskAccepted(role[1])
         else:
             confirmed = slicer.util.confirmYesNoDisplay(
-                "Decline %s's line?\n\nThe versions stay in the version tree." % junior,
+                "Decline %s's branch?\n\nThe versions stay in the version tree." % junior,
                 windowTitle="Decline",
             )
             if not confirmed:
@@ -7181,21 +7346,25 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._declineReviewedShareRequest(request)
         self._updateActiveVersionIndicators()
 
-    def _mergeOwnReviewLine(self) -> None:
-        """Senior/owner: put their own shared line onto main (same merge as Accept)."""
+    def _mergeOwnReviewLine(self, lane: str = "") -> None:
+        """Senior/owner: put their own shared named branch onto main (same merge as Accept)."""
         me = (self._githubLogin() or "").strip()
         if not me or not self._canAssignTask():
-            self._appendFeed("Only a senior can merge their line onto main.", error=True)
+            self._appendFeed("Only a senior can merge their branch onto main.", error=True)
+            return
+        slug = normalize_branch_slug(lane) or self._currentNamedBranchSlug()
+        if not slug:
+            self._appendFeed("Switch to your branch first.", error=True)
             return
         confirmed = slicer.util.confirmYesNoDisplay(
-            "Merge your line onto main?",
+            "Merge branch %s onto main and publish it to the shared project?" % slug,
             windowTitle="Merge",
         )
         if not confirmed:
             return
         request = {
             "full_name": self._currentProjectName(),
-            "branch": review_branch_for(me),
+            "branch": review_branch_for(slug),
             "number": None,
             "author": me,
         }
@@ -7203,20 +7372,24 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._recordActivity(
                 self._currentProjectName(),
                 "accept",
-                "%s merged their line onto main." % (me or "Someone"),
+                "%s merged branch %s onto main." % (me or "Someone", slug),
             )
             self._updateActiveVersionIndicators()
 
-    def _submitOwnReviewLine(self) -> None:
-        role = self._taskRoleForLane(review_lane_slug(self._githubLogin()))
+    def _submitOwnReviewLine(self, lane: str = "") -> None:
+        slug = normalize_branch_slug(lane) or self._currentNamedBranchSlug()
+        if not slug:
+            self._appendFeed("Share a branch first.", error=True)
+            return
+        role = self._taskRoleForLane(slug)
         if not role or role[0] != "submit":
-            self._appendFeed("You can request a review only on your own line.", error=True)
+            self._appendFeed("You can request a review only on your own branch.", error=True)
             return
         task = role[1]
         description = str(task.get("description") or "").strip()
-        if self._openReviewForJunior(self._githubLogin()):
+        if self._openReviewForJunior(self._githubLogin(), lane=slug):
             slicer.util.infoDisplay(
-                "A review is already requested for your line.",
+                "A review is already requested for this branch.",
                 windowTitle="Review already requested",
             )
             return
@@ -7224,7 +7397,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._openProgress("Request review", "Asking for a review…")
         try:
             self._updateProgress("Asking for a review…")
-            outcome = submit_review_line(full_name)
+            outcome = submit_review_line(full_name, slug)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._appendFeed(str(error).split("\n")[0], error=True)
@@ -7234,12 +7407,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if str(task.get("status") or "") != "submitted":
                 self._markTaskSubmitted(task, description)
             slicer.util.infoDisplay(
-                "A review is already requested for your line.",
+                "A review is already requested for this branch.",
                 windowTitle="Review already requested",
             )
             return
         self._markTaskSubmitted(task, description)
-        self._appendFeed("Review requested. Your line is not on main yet.")
+        self._appendFeed("Review requested. This branch is not on main yet.")
 
     def _markTaskSubmitted(self, task: dict, description: str) -> None:
         junior = str((task or {}).get("junior") or "").strip()
@@ -7291,6 +7464,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         try:
             self._updateProgress("Adding the version to the project…")
             local_path = accept_share_request(full_name, request.get("branch") or "", request.get("number"))
+            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
@@ -7510,6 +7684,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not self._ontology_document:
                 self._appendFeed("Fill project data first: Ontology map.", error=True)
                 return
+        on_branch = False
+        try:
+            on_branch = work_is_on_review_branch(local_path)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            on_branch = False
+        new_branch_slug = ""
+        if not on_branch:
+            destination = self._promptSaveDestination()
+            if destination == "cancel":
+                self._appendFeed("Save cancelled.")
+                return
+            if destination == "branch":
+                new_branch_slug = self._promptBranchName()
+                if not new_branch_slug:
+                    self._appendFeed("Save cancelled.")
+                    return
         default_message = "First version" if not self._currentVersionId else "New version"
         message = self._promptCommitMessage(
             "Save version",
@@ -7542,6 +7732,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 write_segmentation=write_segmentation,
                 write_ontology=write_ontology,
             )
+            if new_branch_slug:
+                self._updateProgress("Creating branch %s…" % new_branch_slug)
+                start_local_review_branch(local_path, new_branch_slug)
             self._updateProgress("Saving the version…")
             commit_local_version(local_path, message)
             self._updateProgress("Updating version history…")
@@ -7568,6 +7761,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Version saved: %s — %s" % (version_id, message))
         else:
             self._appendFeed("Version saved: %s" % message)
+        if new_branch_slug:
+            self._appendFeed(
+                "Saved on branch %s (local only until you Share)." % new_branch_slug
+            )
 
     def onShare(self) -> None:
         if not self._connected:
@@ -7582,41 +7779,43 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
             self._appendFeed("Open the project first.", error=True)
             return
-        full_name = self._currentProjectName()
-        needs_approval = False
-        try:
-            needs_approval = (
-                not self._isCurrentProjectOwner()
-                and self._rememberPeopleAccess(full_name) == PEOPLE_ACCESS_JUNIOR
-            )
-        except (GitHubAuthError, OSError, RuntimeError, ValueError):
-            needs_approval = self._shareNeedsApproval()
-        self.shareButton.setEnabled(False)
-        if needs_approval:
-            self._shareAsBranch(local_path)
-            return
         on_branch = False
         try:
             on_branch = work_is_on_review_branch(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             on_branch = False
-        choice = self._promptShareDestination(on_branch)
-        if choice == "cancel":
+        # Juniors publish a branch only (main stays for seniors / Merge-Accept).
+        if self._shareNeedsApproval() and not on_branch:
+            self._appendFeed(
+                "Save on a branch first (Create a branch), then Share.",
+                error=True,
+            )
+            self._updateVersionActionButtons()
+            return
+        if not self._confirmShareCurrentLine(local_path):
             self._appendFeed("Share cancelled.")
             self._updateVersionActionButtons()
             return
-        if choice == "branch":
-            self._shareAsBranch(local_path)
-        else:
-            self._shareToProject(local_path)
+        self.shareButton.setEnabled(False)
+        self._publishCurrentLine(local_path)
 
-    def _shareToProject(self, local_path: str) -> None:
-        self._appendFeed("Sharing project…")
-        self._openProgress("Share", "Sharing the project…")
-        history = {}
+    def _publishCurrentLine(self, local_path: str) -> None:
+        """Push only the current branch (main or another branch) to the shared project."""
         try:
-            self._updateProgress("Sharing the project…")
-            share_local_versions(local_path)
+            on_branch = work_is_on_review_branch(local_path)
+            slug = current_review_branch_slug(local_path) if on_branch else ""
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            on_branch = False
+            slug = ""
+        branch = slug or "main"
+        self._appendFeed("Sharing %s…" % branch)
+        self._openProgress("Share", "Publishing %s…" % branch)
+        history = {}
+        published = branch
+        try:
+            self._updateProgress("Publishing %s…" % branch)
+            published = publish_current_line(local_path)
+            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
@@ -7632,51 +7831,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._refreshUiState()
         self._unshared_version = unshared
         self._updateVersionActionButtons()
-        self._appendFeed("Project shared on main.")
+        me = self._githubLogin() or "Someone"
+        if published == "main":
+            self._appendFeed("Shared on main.")
+            share_event = self._buildActivityEvent(
+                "share", "%s shared versions on main." % me
+            )
+        else:
+            label = published or branch
+            self._appendFeed("Shared on branch %s." % label)
+            share_event = self._buildActivityEvent(
+                "share", "%s shared versions on branch %s." % (me, label)
+            )
+            slicer.util.infoDisplay(
+                self._shareLineNextStepMessage(),
+                windowTitle="Share",
+            )
         if self._unsaved_changes:
             self._appendFeed(
                 "Unsaved changes are still on this computer. Save a version if you want them shared later."
             )
-        # Timestamp frozen at Share success; network publish after UI feedback.
-        me = self._githubLogin() or "Someone"
-        share_event = self._buildActivityEvent(
-            "share", "%s shared versions on main." % me
-        )
-        if share_event:
-            self._recordActivity(self._currentProjectName(), event=share_event)
-
-    def _shareAsBranch(self, local_path: str) -> None:
-        self._appendFeed("Sharing on a branch beside main…")
-        self._openProgress("Share", "Sharing on a branch beside main…")
-        history = {}
-        try:
-            self._updateProgress("Sharing on a branch beside main…")
-            publish_review_branch(local_path)
-            self._updateProgress("Updating version history…")
-            history = read_project_history(local_path)
-        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            self._closeProgress()
-            self._updateVersionActionButtons()
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
-            return
-        unshared = self._historyHasUnsharedVersion(history)
-        self._applyProjectHistoryBundle(history, follow_head=True)
-        self._unshared_version = unshared
-        self._closeProgress()
-        self._refreshUiState()
-        self._unshared_version = unshared
-        self._updateVersionActionButtons()
-        me = self._githubLogin() or "Someone"
-        # Freeze notif time at Share success (before popup / network publish).
-        share_event = self._buildActivityEvent(
-            "share", "%s shared versions on their line." % me
-        )
-        self._appendFeed("Shared on your line.")
-        slicer.util.infoDisplay(
-            self._shareLineNextStepMessage(),
-            windowTitle="Share",
-        )
         if share_event:
             self._recordActivity(self._currentProjectName(), event=share_event)
 
@@ -7697,17 +7871,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _shareLineNextStepMessage(self) -> str:
         if self._canAssignTask():
             return (
-                "Shared on your line. If you want to put it on main, open your line "
-                "in the version tree and Merge."
+                "Shared on your branch. If you want to put it on main, open that "
+                "branch in the version tree and Merge."
             )
         if self._hasActiveTaskAsJunior():
             return (
-                "Shared on your line. Next: open your line in the version tree → "
-                "Request review."
+                "Shared on your branch. Next: open that branch in the version "
+                "tree → Request review."
             )
         return (
-            "Shared on your line. To request a review, open My task and Propose a "
-            "Voluntary task (or ask a senior to Assign you one)."
+            "Shared on your branch. To request a review, open My task and "
+            "Propose a Voluntary task (or ask a senior to Assign you one)."
         )
 
     def _positionTaskBadge(self) -> None:
