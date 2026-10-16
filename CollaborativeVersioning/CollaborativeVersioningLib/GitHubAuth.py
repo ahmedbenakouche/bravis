@@ -798,34 +798,6 @@ def _merge_head_into_shared_project(repo_dir: str, login: str) -> None:
     _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
 
 
-def _publish_current_review_line(repo_dir: str, _login: str = "") -> None:
-    """If HEAD is on a named cv-review/* branch, publish that branch tip."""
-    current = _current_branch_name(repo_dir)
-    if not current.startswith("cv-review/"):
-        return
-    head = _git_rev_parse(repo_dir, "HEAD")
-    if not head:
-        return
-    push = _run_git(
-        ["push", "origin", "HEAD:refs/heads/%s" % current],
-        cwd=repo_dir,
-        timeout=180,
-    )
-    if push.returncode != 0:
-        raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
-    _run_git(["update-ref", "refs/remotes/origin/%s" % current, head], cwd=repo_dir, timeout=20)
-
-
-def _return_head_to_main(repo_dir: str) -> None:
-    """After Share, work from main again so Open can update the shared project."""
-    main = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(repo_dir, "origin/main")
-    if not main:
-        return
-    if _current_branch_name(repo_dir) != "main":
-        _point_head_at(repo_dir, "main", main)
-    _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
-
-
 def people_access_for(full_name: str, login: str | None = None) -> str:
     """senior = share now; junior = needs review. Owner is always senior."""
     owner, _repo = _split_project_name(full_name)
@@ -1338,46 +1310,6 @@ def accept_share_request(full_name: str, branch: str, number) -> str:
     return dest
 
 
-def _declined_shas_path(repo_dir: str) -> str:
-    return os.path.join(repo_dir, ".git", "cv-declined-shas")
-
-
-def _load_declined_shas(repo_dir: str) -> set[str]:
-    try:
-        with open(_declined_shas_path(repo_dir), encoding="utf-8") as handle:
-            raw = json.load(handle)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return set()
-    if not isinstance(raw, list):
-        return set()
-    return {str(item).strip() for item in raw if str(item).strip()}
-
-
-def _remember_declined_shas(repo_dir: str, shas) -> None:
-    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
-        return
-    current = _load_declined_shas(repo_dir)
-    current.update(str(sha).strip() for sha in (shas or []) if str(sha).strip())
-    try:
-        with open(_declined_shas_path(repo_dir), "w", encoding="utf-8") as handle:
-            json.dump(sorted(current), handle)
-    except OSError:
-        return
-
-
-def _unique_commits_not_on_main(repo_dir: str, tip: str) -> set[str]:
-    if not tip:
-        return set()
-    result = _run_git(
-        ["log", "--format=%H", tip, "--not", "origin/main"],
-        cwd=repo_dir,
-        timeout=60,
-    )
-    shas = {line.strip() for line in (result.stdout or "").splitlines() if line.strip()}
-    shas.add(tip)
-    return shas
-
-
 def decline_share_request(full_name: str, number, branch: str = "") -> None:
     """Close the review request but keep the colleague's versions."""
     head_branch, head_sha = _share_request_head(full_name, number)
@@ -1402,11 +1334,6 @@ def decline_share_request(full_name: str, number, branch: str = "") -> None:
             _ensure_github_branch(full_name, keep_branch, head_sha)
         except (GitHubAuthError, OSError, ValueError):
             pass
-    dest = local_project_dir(full_name)
-    remembered = {head_sha} if head_sha else set()
-    if os.path.isdir(os.path.join(dest, ".git")) and head_sha:
-        remembered.update(_unique_commits_not_on_main(dest, head_sha))
-    _remember_declined_shas(dest, remembered)
 
 
 def commit_and_push(repo_dir: str, message: str) -> None:
@@ -1681,11 +1608,9 @@ def build_project_history_model(
     head_sha: str,
     review_tips: dict[str, list[str]],
     unpushed: set[str] | None = None,
-    declined_shas: set[str] | None = None,
     shared_shas: set[str] | None = None,
 ) -> dict[str, Any]:
     """Turn Git commits + review tips into version specs (DAG)."""
-    _ = declined_shas  # callers still pass this; status is only local / pushed now
     empty = {
         "commit_history": [],
         "version_specs": [],
@@ -2090,7 +2015,6 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
         head_sha,
         review_tips,
         unpushed,
-        declined_shas=_load_declined_shas(repo_dir),
         shared_shas=shared_shas,
     )
     if not model.get("version_specs"):
@@ -2137,7 +2061,6 @@ def read_compare_project_histories(
     )
     head_sha = _git_rev_parse(repo_dir, "HEAD")
     unpushed = _unpushed_commit_shas(repo_dir)
-    declined = _load_declined_shas(repo_dir)
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
     local_review_tips = _review_tips(repo_dir, local_only=True)
     remote_review_tips = _review_tips(repo_dir, remote_only=True)
@@ -2158,7 +2081,6 @@ def read_compare_project_histories(
             origin or "",
             remote_review_tips,
             set(),
-            declined_shas=declined,
             shared_shas=shared_shas,
         )
 
@@ -2227,7 +2149,6 @@ def read_compare_project_histories(
             head_sha or main_for_local,
             review_for_local,
             unpushed,
-            declined_shas=declined,
             shared_shas=shared_shas,
         )
     elif freeze_ok:
@@ -2328,7 +2249,6 @@ def read_compare_project_histories(
             head_sha or origin or local_main,
             merged_tips,
             unpushed,
-            declined_shas=declined,
             shared_shas=shared_shas,
         )
 

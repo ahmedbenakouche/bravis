@@ -3021,42 +3021,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return None
         return message
 
-    def _promptOpenUnsharedChoice(self, full_name: str) -> str:
-        """Return update, local, replace, or cancel."""
-        try:
-            info = inspect_local_project(full_name)
-        except GitHubAuthError:
-            return "update"
-        if not info.get("exists") or not info.get("unshared_count"):
-            return "update"
-        count = int(info.get("unshared_count") or 0)
-        box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Open project")
-        if count == 1:
-            box.setText(
-                "This project has 1 version saved on this computer that is not shared yet."
-            )
-        else:
-            box.setText(
-                "This project has %d versions saved on this computer that are not shared yet."
-                % count
-            )
-        box.setInformativeText(
-            "Open this computer's work (keep those versions), or replace it with the shared project?\n\n"
-            "Replacing discards versions saved here but not shared."
-        )
-        local_btn = box.addButton("Open this computer's work", qt.QMessageBox.AcceptRole)
-        shared_btn = box.addButton("Open shared project", qt.QMessageBox.DestructiveRole)
-        box.addButton("Cancel", qt.QMessageBox.RejectRole)
-        box.setDefaultButton(local_btn)
-        box.exec_()
-        clicked = box.clickedButton()
-        if clicked == local_btn:
-            return "local"
-        if clicked == shared_btn:
-            return "replace"
-        return "cancel"
-
     def _promptSwitchVersion(self, version_id: str) -> bool:
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Switch version")
@@ -5154,31 +5118,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (AttributeError, RuntimeError, TypeError, ValueError):
             pass
 
-    def _ownedProjectNames(self) -> list[str]:
-        names = []
-        for repo in ((self._github_session or {}).get("repos") or []):
-            if repo.get("role") != "owner":
-                continue
-            full_name = repo.get("full_name")
-            if full_name:
-                names.append(full_name)
-        return names
-
-    def _accessibleProjectNames(self) -> list[str]:
-        names = []
-        seen = set()
-        for repo in ((self._github_session or {}).get("repos") or []):
-            full_name = str(repo.get("full_name") or "").strip()
-            key = full_name.lower()
-            if not full_name or key in seen:
-                continue
-            seen.add(key)
-            names.append(full_name)
-        current = self._currentProjectName() if self._hasSelectedProject() else ""
-        if current and current.lower() not in seen:
-            names.insert(0, current)
-        return names[:20]
-
     def _onNotificationsPoll(self) -> None:
         self._runNotificationChecks(announce=True)
 
@@ -7196,10 +7135,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._offering_invitations = False
                 if self._connected:
                     self._runNotificationChecks(announce=False)
-
-    def _openInvitationNotification(self, invitation: dict) -> None:
-        self._markNotificationRead(invitation)
-        self._openNotificationDetail(invitation)
 
     def _currentNamedBranchSlug(self) -> str:
         local_path = getattr(self, "_local_project_path", None) or ""
