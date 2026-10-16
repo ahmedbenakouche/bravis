@@ -93,11 +93,13 @@ from CollaborativeVersioningLib.GitHubAuth import (
     cancel_project_invitation,
     set_wait_callback,
     publish_current_line,
+    ensure_can_share_with_shared,
     start_local_review_branch,
     accept_share_request,
     decline_share_request,
     suggest_github_usernames,
     work_is_on_review_branch,
+    is_viewing_older_than_branch_tip,
     review_branch_for,
     current_review_branch_slug,
     normalize_branch_slug,
@@ -948,9 +950,18 @@ class CompareWithSharedDialog(qt.QDialog):
         return self._lanesLabel(self._conflict_lanes)
 
     def _setupInitialState(self) -> None:
-        # Handled flows: tip conflict (3 buttons), obsolete merged branch (Reset),
-        # shared ahead with no tip conflict (Update — local unshared may also exist).
-        # Anything else: not handled yet.
+        # Handled flows: tip conflict alone, obsolete merged alone, shared ahead
+        # (Update). Tip conflict + obsolete together → not handled (integration TBD).
+        self._hideAllChoiceButtons()
+        if self._conflict and self._obsolete_merged:
+            self._setConflictsMessage(
+                "This case is not handled yet.\n"
+                "Tip conflict and an obsolete merged branch at the same time.\n"
+                "Ask the developer to integrate it."
+            )
+            self._result_panel.hide()
+            self._validate_btn.setEnabled(False)
+            return
         if self._conflict:
             self._setConflictsMessage(
                 "Local and shared have diverged on: %s.\n"
@@ -968,7 +979,6 @@ class CompareWithSharedDialog(qt.QDialog):
             self._validate_btn.setEnabled(False)
             return
 
-        self._hideAllChoiceButtons()
         if self._obsolete_merged:
             branches = self._lanesLabel(self._obsolete_merged_lanes)
             many = len(self._obsolete_merged_lanes) > 1
@@ -3060,10 +3070,25 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.exec_()
         return box.clickedButton() == switch_btn
 
-    def _promptSaveDestination(self) -> str:
-        """When saving from main: Put on main / Create a branch / cancel."""
+    def _promptSaveDestination(self, from_older_main: bool = False) -> str:
+        """When saving from main: Put on main / Create a branch / cancel.
+
+        If the worktree is on an older main version (tip still ahead with
+        unshared versions), only Create a branch is offered so those tips stay.
+        """
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Save version")
+        if from_older_main:
+            box.setText("Save from this older main version?")
+            box.setInformativeText(
+                "Main still has later versions on this computer.\n"
+                "Create a branch from here — those later main versions stay."
+            )
+            branch_btn = box.addButton("Create a branch", qt.QMessageBox.AcceptRole)
+            box.addButton("Cancel", qt.QMessageBox.RejectRole)
+            box.setDefaultButton(branch_btn)
+            box.exec_()
+            return "branch" if box.clickedButton() == branch_btn else "cancel"
         box.setText("Where should this version be saved?")
         box.setInformativeText(
             "Put on main — save on main.\n"
@@ -7685,13 +7710,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed("Fill project data first: Ontology map.", error=True)
                 return
         on_branch = False
+        from_older_main = False
         try:
             on_branch = work_is_on_review_branch(local_path)
+            if not on_branch:
+                from_older_main = is_viewing_older_than_branch_tip(local_path, "main")
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             on_branch = False
+            from_older_main = False
         new_branch_slug = ""
         if not on_branch:
-            destination = self._promptSaveDestination()
+            destination = self._promptSaveDestination(from_older_main=from_older_main)
             if destination == "cancel":
                 self._appendFeed("Save cancelled.")
                 return
@@ -7813,6 +7842,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         history = {}
         published = branch
         try:
+            # Strict: fetch + refuse if shared is ahead / tips diverged (Update first).
+            local_freeze = copy.deepcopy(
+                getattr(self, "_project_history_bundle", None)
+            )
+            self._updateProgress("Checking the shared project…")
+            ensure_can_share_with_shared(local_path, local_history=local_freeze)
             self._updateProgress("Publishing %s…" % branch)
             published = publish_current_line(local_path)
             save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))

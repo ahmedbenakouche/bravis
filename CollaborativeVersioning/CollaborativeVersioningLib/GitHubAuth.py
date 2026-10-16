@@ -547,13 +547,15 @@ def _stage_and_commit(repo_dir: str, message: str, fail_prefix: str) -> None:
 
 def head_can_update_shared_project(repo_dir: str) -> bool:
     """True when Share can add this computer's versions onto the shared project line."""
-    head = _git_rev_parse(repo_dir, "HEAD")
-    if not head:
+    # Use main tip (not detached HEAD) so viewing an older version does not
+    # look like we are behind origin/main.
+    tip = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(repo_dir, "HEAD")
+    if not tip:
         return False
     origin = _git_rev_parse(repo_dir, "origin/main")
     if not origin:
         return True
-    return _is_ancestor(repo_dir, origin, head)
+    return _is_ancestor(repo_dir, origin, tip)
 
 
 def work_is_on_review_branch(repo_dir: str) -> bool:
@@ -600,6 +602,32 @@ def start_local_review_branch(repo_dir: str, branch_name: str) -> str:
     return slug
 
 
+def ensure_can_share_with_shared(
+    repo_dir: str,
+    local_history: dict[str, Any] | None = None,
+) -> None:
+    """Fetch and refuse Share when the shared project is ahead or tips diverged.
+
+    Local unshared versions alone do not block Share. Remote extras, tip
+    conflicts, or an obsolete merged branch require Compare → Update/resolve
+    first (strict alignment before any Share).
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    fetch_remote_updates(repo_dir)
+    compare = read_compare_project_histories(repo_dir, local_history=local_history)
+    if (
+        compare.get("has_remote_extras")
+        or compare.get("conflict")
+        or compare.get("obsolete_merged")
+    ):
+        raise GitHubAuthError(
+            "Could not share. The shared project has versions that are not on "
+            "this computer yet (or tips diverged).\n\n"
+            "Open Compare with shared (bell), Update or resolve, then Share again."
+        )
+
+
 def publish_current_line(repo_dir: str) -> str:
     """Publish only the current branch (main or another branch). Returns 'main' or slug."""
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
@@ -618,11 +646,28 @@ def git_branch_for_history_lane(lane: str) -> str:
     return review_branch_for(name)
 
 
+def is_viewing_older_than_branch_tip(repo_dir: str, lane: str = "main") -> bool:
+    """True when HEAD is a strict ancestor of the lane's branch tip.
+
+    Happens after Switch to an older version: the tip (e.g. unshared main/2–3)
+    stays on the branch while the worktree shows an earlier commit.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return False
+    branch = git_branch_for_history_lane(lane)
+    tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
+    head = _git_rev_parse(repo_dir, "HEAD")
+    if not tip or not head or tip == head:
+        return False
+    return _is_ancestor(repo_dir, head, tip)
+
+
 def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
     """Point HEAD at this version and sync the full worktree (Switch).
 
-    Uses one git reset --hard. Must always move to the target sha — even when
-    that commit is an ancestor of current HEAD (switching to an older version).
+    When the target is an older commit on the same lane, leave the branch tip
+    where it is (detached HEAD) so later unshared versions stay on that line.
+    Switching to the tip (or ahead) attaches the branch again.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -631,7 +676,21 @@ def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
     branch = git_branch_for_history_lane(lane)
     head = _git_rev_parse(repo_dir, "HEAD")
     current = _current_branch_name(repo_dir)
+    tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
     if head == sha and current == branch:
+        return
+    # Already viewing this older commit with tip preserved.
+    if (
+        head == sha
+        and not current
+        and tip
+        and tip != sha
+        and _is_ancestor(repo_dir, sha, tip)
+    ):
+        return
+    # Older version on this lane: load it without moving the tip (keeps main/2–3).
+    if tip and sha != tip and _is_ancestor(repo_dir, sha, tip):
+        _checkout_detached_at(repo_dir, sha)
         return
     _checkout_branch_at(repo_dir, branch, sha)
 
@@ -666,6 +725,11 @@ def share_local_versions(repo_dir: str) -> None:
             "You are on a branch (not main).\n\n"
             "Share publishes this branch only. To put it on main, use Merge (or Accept)."
         )
+    # Prefer the main tip so Share still publishes unshared main/N while the
+    # worktree is temporarily on an older version (detached Switch).
+    main_tip = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
+        repo_dir, "HEAD"
+    )
     origin = _run_git(["rev-parse", "--verify", "--quiet", "origin/main"], cwd=repo_dir, timeout=30)
     if origin.returncode == 0 and not _unpushed_commit_shas(repo_dir):
         raise GitHubAuthError("No new versions to share.")
@@ -675,16 +739,16 @@ def share_local_versions(repo_dir: str) -> None:
     if origin.returncode == 0 and not head_can_update_shared_project(repo_dir):
         _merge_head_into_shared_project(repo_dir, login or "owner")
         return
+    if not main_tip:
+        raise GitHubAuthError("Could not share the project yet.")
     push = _run_git(
-        ["push", "-u", "origin", "HEAD:refs/heads/main"],
+        ["push", "-u", "origin", "%s:refs/heads/main" % main_tip],
         cwd=repo_dir,
         timeout=180,
     )
     if push.returncode != 0:
         raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
-    head = _git_rev_parse(repo_dir, "HEAD")
-    if head:
-        _run_git(["update-ref", "refs/remotes/origin/main", head], cwd=repo_dir, timeout=20)
+    _run_git(["update-ref", "refs/remotes/origin/main", main_tip], cwd=repo_dir, timeout=20)
     _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
 
 
@@ -802,7 +866,10 @@ def current_review_branch_slug(repo_dir: str) -> str:
 
 
 def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
-    """Share current versions on a named branch beside main. Returns the slug used."""
+    """Share current versions on a named branch beside main. Returns the slug used.
+
+    Does not change local main — unshared main versions stay on this computer.
+    """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
     origin = _run_git(["rev-parse", "--verify", "--quiet", "origin/main"], cwd=repo_dir, timeout=30)
@@ -850,9 +917,8 @@ def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
     if push.returncode != 0:
         raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
     _run_git(["update-ref", "refs/remotes/origin/%s" % branch, head], cwd=repo_dir, timeout=20)
-    origin_main = _git_rev_parse(repo_dir, "origin/main")
-    if origin_main:
-        _run_git(["update-ref", "refs/heads/main", origin_main], cwd=repo_dir, timeout=20)
+    # Do not move refs/heads/main — Share publishes this branch only. Recolling
+    # main onto origin/main would hide local unshared main versions from the tree.
     return slug
 
 
@@ -1099,6 +1165,18 @@ def _point_head_at(repo_dir: str, branch: str, sha: str) -> None:
     reset = _run_git(["reset", "--mixed", sha], cwd=repo_dir, timeout=30)
     if reset.returncode != 0:
         detail = (reset.stderr or reset.stdout or "").strip()
+        raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+
+
+def _checkout_detached_at(repo_dir: str, sha: str) -> None:
+    """Sync the worktree to sha without moving any branch tip."""
+    result = _run_git(
+        ["checkout", "--force", "--detach", sha],
+        cwd=repo_dir,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
         raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
 
 
@@ -1350,13 +1428,29 @@ def _format_git_date(iso: str) -> str:
 
 
 def _unpushed_commit_shas(repo_dir: str) -> set[str]:
-    origin = _run_git(["rev-parse", "--verify", "--quiet", "origin/main"], cwd=repo_dir, timeout=30)
-    if origin.returncode != 0:
+    """SHAs on the current line tip that are not on any shared remote tip.
+
+    Matches Version-tree "local" vs "pushed": shared = origin/main +
+    origin/cv-review/* (see ``_shared_remote_shas``). On main (or detached
+    viewing an older main commit), use the main tip; on a review branch, HEAD.
+    """
+    if work_is_on_review_branch(repo_dir):
+        tip = _git_rev_parse(repo_dir, "HEAD")
+    else:
+        tip = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
+            repo_dir, "HEAD"
+        )
+    if not tip:
         return set()
-    result = _run_git(["log", "origin/main..HEAD", "--format=%H"], cwd=repo_dir, timeout=60)
-    if result.returncode != 0:
+    commit_by_sha = _read_repo_commits(repo_dir)
+    if not commit_by_sha:
         return set()
-    return {line.strip() for line in (result.stdout or "").splitlines() if line.strip()}
+    shared = _shared_remote_shas(repo_dir, commit_by_sha)
+    return {
+        sha
+        for sha in _first_parent_chain(commit_by_sha, tip)
+        if sha and sha not in shared
+    }
 
 
 def inspect_local_project(full_name: str) -> dict[str, Any]:
@@ -1606,7 +1700,7 @@ def build_project_history_model(
     tags: dict[str, str] = {}
     sha_by_id: dict[str, str] = {}
     if shared_shas is None:
-        # Without a repo scan: treat only SHAs outside origin/main..HEAD as shared (main case).
+        # Without a repo scan: treat SHAs not in ``unpushed`` as shared.
         shared_shas = set()
         if unpushed is not None:
             shared_shas = {sha for sha in commit_by_sha if sha not in unpushed}
@@ -2191,8 +2285,10 @@ def read_compare_project_histories(
     conflict_includes_main = "main" in conflict_lanes
 
     # Branch already merged on shared, but this computer kept committing on it.
+    # Detect even when tip conflict exists — Compare UI treats the combination as
+    # "not handled" until integration is redesigned (conflict alone / obsolete alone OK).
     obsolete_merged_lanes: list[str] = []
-    if not conflict and commit_by_sha and origin:
+    if commit_by_sha and origin:
         main_reach = _all_reachable_shas(commit_by_sha, origin)
         for slug in sorted(
             set(local_review_tips.keys()) | set(remote_review_tips.keys()),
