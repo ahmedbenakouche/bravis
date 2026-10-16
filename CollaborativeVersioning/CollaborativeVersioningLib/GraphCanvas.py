@@ -434,43 +434,93 @@ COMPARE_DIFF_COLOR = "#dc2626"  # red — Local / Shared diffs
 COMPARE_RESULT_COLOR = "#16a34a"  # green — Result preview (what this choice applies)
 
 
+# Assignment for side-branch colors in the current graph / history (not main).
+_branch_color_by_lane: dict[str, str] = {}
+
+
+def _side_branch_palette():
+    """Strong hues for side branches — not main indigo, not compare red/green."""
+    if getattr(_ui, "IS_DARK", True):
+        return [
+            "#f59e0b",  # amber
+            "#22d3ee",  # cyan
+            "#f472b6",  # pink
+            "#a3e635",  # lime
+            "#fb923c",  # orange
+            "#e879f9",  # magenta
+            "#2dd4bf",  # teal
+            "#fcd34d",  # gold
+            "#38bdf8",  # sky
+            "#c084fc",  # violet (lighter than main indigo)
+            "#fdba74",  # peach
+            "#67e8f9",  # ice cyan
+            "#f9a8d4",  # rose
+            "#bef264",  # yellow-green
+            "#fbbf24",  # warm gold
+            "#d946ef",  # fuchsia
+        ]
+    return [
+        "#d97706",  # amber
+        "#0891b2",  # cyan
+        "#db2777",  # pink
+        "#65a30d",  # lime
+        "#ea580c",  # orange
+        "#a21caf",  # magenta
+        "#0f766e",  # teal
+        "#ca8a04",  # yellow
+        "#0284c7",  # sky
+        "#7c3aed",  # violet
+        "#c2410c",  # burnt orange
+        "#0e7490",  # deep cyan
+        "#be185d",  # rose
+        "#4d7c0f",  # olive
+        "#b45309",  # brown-gold
+        "#86198f",  # deep fuchsia
+    ]
+
+
+def prepare_branch_colors(branches) -> None:
+    """Assign unique palette colors to displayed side branches (stable order).
+
+    ``main`` stays on the theme indigo. Side lanes are sorted and take distinct
+    palette entries until the palette is exhausted (then colors reuse).
+    Call before painting the Version tree or styling Version history so both match.
+    """
+    global _branch_color_by_lane
+    names = sorted(
+        {
+            str(name).strip()
+            for name in (branches or ())
+            if str(name).strip() and str(name).strip().lower() != "main"
+        },
+        key=lambda text: text.lower(),
+    )
+    palette = _side_branch_palette()
+    if not palette:
+        _branch_color_by_lane = {}
+        return
+    assigned: dict[str, str] = {}
+    for index, name in enumerate(names):
+        assigned[name] = palette[index % len(palette)]
+    _branch_color_by_lane = assigned
+
+
 def _branch_color(branch):
     """Color for a version-tree lane (main + side branches). Shared with Version history."""
-    if branch == "main":
+    name = str(branch or "").strip() or "main"
+    if name.lower() == "main":
         # Read theme live (MAIN_COLOR is only an import-time fallback).
         return _ui.ACCENT_INDIGO or MAIN_COLOR or "#818cf8"
-    # Side branches: strong hue separation. Never reuse main indigo/violet, ice-blue,
-    # or compare red/green (diff / result outlines).
-    if getattr(_ui, "IS_DARK", True):
-        palette = [
-            "#f59e0b",  # amber
-            "#fb923c",  # orange
-            "#f472b6",  # pink
-            "#22d3ee",  # cyan
-            "#eab308",  # yellow
-            "#2dd4bf",  # teal
-            "#fdba74",  # peach
-            "#e879f9",  # magenta (far from indigo)
-            "#38bdf8",  # sky
-            "#fcd34d",  # gold
-        ]
-    else:
-        palette = [
-            "#d97706",  # amber
-            "#ea580c",  # orange
-            "#db2777",  # pink
-            "#0891b2",  # cyan
-            "#ca8a04",  # yellow
-            "#0f766e",  # teal
-            "#c2410c",  # burnt orange
-            "#a21caf",  # magenta
-            "#0284c7",  # sky
-            "#b45309",  # brown-gold
-        ]
+    mapped = _branch_color_by_lane.get(name)
+    if mapped:
+        return mapped
+    # Fallback if prepare_branch_colors was not called (isolated lookup).
+    palette = _side_branch_palette()
+    if not palette:
+        return _ui.ACCENT_INDIGO or MAIN_COLOR or "#818cf8"
     acc = 0
-    for char in str(branch or ""):
+    for char in name:
         acc = (acc * 33 + ord(char)) % 2147483647
-    # Spread consecutive hash buckets around the palette (not just % len).
     return palette[(acc * 7) % len(palette)]
 
 
@@ -618,6 +668,7 @@ def _version_graph_edges(specs):
 def _layout_version_graph(specs):
     """Layout : colonnes par ligne de versions, lignes sans chevauchement."""
     specs_by_id = {spec["id"]: dict(spec) for spec in specs}
+    prepare_branch_colors(spec.get("branch", "main") for spec in specs)
     rows = _compute_version_rows(specs)
     centers = _lane_centers_for(specs, rows)
 

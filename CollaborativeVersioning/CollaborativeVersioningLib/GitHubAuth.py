@@ -2951,8 +2951,6 @@ _ACTIVITY_KINDS = frozenset(
     (
         "join",
         "assign",
-        "propose",
-        "claim",
         "cancel",
         "submit",
         "accept",
@@ -2960,6 +2958,9 @@ _ACTIVITY_KINDS = frozenset(
         "share",
         "people_add",
         "people_remove",
+        # Legacy voluntary ops (ignored for new events; kept so old activity can load).
+        "propose",
+        "claim",
     )
 )
 

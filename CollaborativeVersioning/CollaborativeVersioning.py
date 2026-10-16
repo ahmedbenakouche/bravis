@@ -365,8 +365,6 @@ def _notification_detail_title(item: dict) -> str:
         "accept": "New accept",
         "submit": "Review requested",
         "assign": "New task",
-        "propose": "Voluntary task",
-        "claim": "Task claimed",
         "cancel": "Task cancelled",
         "decline": "Review declined",
         "join": "New join",
@@ -982,17 +980,24 @@ class CompareWithSharedDialog(qt.QDialog):
         if self._obsolete_merged:
             branches = self._lanesLabel(self._obsolete_merged_lanes)
             many = len(self._obsolete_merged_lanes) > 1
+            reset_also = self._lanesLabel(
+                self._reset_lanes or (["main"] + list(self._obsolete_merged_lanes))
+            )
             self._setConflictsMessage(
                 (
                     "Branches %s were already merged onto main on the shared project.\n"
                     "Your local versions on those branches are obsolete.\n"
-                    "Preview: Reset to shared. Click Validate to apply."
+                    "Reset moves these tips to shared: %s "
+                    "(main included — unshared main versions leave the tree).\n"
+                    "Click Validate to apply."
                     if many
                     else "Branch %s was already merged onto main on the shared project.\n"
                     "Your local versions on that branch are obsolete.\n"
-                    "Preview: Reset to shared. Click Validate to apply."
+                    "Reset moves these tips to shared: %s "
+                    "(main included — unshared main versions leave the tree).\n"
+                    "Click Validate to apply."
                 )
-                % branches
+                % (branches, reset_also)
             )
             self._reset_btn.show()
             self._selectChoice(self.ACTION_RESET, silent=True)
@@ -1087,13 +1092,20 @@ class CompareWithSharedDialog(qt.QDialog):
                 "Local tip stays; shared tip is not applied",
             )
         if choice == self.ACTION_RESET:
-            reset_lanes = self._lanesLabel(
+            reset_names = (
                 self._reset_lanes or self._conflict_lanes or self._obsolete_merged_lanes
             )
+            reset_lanes = self._lanesLabel(reset_names)
+            includes_main = any(
+                str(name).strip().lower() == "main" for name in (reset_names or ())
+            )
+            detail = "Branches (%s) match shared; other local versions stay" % reset_lanes
+            if includes_main:
+                detail += " — unshared main versions leave the tree"
             return (
                 reset_model,
                 "Result — Reset to shared",
-                "Branches (%s) match shared; other local versions stay" % reset_lanes,
+                detail,
             )
         if choice == self.ACTION_UPDATE:
             if self._has_local:
@@ -1333,10 +1345,10 @@ class PeopleDialog(qt.QDialog):
         add_layout.addWidget(self.suggestionList)
         owner_hint = qt.QLabel(
             "They will receive an invitation. After they accept, the project appears in their list.\n"
-            "Senior: can assign Tasks, claim Voluntary tasks, share onto main, "
+            "Senior: can assign Tasks, share onto main, "
             "and Accept / Decline a junior's review request.\n"
-            "Junior: can work on the project, share on their own branch, "
-            "and Propose a Voluntary task (or wait for a Task) before Request review."
+            "Junior: can work on the project and share on their own branch "
+            "(after a senior assigns a Task)."
         )
         owner_hint.setWordWrap(True)
         owner_hint.setStyleSheet(DIALOG_HINT_STYLE)
@@ -1697,88 +1709,24 @@ def _notification_text(text: str, limit: int = _NOTIFICATION_TEXT_LEN) -> str:
     return cleaned[:limit].rstrip() + "…"
 
 
-class ProposeTaskDialog(qt.QDialog):
-    """Ask for a voluntary-task description (own window — avoids nested-modal bugs)."""
-
-    def __init__(self, parent) -> None:
-        qt.QDialog.__init__(self, parent)
-        self.setWindowTitle("Propose voluntary task")
-        self.setFixedWidth(420)
-        self.setModal(True)
-        self._proposed = ""
-        layout = qt.QVBoxLayout(self)
-        layout.setSpacing(10)
-        hint = qt.QLabel(
-            "Describe what you worked on. A senior can Claim it afterward."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet(DIALOG_HINT_STYLE)
-        layout.addWidget(hint)
-        self.edit = qt.QPlainTextEdit()
-        self.edit.setStyleSheet(FIELD_STYLE)
-        self.edit.setPlaceholderText("What did you work on / want reviewed?")
-        self.edit.setFixedHeight(88)
-        self.edit.setLineWrapMode(qt.QPlainTextEdit.WidgetWidth)
-        try:
-            self.edit.setTabChangesFocus(True)
-        except (AttributeError, TypeError, RuntimeError):
-            pass
-        layout.addWidget(self.edit)
-        self.statusLabel = qt.QLabel("")
-        self.statusLabel.setWordWrap(True)
-        self.statusLabel.setVisible(False)
-        layout.addWidget(self.statusLabel)
-        row = qt.QHBoxLayout()
-        row.addStretch(1)
-        cancel_btn = qt.QPushButton("Cancel")
-        ok_btn = qt.QPushButton("Propose")
-        cancel_btn.setStyleSheet(BTN_SECONDARY)
-        ok_btn.setStyleSheet(BTN_CREATE)
-        cancel_btn.connect("clicked()", self.reject)
-        ok_btn.connect("clicked()", self._onPropose)
-        row.addWidget(cancel_btn)
-        row.addWidget(ok_btn)
-        layout.addLayout(row)
-
-    def _onPropose(self) -> None:
-        try:
-            text = self.edit.toPlainText()
-            if callable(text):
-                text = text()
-        except (TypeError, AttributeError, RuntimeError):
-            text = ""
-        title = normalize_task_title(text)
-        if not title:
-            self.statusLabel.setText("Write a short description first.")
-            self.statusLabel.setVisible(True)
-            self.statusLabel.setStyleSheet(
-                "color: %s; font-size: 11px; font-weight: 600;" % FEED_COLOR_ERROR
-            )
-            return
-        self._proposed = title
-        self.accept()
-
-    def description(self) -> str:
-        return str(self._proposed or "")
-
-
 class TaskDialog(qt.QDialog):
-    """Assign / claim tasks (senior), or propose a voluntary task (junior)."""
+    """Assign tasks (senior) or view your assigned task (junior)."""
 
     def __init__(self, parent, people=None, tasks=None, me="", can_assign=False) -> None:
         qt.QDialog.__init__(self, parent)
-        self.setWindowTitle("Tasks" if can_assign else "My task")
+        self.setWindowTitle("Tasks")
         self.setFixedWidth(460)
         self.setModal(True)
         self._people = list(people or [])
-        self._all_tasks = list(tasks or [])
+        # Voluntary tasks are retired — only assigned tasks remain.
+        self._all_tasks = [
+            task for task in (tasks or []) if self._is_assigned_task(task)
+        ]
         self._tasks = list(self._all_tasks)
         self._me = str(me or "").strip()
         self._can_assign = bool(can_assign)
         self._assign_handler = None
         self._cancel_handler = None
-        self._propose_handler = None
-        self._claim_handler = None
 
         layout = qt.QVBoxLayout(self)
         layout.setSpacing(10)
@@ -1802,8 +1750,7 @@ class TaskDialog(qt.QDialog):
             pass
         form.addRow("Description:", self.descriptionEdit)
         hint = qt.QLabel(
-            "This junior will work with you. One junior can only have one task at a time "
-            "(assigned or voluntary)."
+            "This junior will work with you. One junior can only have one task at a time."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(DIALOG_HINT_STYLE)
@@ -1868,35 +1815,19 @@ class TaskDialog(qt.QDialog):
         buttons.addStretch(1)
         closeButton = qt.QPushButton("Close")
         self.cancelTaskButton = qt.QPushButton("Cancel task")
-        self.claimButton = qt.QPushButton("Claim")
-        self.proposeButton = qt.QPushButton("Propose voluntary task")
         self.assignButton = qt.QPushButton("Assign")
         closeButton.setStyleSheet(BTN_SECONDARY)
         self.cancelTaskButton.setStyleSheet(BTN_DELETE)
-        self.claimButton.setStyleSheet(BTN_SECONDARY)
-        self.proposeButton.setStyleSheet(BTN_CREATE)
         self.assignButton.setStyleSheet(BTN_CREATE)
-        self.proposeButton.setToolTip(
-            "Propose a Voluntary task without waiting for a senior. "
-            "A senior can Claim it afterward."
-        )
         closeButton.connect("clicked()", self.reject)
         self.cancelTaskButton.connect("clicked()", self._onCancelTaskClicked)
-        self.claimButton.connect("clicked()", self._onClaimClicked)
-        self.proposeButton.connect("clicked()", self._onProposeClicked)
         self.assignButton.connect("clicked()", self._onAssignClicked)
         buttons.addWidget(closeButton)
         buttons.addWidget(self.cancelTaskButton)
-        buttons.addWidget(self.claimButton)
-        buttons.addWidget(self.proposeButton)
         buttons.addWidget(self.assignButton)
         layout.addLayout(buttons)
         self.assignButton.setVisible(self._can_assign)
         self.assignButton.setDefault(self._can_assign)
-        self.claimButton.setVisible(self._can_assign)
-        self.proposeButton.setVisible(not self._can_assign)
-        self.proposeButton.setDefault(not self._can_assign)
-        # Cancel: seniors (their tasks) or junior (own voluntary).
         self.cancelTaskButton.setVisible(True)
 
         self.taskList.connect("currentRowChanged(int)", self._onTaskRowChanged)
@@ -1912,12 +1843,6 @@ class TaskDialog(qt.QDialog):
 
     def set_cancel_handler(self, handler) -> None:
         self._cancel_handler = handler
-
-    def set_propose_handler(self, handler) -> None:
-        self._propose_handler = handler
-
-    def set_claim_handler(self, handler) -> None:
-        self._claim_handler = handler
 
     def set_status(self, message: str, error: bool = False) -> None:
         text = (message or "").strip()
@@ -1959,12 +1884,14 @@ class TaskDialog(qt.QDialog):
         return str(label or "").strip()
 
     @staticmethod
-    def _task_kind(task: dict) -> str:
+    def _is_assigned_task(task: dict) -> bool:
         kind = str((task or {}).get("kind") or "").strip().lower()
-        if kind in ("assigned", "voluntary"):
-            return kind
-        senior = str((task or {}).get("senior") or "").strip()
-        return "voluntary" if not senior else "assigned"
+        if kind == "voluntary":
+            return False
+        if kind == "assigned":
+            return True
+        # Legacy rows without kind: keep only if a senior is set.
+        return bool(str((task or {}).get("senior") or "").strip())
 
     def _busy_juniors(self) -> set:
         busy = set()
@@ -2012,14 +1939,7 @@ class TaskDialog(qt.QDialog):
         accepted = str(task.get("status") or "") == "accepted"
         excerpt = _task_excerpt(task.get("description") or "") or "No description."
         mark = "✅" if accepted else "⏳"
-        kind = self._task_kind(task)
-        if kind == "voluntary":
-            if senior:
-                label = "%s  Voluntary · %s <- %s : %s" % (mark, senior, junior, excerpt)
-            else:
-                label = "%s  Voluntary · unclaimed · %s : %s" % (mark, junior, excerpt)
-        else:
-            label = "%s  %s -> %s : %s" % (mark, senior, junior, excerpt)
+        label = "%s  %s -> %s : %s" % (mark, senior, junior, excerpt)
         if self._isMyActiveTask(task):
             return "● Your task — %s" % label
         return label
@@ -2027,9 +1947,7 @@ class TaskDialog(qt.QDialog):
     def _emptyTasksMessage(self) -> str:
         if self._can_assign:
             return "No task yet."
-        if self._canPropose():
-            return "No task yet for you. You can Propose a Voluntary task."
-        return "No task yet for you."
+        return "No task yet for you. Wait for a senior to assign one."
 
     def _fillTasks(self) -> None:
         self.taskList.clear()
@@ -2063,37 +1981,10 @@ class TaskDialog(qt.QDialog):
         if str(task.get("status") or "") == "accepted":
             return False
         me = self._me.lower()
-        if not me:
+        if not me or not self._can_assign:
             return False
-        junior = str(task.get("junior") or "").strip().lower()
         senior = str(task.get("senior") or "").strip().lower()
-        kind = self._task_kind(task)
-        if self._can_assign:
-            if kind == "voluntary" and not senior:
-                return True  # any senior can cancel unclaimed voluntary
-            return bool(senior) and me == senior
-        # Junior: cancel own voluntary only
-        return kind == "voluntary" and junior == me
-
-    def _canClaimSelected(self) -> bool:
-        if not self._can_assign:
-            return False
-        task = self.selected_task()
-        if not task:
-            return False
-        if str(task.get("status") or "") == "accepted":
-            return False
-        if self._task_kind(task) != "voluntary":
-            return False
-        return not str(task.get("senior") or "").strip()
-
-    def _canPropose(self) -> bool:
-        if self._can_assign:
-            return False
-        me = self._me.lower()
-        if not me:
-            return False
-        return me not in self._busy_juniors()
+        return bool(senior) and me == senior
 
     def _onTaskRowChanged(self, _row) -> None:
         self._updateDetail()
@@ -2105,14 +1996,10 @@ class TaskDialog(qt.QDialog):
             self.detailLabel.setText(double_click)
             self.detailLabel.setVisible(bool(self._tasks))
             return
-        parts = []
-        if self._canPropose():
-            parts.append(self._emptyTasksMessage())
         if self._tasks:
-            parts.append(double_click)
-        elif not parts:
-            parts.append(double_click)
-        self.detailLabel.setText("\n".join(parts))
+            self.detailLabel.setText(double_click)
+        else:
+            self.detailLabel.setText(self._emptyTasksMessage())
         self.detailLabel.setVisible(True)
 
     def _task_at_row(self, row) -> dict | None:
@@ -2139,19 +2026,12 @@ class TaskDialog(qt.QDialog):
         senior = str(task.get("senior") or "").strip()
         junior = str(task.get("junior") or "").strip()
         description = str(task.get("description") or "").strip() or "No description."
-        kind = self._task_kind(task)
         dialog = qt.QDialog(self)
         dialog.setWindowTitle("Task")
         dialog.setFixedWidth(420)
         dialog.setModal(True)
         layout = qt.QVBoxLayout(dialog)
-        if kind == "voluntary":
-            if senior:
-                title_text = "Voluntary task by %s · claimed by %s." % (junior, senior)
-            else:
-                title_text = "Voluntary task by %s · waiting for a senior to Claim." % junior
-        else:
-            title_text = "%s assigned %s to this task." % (senior, junior)
+        title_text = "%s assigned %s to this task." % (senior, junior)
         title = qt.QLabel(title_text)
         if str(task.get("status") or "") == "accepted":
             title.setText("✅ " + title.text)
@@ -2174,19 +2054,6 @@ class TaskDialog(qt.QDialog):
 
     def _updateActionButtons(self) -> None:
         self.cancelTaskButton.setEnabled(self._canCancelSelected())
-        self.claimButton.setEnabled(self._canClaimSelected())
-        can_propose = self._canPropose()
-        self.proposeButton.setEnabled(can_propose)
-        if not self._can_assign:
-            if can_propose:
-                self.proposeButton.setToolTip(
-                    "Propose a Voluntary task without waiting for a senior. "
-                    "A senior can Claim it afterward."
-                )
-            else:
-                self.proposeButton.setToolTip(
-                    "You already have an active task (assigned or voluntary)."
-                )
 
     def _onAssignClicked(self) -> None:
         junior = self.selected_junior()
@@ -2200,45 +2067,6 @@ class TaskDialog(qt.QDialog):
         handler = self._assign_handler
         if handler is not None:
             handler(self, junior, description)
-
-    def _onProposeClicked(self) -> None:
-        if not self._canPropose():
-            self.set_status("You already have an active task.", error=True)
-            return
-        # Defer + own top-level dialog: nested modal under TaskDialog often does nothing in Slicer.
-        qt.QTimer.singleShot(0, self._openProposeDescriptionDialog)
-
-    def _openProposeDescriptionDialog(self) -> None:
-        if not self._canPropose():
-            self.set_status("You already have an active task.", error=True)
-            return
-        try:
-            parent = slicer.util.mainWindow()
-        except Exception:
-            parent = self
-        dialog = ProposeTaskDialog(parent)
-        result = dialog.exec_()
-        try:
-            accepted = result == qt.QDialog.Accepted or int(result) == int(qt.QDialog.Accepted)
-        except (TypeError, ValueError):
-            accepted = bool(result)
-        if not accepted:
-            return
-        description = dialog.description()
-        if not description:
-            return
-        handler = self._propose_handler
-        if handler is not None:
-            handler(self, description)
-
-    def _onClaimClicked(self) -> None:
-        task = self.selected_task()
-        if not task or not self._canClaimSelected():
-            self.set_status("Select an unclaimed Voluntary task first.", error=True)
-            return
-        handler = self._claim_handler
-        if handler is not None:
-            handler(self, task)
 
     def _onCancelTaskClicked(self) -> None:
         task = self.selected_task()
@@ -3034,20 +2862,38 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.exec_()
         return box.clickedButton() == switch_btn
 
-    def _promptSaveDestination(self, from_older_main: bool = False) -> str:
+    def _promptSaveDestination(
+        self,
+        from_older_main: bool = False,
+        junior: bool = False,
+    ) -> str:
         """When saving from main: Put on main / Create a branch / cancel.
 
-        If the worktree is on an older main version (tip still ahead with
-        unshared versions), only Create a branch is offered so those tips stay.
+        Juniors never get Put on main (they can only Share a branch).
+        Older-main view: only Create a branch so later unshared main tips stay.
         """
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Save version")
-        if from_older_main:
-            box.setText("Save from this older main version?")
-            box.setInformativeText(
-                "Main still has later versions on this computer.\n"
-                "Create a branch from here — those later main versions stay."
-            )
+        if junior or from_older_main:
+            if junior and from_older_main:
+                box.setText("Save from this older main version?")
+                box.setInformativeText(
+                    "As a junior you save on a branch (not on main).\n"
+                    "Main still has later versions on this computer — "
+                    "Create a branch from here; those later main versions stay."
+                )
+            elif junior:
+                box.setText("Save on a branch?")
+                box.setInformativeText(
+                    "As a junior you save on a branch (not on main).\n"
+                    "Create a branch to save this version."
+                )
+            else:
+                box.setText("Save from this older main version?")
+                box.setInformativeText(
+                    "Main still has later versions on this computer.\n"
+                    "Create a branch from here — those later main versions stay."
+                )
             branch_btn = box.addButton("Create a branch", qt.QMessageBox.AcceptRole)
             box.addButton("Cancel", qt.QMessageBox.RejectRole)
             box.setDefaultButton(branch_btn)
@@ -6402,7 +6248,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 event["at"] = str(message.get("at"))
             return event
         op = str(message.get("task_op") or "").strip()
-        if op not in ("assign", "propose", "claim", "cancel", "submit", "accept"):
+        if op not in ("assign", "cancel", "submit", "accept"):
             return None
         author = str(message.get("author") or self._githubLogin() or "Someone")
         junior = str(message.get("junior") or "").strip() or "a junior"
@@ -6413,15 +6259,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if excerpt
                 else "%s assigned %s to a task." % (author, junior)
             )
-        elif op == "propose":
-            excerpt = _task_excerpt(message.get("description") or "")
-            text = (
-                "%s proposed a voluntary task: %s" % (author, excerpt)
-                if excerpt
-                else "%s proposed a voluntary task." % author
-            )
-        elif op == "claim":
-            text = "%s claimed %s's voluntary task." % (author, junior)
         elif op == "cancel":
             text = "%s cancelled the task for %s." % (author, junior)
         elif op == "submit":
@@ -6546,56 +6383,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 }
             )
             return current
-        if op == "propose":
-            if not junior:
-                raise GitHubAuthError("Could not propose a voluntary task.")
-            if not description:
-                raise GitHubAuthError("Write a short description first.")
-            if any(
-                str(task.get("junior") or "").lower() == junior.lower()
-                and str(task.get("status") or "") != "accepted"
-                for task in current
-            ):
-                raise GitHubAuthError("You already have an active task.")
-            current.append(
-                {
-                    "id": str(message.get("task_id") or message.get("id") or ""),
-                    "junior": junior,
-                    "senior": "",
-                    "kind": "voluntary",
-                    "description": description,
-                    "status": "",
-                }
-            )
+        if op in ("propose", "claim"):
+            # Voluntary tasks removed — ignore legacy ops if they still appear.
             return current
-        if op == "claim":
-            tid = str((message or {}).get("task_id") or "").strip()
-            junior_key = junior.lower()
-            if not senior:
-                raise GitHubAuthError("Could not claim this task.")
-            updated = []
-            matched = False
-            for task in current:
-                if str(task.get("status") or "") == "accepted":
-                    updated.append(task)
-                    continue
-                matches = bool(tid) and str(task.get("id") or "") == tid
-                if not matches and not tid and junior_key:
-                    matches = str(task.get("junior") or "").lower() == junior_key
-                if matches and not matched:
-                    kind = str(task.get("kind") or "").strip().lower()
-                    if kind != "voluntary" and str(task.get("senior") or "").strip():
-                        raise GitHubAuthError("Only Voluntary tasks can be claimed.")
-                    if str(task.get("senior") or "").strip():
-                        raise GitHubAuthError("This task is already claimed.")
-                    task = dict(task)
-                    task["kind"] = "voluntary"
-                    task["senior"] = senior
-                    matched = True
-                updated.append(task)
-            if not matched:
-                raise GitHubAuthError("That task is no longer available to claim.")
-            return updated
         if op == "submit":
             return self._tasksWithStatus(
                 current,
@@ -6681,13 +6471,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Select a project first.", error=True)
             return
         can_assign = self._canAssignTask()
-        title = "Tasks" if can_assign else "My task"
         people = []
         button = getattr(self, "messagesTaskButton", None)
         if button is not None:
             button.setEnabled(False)
         if can_assign:
-            self._openProgress(title, "Reading who is on this project…")
+            self._openProgress("Tasks", "Reading who is on this project…")
             try:
                 self._updateProgress("Reading who is on this project…")
                 people = list_project_people(self._currentProjectName())
@@ -6716,9 +6505,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         dialog.set_cancel_handler(self._onCancelTaskChosen)
         if can_assign:
             dialog.set_assign_handler(self._onAssignTaskChosen)
-            dialog.set_claim_handler(self._onClaimTaskChosen)
-        else:
-            dialog.set_propose_handler(self._onProposeVoluntaryTaskChosen)
         self._task_dialog_open = True
         try:
             dialog.exec_()
@@ -6747,49 +6533,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         dialog.accept()
         self._enqueueTaskMessage(message)
         self._appendFeed("Assigned %s to this task." % junior)
-
-    def _onProposeVoluntaryTaskChosen(self, dialog, description: str) -> None:
-        junior = self._githubLogin()
-        try:
-            message = build_project_message(
-                junior,
-                "proposed a voluntary task: %s" % _task_excerpt(description),
-                kind="task",
-            )
-        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            dialog.set_status(str(error).split("\n")[0], error=True)
-            return
-        message["task_op"] = "propose"
-        message["junior"] = junior
-        message["senior"] = ""
-        message["description"] = normalize_task_title(description)
-        message["task_id"] = message.get("id")
-        dialog.accept()
-        self._enqueueTaskMessage(message)
-        self._appendFeed("Proposed a voluntary task. A senior can Claim it.")
-
-    def _onClaimTaskChosen(self, dialog, task: dict) -> None:
-        junior = str((task or {}).get("junior") or "").strip()
-        senior = self._githubLogin()
-        try:
-            message = build_project_message(
-                senior,
-                "claimed %s's voluntary task." % junior,
-                kind="task",
-            )
-        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            dialog.set_status(str(error).split("\n")[0], error=True)
-            return
-        message["task_op"] = "claim"
-        message["task_id"] = str((task or {}).get("id") or "")
-        message["junior"] = junior
-        message["senior"] = senior
-        message["description"] = normalize_task_title(
-            (task or {}).get("description") or ""
-        )
-        dialog.accept()
-        self._enqueueTaskMessage(message)
-        self._appendFeed("Claimed %s's voluntary task." % junior)
 
     def _onCancelTaskChosen(self, dialog, task: dict) -> None:
         junior = str((task or {}).get("junior") or "").strip()
@@ -7010,12 +6753,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Reset to shared")
         box.setIcon(qt.QMessageBox.Warning)
+        includes_main = any(str(name).strip().lower() == "main" for name in lanes)
+        warn_main = (
+            "\n\nWarning: main is included — unshared versions on main leave the tree."
+            if includes_main
+            else ""
+        )
         box.setText(
-            "Reset conflicting branches to the shared tips?\n\n"
+            "Reset these branches to the shared tips?\n\n"
             "Branches: %s\n"
             "Other local branches stay unchanged.\n\n"
-            "Warning: conflicting saved versions leave those branch lines."
-            % lanes_label
+            "Warning: saved versions on the reset branches leave those lines."
+            "%s"
+            % (lanes_label, warn_main)
         )
         box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
         box.button(qt.QMessageBox.Ok).setText("Reset to shared")
@@ -7655,7 +7405,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             from_older_main = False
         new_branch_slug = ""
         if not on_branch:
-            destination = self._promptSaveDestination(from_older_main=from_older_main)
+            # Junior: Create a branch only (cannot Share from main).
+            destination = self._promptSaveDestination(
+                from_older_main=from_older_main,
+                junior=self._shareNeedsApproval(),
+            )
             if destination == "cancel":
                 self._appendFeed("Save cancelled.")
                 return
@@ -7850,8 +7604,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "tree → Request review."
             )
         return (
-            "Shared on your branch. To request a review, open My task and "
-            "Propose a Voluntary task (or ask a senior to Assign you one)."
+            "Shared on your branch. To request a review, ask a senior to "
+            "Assign you a task first."
         )
 
     def _positionTaskBadge(self) -> None:
@@ -7899,22 +7653,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 badge.hide()
             return
         button.setStyleSheet(self._taskButtonAccentStyle())
-        # Default label is Tasks; only a project Junior sees My task.
-        show_my_task = bool(self._hasSelectedProject() and not self._canAssignTask())
-        if not show_my_task:
-            button.setText("Tasks")
-            button.setToolTip(
-                "Tasks" if self._hasSelectedProject() else "Select a project first."
-            )
+        button.setText("Tasks")
+        if not self._hasSelectedProject():
+            button.setToolTip("Select a project first.")
             if badge is not None:
                 badge.hide()
             return
-        button.setText("My task")
+        # Junior: tip + badge when a task is assigned; senior: generic tip.
+        if self._canAssignTask():
+            button.setToolTip("Tasks")
+            if badge is not None:
+                badge.hide()
+            return
         task = self._activeTaskAsJunior()
         if task is None:
-            button.setToolTip(
-                "No active task — Propose a Voluntary task, or wait for an Assign."
-            )
+            button.setToolTip("No active task — wait for a senior to Assign you one.")
             if badge is not None:
                 badge.hide()
             return
@@ -7922,17 +7675,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             task.get("submitted_description") or task.get("description") or ""
         )
         senior = str(task.get("senior") or "").strip()
-        kind = str(task.get("kind") or "").strip().lower()
-        if kind == "voluntary" or (not senior and kind != "assigned"):
-            if senior and excerpt:
-                tip = "Voluntary · claimed by %s — %s" % (senior, excerpt)
-            elif senior:
-                tip = "Voluntary · claimed by %s" % senior
-            elif excerpt:
-                tip = "Voluntary · unclaimed — %s" % excerpt
-            else:
-                tip = "Voluntary task · waiting for a senior to Claim"
-        elif excerpt and senior:
+        if excerpt and senior:
             tip = "%s (Assigned by %s)" % (excerpt, senior)
         elif excerpt:
             tip = excerpt
@@ -8397,6 +8140,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _refreshHistoryTable(self) -> None:
         bundle = getattr(self, "_project_history_bundle", None) or {}
         commit_history = bundle.get("commit_history", [])
+        # Same lane→color map as the Version tree (unique among displayed branches).
+        CollaborativeVersioningLib.GraphCanvas.prepare_branch_colors(
+            (spec or {}).get("branch", "main")
+            for spec in (bundle.get("version_specs") or [])
+        )
         self.historyTableWidget.setRowCount(len(commit_history))
         for row_index, row_values in enumerate(commit_history):
             version_id = row_values[0]
