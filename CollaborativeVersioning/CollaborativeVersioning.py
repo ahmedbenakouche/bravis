@@ -95,6 +95,8 @@ from CollaborativeVersioningLib.GitHubAuth import (
     publish_current_line,
     ensure_can_share_with_shared,
     start_local_review_branch,
+    create_and_publish_task_branch,
+    sha_is_shared_on_remote,
     accept_share_request,
     decline_share_request,
     suggest_github_usernames,
@@ -339,7 +341,8 @@ class ProjectConfigDialog(qt.QDialog):
         }
 
 
-_VERSIONS_SYNC_ACTIVITY_KINDS = frozenset(("share", "accept"))
+# Activity that means "remote graph changed" → ⚠ until Compare / Update.
+_VERSIONS_SYNC_ACTIVITY_KINDS = frozenset(("share", "accept", "assign"))
 
 
 def _notification_list_label(item: dict) -> str:
@@ -1762,9 +1765,6 @@ def _notification_text(text: str, limit: int = _NOTIFICATION_TEXT_LEN) -> str:
 class TaskDialog(qt.QDialog):
     """Assign tasks to one or more juniors (senior), or browse all project tasks."""
 
-    # Close Tasks so the senior can click a start version on the Version tree.
-    PICK_START_VERSION = 2
-
     def __init__(
         self,
         parent,
@@ -1788,6 +1788,7 @@ class TaskDialog(qt.QDialog):
         self._can_assign = bool(can_assign)
         self._assign_handler = None
         self._cancel_handler = None
+        self._pick_start_handler = None
         self._anchor_sha = ""
         self._anchor_label = ""
 
@@ -1870,7 +1871,8 @@ class TaskDialog(qt.QDialog):
         start_layout.addWidget(self.pickStartButton, 0)
         form.addRow("Start version:", start_row)
         start_hint = qt.QLabel(
-            "Required. Click Choose on tree, then pick a node (e.g. main/3)."
+            "Required. Choose on tree — only already shared versions "
+            "(solid border). Dashed = share that version first."
         )
         start_hint.setWordWrap(True)
         start_hint.setStyleSheet(DIALOG_HINT_STYLE)
@@ -1972,6 +1974,9 @@ class TaskDialog(qt.QDialog):
     def set_cancel_handler(self, handler) -> None:
         self._cancel_handler = handler
 
+    def set_pick_start_handler(self, handler) -> None:
+        self._pick_start_handler = handler
+
     def export_draft(self) -> dict:
         return {
             "description": self._raw_description(),
@@ -2060,7 +2065,12 @@ class TaskDialog(qt.QDialog):
         return (str(self._anchor_sha or "").strip(), str(self._anchor_label or "").strip())
 
     def _onPickStartClicked(self) -> None:
-        self.done(self.PICK_START_VERSION)
+        handler = self._pick_start_handler
+        if handler is None:
+            self.set_status("Could not open the Version tree.", error=True)
+            return
+        self.set_status("Click a shared version in the Version tree…")
+        handler(self)
 
     def _raw_description(self) -> str:
         try:
@@ -2300,6 +2310,12 @@ class TaskDialog(qt.QDialog):
             start_line.setWordWrap(True)
             start_line.setStyleSheet(DIALOG_HINT_STYLE)
             layout.addWidget(start_line)
+        branch = str(task.get("branch_slug") or "").strip()
+        if branch:
+            branch_line = qt.QLabel("Task branch: %s" % branch)
+            branch_line.setWordWrap(True)
+            branch_line.setStyleSheet(DIALOG_HINT_STYLE)
+            layout.addWidget(branch_line)
         body = qt.QPlainTextEdit()
         body.setReadOnly(True)
         body.setPlainText(description)
@@ -2427,6 +2443,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messageSendReads = {}
         self._people_dialog_open = False
         self._task_dialog_open = False
+        self._open_task_dialog = None
+        self._task_anchor_picking = False
+        self._task_anchor_pick_done = False
         self._notifications_popup_open = False
         self._ontology_graph_pending = False
         self._messages = []
@@ -3197,6 +3216,59 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Enter a valid branch name.", error=True)
             return ""
         return slug
+
+    def _promptTaskBranchName(
+        self,
+        parent=None,
+        start_label: str = "",
+        default_name: str = "",
+    ) -> str:
+        """Ask the senior to name the shared task branch. Empty = cancelled."""
+        host = parent if parent is not None else slicer.util.mainWindow()
+        start = str(start_label or "").strip() or "the chosen start version"
+        suggested = normalize_branch_slug(default_name) or ""
+        name, ok = _qt_input_text(
+            host,
+            "Task branch name",
+            "A shared branch will be created from %s so the assigned "
+            "juniors can work on this task together.\n\n"
+            "Choose a name for that branch:" % start,
+            suggested,
+        )
+        if not ok:
+            return ""
+        slug = normalize_branch_slug(name)
+        if not slug:
+            self._showTaskWarning(
+                "Enter a valid branch name (letters, numbers, dashes).",
+                parent=host,
+            )
+            return ""
+        return slug
+
+    def _showTaskWarning(self, message: str, parent=None) -> None:
+        """Blocking warning box (preferred over a feed line for task pick/assign)."""
+        text = str(message or "").strip() or "Something went wrong."
+        host = parent
+        if host is None:
+            logic = getattr(self, "logic", None)
+            if logic is not None:
+                host = getattr(logic, "historyDialog", None)
+        if host is None:
+            host = getattr(self, "_open_task_dialog", None)
+        if host is None:
+            host = slicer.util.mainWindow()
+        try:
+            slicer.util.warningDisplay(text, windowTitle="Tasks", parent=host)
+            return
+        except TypeError:
+            pass
+        box = qt.QMessageBox(host)
+        box.setWindowTitle("Tasks")
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setText(text)
+        box.setStandardButtons(qt.QMessageBox.Ok)
+        box.exec_()
 
     def _confirmShareCurrentLine(self, local_path: str) -> bool:
         """Explain exactly what Share will publish on the current branch."""
@@ -6523,6 +6595,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if op == "assign":
             excerpt = _task_excerpt(message.get("description") or "")
             start = str(message.get("anchor_label") or "").strip()
+            branch = str(message.get("branch_slug") or "").strip()
             if start and excerpt:
                 text = "%s assigned %s to a task from %s: %s" % (
                     author,
@@ -6536,6 +6609,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 text = "%s assigned %s to a task: %s" % (author, juniors, excerpt)
             else:
                 text = "%s assigned %s to a task." % (author, juniors)
+            if branch:
+                text = "%s Branch %s." % (text.rstrip("."), branch)
         elif op == "cancel":
             text = "%s cancelled the task for %s." % (author, juniors)
         elif op == "submit":
@@ -6647,19 +6722,23 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             anchor_label = str((message or {}).get("anchor_label") or "").strip()
             if not anchor_sha or not anchor_label:
                 raise GitHubAuthError("Choose a start version on the Version tree first.")
-            current.append(
-                {
-                    "id": str(message.get("task_id") or message.get("id") or ""),
-                    "juniors": list(juniors),
-                    "junior": juniors[0],
-                    "senior": senior,
-                    "kind": "assigned",
-                    "description": description,
-                    "status": "",
-                    "anchor_sha": anchor_sha,
-                    "anchor_label": anchor_label,
-                }
+            entry = {
+                "id": str(message.get("task_id") or message.get("id") or ""),
+                "juniors": list(juniors),
+                "junior": juniors[0],
+                "senior": senior,
+                "kind": "assigned",
+                "description": description,
+                "status": "",
+                "anchor_sha": anchor_sha,
+                "anchor_label": anchor_label,
+            }
+            branch_slug = normalize_branch_slug(
+                (message or {}).get("branch_slug") or ""
             )
+            if branch_slug:
+                entry["branch_slug"] = branch_slug
+            current.append(entry)
             return current
         if op in ("propose", "claim"):
             # Voluntary tasks removed — ignore legacy ops if they still appear.
@@ -6786,56 +6865,103 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         dialog.set_cancel_handler(self._onCancelTaskChosen)
         if can_assign:
             dialog.set_assign_handler(self._onAssignTaskChosen)
+            dialog.set_pick_start_handler(self._onPickStartFromTaskDialog)
         self._task_dialog_open = True
+        self._open_task_dialog = dialog
         try:
-            result = dialog.exec_()
+            dialog.exec_()
         finally:
             self._task_dialog_open = False
+            self._open_task_dialog = None
+            if getattr(self, "_task_anchor_picking", False):
+                self._task_anchor_picking = False
+                self._closeHistoryDialog()
             if button is not None:
                 button.setEnabled(True)
             self._updateTaskButtonUi()
-        if can_assign and int(result) == TaskDialog.PICK_START_VERSION:
-            self._task_assign_draft = dialog.export_draft()
-            self._beginTaskAnchorPick()
+
+    def _onPickStartFromTaskDialog(self, dialog) -> None:
+        self._open_task_dialog = dialog
+        self._beginTaskAnchorPick()
 
     def _beginTaskAnchorPick(self) -> None:
+        dialog = getattr(self, "_open_task_dialog", None)
         if not self._projectDataIsLoaded():
-            self._appendFeed("Open the project first to choose a start version.", error=True)
-            draft = getattr(self, "_task_assign_draft", None)
-            qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
+            message = "Open the project first to choose a start version."
+            self._appendFeed(message, error=True)
+            if dialog is not None:
+                dialog.set_status(message, error=True)
             return
         specs = list(
             (getattr(self, "_project_history_bundle", None) or {}).get("version_specs") or []
         )
         if not specs:
-            self._appendFeed("No versions yet to choose as a start.", error=True)
-            draft = getattr(self, "_task_assign_draft", None)
-            qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
+            message = "No versions yet to choose as a start."
+            self._appendFeed(message, error=True)
+            if dialog is not None:
+                dialog.set_status(message, error=True)
             return
         self._task_anchor_picking = True
         self._task_anchor_pick_done = False
-        self._appendFeed("Click the start version in the Version tree.")
-        self.onOpenHistoryGraph(pick_mode=True)
+        self._appendFeed(
+            "Click a shared start version in the Version tree "
+            "(dashed nodes must be shared first)."
+        )
+        self.onOpenHistoryGraph(pick_mode=True, parent=dialog)
+
+    def _versionIsUnshared(self, version_id: str) -> bool:
+        vid = str(version_id or "").strip()
+        if not vid:
+            return True
+        for row in (
+            (getattr(self, "_project_history_bundle", None) or {}).get("commit_history")
+            or []
+        ):
+            if not row or str(row[0] or "").strip() != vid:
+                continue
+            if len(row) > 4 and str(row[4] or "").strip().lower() == "local":
+                return True
+            return False
+        return False
 
     def _finishTaskAnchorPick(self, version_id: str) -> None:
         if not getattr(self, "_task_anchor_picking", False):
             return
+        dialog = getattr(self, "_open_task_dialog", None)
+        logic = getattr(self, "logic", None)
+        graph_parent = (
+            getattr(logic, "historyDialog", None) if logic is not None else None
+        )
         vid = str(version_id or "").strip()
+        if self._versionIsUnshared(vid):
+            message = "You have to share this version first."
+            if dialog is not None:
+                dialog.set_status(message, error=True)
+            self._showTaskWarning(message, parent=graph_parent or dialog)
+            return
         bundle = getattr(self, "_project_history_bundle", None) or {}
         sha = str((bundle.get("sha_by_id") or {}).get(vid) or "").strip().lower()
         label = self._versionDisplayTag(vid) if vid else ""
         if not sha or not label:
-            self._appendFeed("Could not use that version as a start.", error=True)
+            message = "Could not use that version as a start."
+            if dialog is not None:
+                dialog.set_status(message, error=True)
+            self._showTaskWarning(message, parent=graph_parent or dialog)
             return
-        draft = dict(getattr(self, "_task_assign_draft", None) or {})
-        draft["anchor_sha"] = sha
-        draft["anchor_label"] = label
-        self._task_assign_draft = draft
+        local_path = getattr(self, "_local_project_path", None) or ""
+        if local_path and not sha_is_shared_on_remote(local_path, sha):
+            message = "You have to share this version first."
+            if dialog is not None:
+                dialog.set_status(message, error=True)
+            self._showTaskWarning(message, parent=graph_parent or dialog)
+            return
         self._task_anchor_pick_done = True
         self._task_anchor_picking = False
         self._closeHistoryDialog()
+        if dialog is not None:
+            dialog.set_start_version(sha, label)
+            dialog.set_status("Start version set to %s." % label)
         self._appendFeed("Start version set to %s." % label)
-        qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
 
     def _cancelTaskAnchorPick(self) -> None:
         if not getattr(self, "_task_anchor_picking", False):
@@ -6843,9 +6969,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if getattr(self, "_task_anchor_pick_done", False):
             return
         self._task_anchor_picking = False
-        draft = getattr(self, "_task_assign_draft", None)
+        dialog = getattr(self, "_open_task_dialog", None)
         self._appendFeed("Start version not chosen.")
-        qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
+        if dialog is not None:
+            try:
+                dialog.set_status("Start version not chosen.", error=True)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
 
     def _closeHistoryDialog(self) -> None:
         logic = getattr(self, "logic", None)
@@ -6882,6 +7012,56 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not sha or not start:
             dialog.set_status("Choose a start version on the Version tree first.", error=True)
             return
+        local_path = getattr(self, "_local_project_path", None) or ""
+        if not local_path or not self._projectDataIsLoaded():
+            dialog.set_status("Open the project first.", error=True)
+            return
+        if not sha_is_shared_on_remote(local_path, sha):
+            message = "You have to share this version first."
+            dialog.set_status(message, error=True)
+            self._showTaskWarning(message, parent=dialog)
+            return
+        # Same alignment gate as Share: remote extras / tip divergence block Assign.
+        dialog.set_status("Checking alignment with the shared project…")
+        try:
+            dialog.assignButton.setEnabled(False)
+            dialog.pickStartButton.setEnabled(False)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        self._openProgress("Tasks", "Checking the shared project…")
+        try:
+            local_freeze = copy.deepcopy(
+                getattr(self, "_project_history_bundle", None)
+            )
+            ensure_can_share_with_shared(
+                local_path,
+                local_history=local_freeze,
+                action="assign",
+            )
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            try:
+                dialog.assignButton.setEnabled(True)
+                dialog.pickStartButton.setEnabled(True)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            dialog.set_status(str(error).split("\n")[0], error=True)
+            self._showTaskWarning(str(error), parent=dialog)
+            return
+        self._closeProgress()
+        try:
+            dialog.assignButton.setEnabled(True)
+            dialog.pickStartButton.setEnabled(True)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        branch_slug = self._promptTaskBranchName(
+            parent=dialog,
+            start_label=start,
+            default_name=description,
+        )
+        if not branch_slug:
+            dialog.set_status("Branch name required to assign the task.", error=True)
+            return
         label = _task_juniors_label({"juniors": names})
         senior = self._githubLogin()
         try:
@@ -6894,18 +7074,54 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             dialog.set_status(str(error).split("\n")[0], error=True)
             return
+        task_id = str(message.get("id") or "")
+        dialog.set_status("Creating task branch %s…" % branch_slug)
+        try:
+            dialog.assignButton.setEnabled(False)
+            dialog.pickStartButton.setEnabled(False)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        self._openProgress("Tasks", "Creating task branch…")
+        try:
+            self._updateProgress("Publishing task branch %s…" % branch_slug)
+            branch_slug = create_and_publish_task_branch(
+                local_path, sha, branch_slug
+            )
+            self._updateProgress("Updating version history…")
+            history = read_project_history(local_path)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            try:
+                dialog.assignButton.setEnabled(True)
+                dialog.pickStartButton.setEnabled(True)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            err = str(error).split("\n")[0]
+            dialog.set_status(err, error=True)
+            self._showTaskWarning(str(error), parent=dialog)
+            return
+        self._applyProjectHistoryBundle(history)
+        self._closeProgress()
+        self._updateCommitHistoryPanel()
+        self._updateVersionActionButtons()
         message["task_op"] = "assign"
         message["juniors"] = names
         message["junior"] = names[0]
         message["senior"] = senior
         message["description"] = normalize_task_title(description)
-        message["task_id"] = message.get("id")
+        message["task_id"] = task_id
         message["anchor_sha"] = sha
         message["anchor_label"] = start
+        message["branch_slug"] = branch_slug
         dialog.accept()
         self._task_assign_draft = None
         self._enqueueTaskMessage(message)
-        self._appendFeed("Assigned %s to this task (start %s)." % (label, start))
+        self._appendFeed(
+            "Assigned %s to this task (start %s, branch %s)."
+            % (label, start, branch_slug)
+        )
+        # Show the new lane start on the Version tree (e.g. my-task/start).
+        qt.QTimer.singleShot(0, lambda: self.onOpenHistoryGraph(pick_mode=False))
 
     def _onCancelTaskChosen(self, dialog, task: dict) -> None:
         juniors = _task_junior_logins(task)
@@ -8507,16 +8723,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self.logic.openDependencyGraph()
 
-    def onOpenHistoryGraph(self, pick_mode: bool = False) -> None:
+    def onOpenHistoryGraph(self, pick_mode: bool = False, parent=None) -> None:
         if not self._canOpenVersionTree():
             payload = self.getVersionTreePayload()
             self._appendFeed(payload["description"], error=True)
             if pick_mode:
-                draft = getattr(self, "_task_assign_draft", None)
                 self._task_anchor_picking = False
-                qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
+                dialog = getattr(self, "_open_task_dialog", None)
+                if dialog is not None:
+                    dialog.set_status(payload["description"], error=True)
             return
-        self.logic.openVersionHistoryGraph(pick_mode=bool(pick_mode))
+        self.logic.openVersionHistoryGraph(
+            pick_mode=bool(pick_mode),
+            parent=parent,
+        )
 
     def _normalizeHistoryVersionId(self, value) -> str:
         text = str(value or "").strip()
@@ -8709,7 +8929,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
         if widget:
             qt.QTimer.singleShot(100, widget._refreshAnatomyTreeCoverage)
 
-    def openVersionHistoryGraph(self, pick_mode: bool = False) -> None:
+    def openVersionHistoryGraph(self, pick_mode: bool = False, parent=None) -> None:
         graph_module = self._loadGraphModule()
 
         if self.historyDialog:
@@ -8731,11 +8951,14 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
                 (getattr(widget, "_project_history_bundle", None) or {}).get("commit_history", [])
             )
 
-        self.historyDialog = qt.QDialog(slicer.util.mainWindow())
-        self.historyDialog.setWindowFlags(qt.Qt.Window)
+        host = parent if parent is not None else slicer.util.mainWindow()
+        self.historyDialog = qt.QDialog(host)
         if pick_mode:
+            # Keep Tasks open behind; block only that dialog while picking.
+            self.historyDialog.setWindowModality(qt.Qt.WindowModal)
             self.historyDialog.setWindowTitle("Choose start version")
         else:
+            self.historyDialog.setWindowFlags(qt.Qt.Window)
             self.historyDialog.setWindowTitle("Version tree")
         self.historyDialog.resize(820, 620)
 
@@ -8744,8 +8967,8 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
 
         if pick_mode:
             hint_text = (
-                "Click the version where juniors should start "
-                "(shown as main/3 on the tree)."
+                "Click a shared version (solid border), e.g. main/3. "
+                "Dashed / local versions must be shared first."
             )
         else:
             hint_text = graph_description or (

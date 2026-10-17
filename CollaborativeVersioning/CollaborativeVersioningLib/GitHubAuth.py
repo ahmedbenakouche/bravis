@@ -602,15 +602,115 @@ def start_local_review_branch(repo_dir: str, branch_name: str) -> str:
     return slug
 
 
+def suggest_task_branch_slug(description: str, task_id: str = "") -> str:
+    """Auto lane name for a task (shown on the Version tree as <slug>/N)."""
+    desc = normalize_branch_slug(description) or "task"
+    if desc.lower() == "task":
+        base = "task"
+    elif desc.lower().startswith("task-"):
+        base = desc[:40]
+    else:
+        base = ("task-%s" % desc)[:40]
+    token = re.sub(r"[^A-Za-z0-9]+", "", str(task_id or ""))[-8:]
+    if not token:
+        token = os.urandom(3).hex()
+    return normalize_branch_slug("%s-%s" % (base.rstrip("-"), token)) or (
+        "task-%s" % token
+    )
+
+
+def sha_is_shared_on_remote(repo_dir: str, sha: str) -> bool:
+    """True when this commit is already on origin/main or origin/cv-review/*."""
+    tip = _git_rev_parse(repo_dir, sha)
+    if not tip or not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return False
+    commit_by_sha = _read_repo_commits(repo_dir)
+    if not commit_by_sha:
+        return False
+    shared = _shared_remote_shas(repo_dir, commit_by_sha)
+    return tip.lower() in {item.lower() for item in shared}
+
+
+def create_and_publish_task_branch(repo_dir: str, sha: str, branch_name: str) -> str:
+    """Create cv-review/<slug> at sha and push only that ref. Does not move HEAD/main.
+
+    The start commit must already be shared. Other local unshared versions are not pushed.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    slug = normalize_branch_slug(branch_name)
+    if not slug:
+        raise GitHubAuthError("Could not name the task branch.")
+    tip = _git_rev_parse(repo_dir, sha)
+    if not tip:
+        raise GitHubAuthError("Start version not found in the local project.")
+    # Refresh remote refs only (no worktree change) so we see existing task branches.
+    fetch_remote_updates(repo_dir)
+    if not sha_is_shared_on_remote(repo_dir, tip):
+        raise GitHubAuthError(
+            "You have to share this version first before using it as a task start."
+        )
+    branch = review_branch_for(slug)
+    remote_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch)
+    local_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
+    existing = remote_tip or local_tip
+    if existing and existing.lower() != tip.lower():
+        raise GitHubAuthError(
+            "Task branch '%s' already exists with different versions.\n\n"
+            "Choose another branch name." % slug
+        )
+    created = _run_git(["branch", "-f", branch, tip], cwd=repo_dir, timeout=30)
+    if created.returncode != 0:
+        detail = (created.stderr or created.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not create the task branch.\n%s" % detail[:400]
+        )
+    if remote_tip and remote_tip.lower() == tip.lower():
+        _acknowledge_task_branch_cap(repo_dir, slug, tip)
+        return slug
+    push = _run_git(
+        ["push", "origin", "%s:refs/heads/%s" % (tip, branch)],
+        cwd=repo_dir,
+        timeout=180,
+    )
+    if push.returncode != 0:
+        raise GitHubAuthError(
+            _share_failure_message((push.stderr or push.stdout or "").strip())
+        )
+    _run_git(
+        ["update-ref", "refs/remotes/origin/%s" % branch, tip],
+        cwd=repo_dir,
+        timeout=20,
+    )
+    _acknowledge_task_branch_cap(repo_dir, slug, tip)
+    return slug
+
+
+def _acknowledge_task_branch_cap(repo_dir: str, slug: str, sha: str) -> None:
+    """Allow the new task lane tip in the Version tree without a full remote absorb."""
+    key = str(slug or "").strip().lower()
+    tip = str(sha or "").strip()
+    if not key or not tip:
+        return
+    caps = load_remote_sync_caps(repo_dir) or capture_remote_sync_caps(repo_dir)
+    tips = dict(caps.get("review_tips") or {})
+    tips[key] = tip
+    if not caps.get("origin_main"):
+        caps["origin_main"] = _git_rev_parse(repo_dir, "origin/main") or ""
+    caps["review_tips"] = tips
+    save_remote_sync_caps(repo_dir, caps)
+
+
 def ensure_can_share_with_shared(
     repo_dir: str,
     local_history: dict[str, Any] | None = None,
+    action: str = "share",
 ) -> None:
-    """Fetch and refuse Share when the shared project is ahead or tips diverged.
+    """Fetch and refuse publish actions when the shared project is ahead or tips diverged.
 
-    Local unshared versions alone do not block Share. Remote extras, tip
-    conflicts, or an obsolete merged branch require Compare → Update/resolve
-    first (strict alignment before any Share).
+    Used before Share and before Assign (task-branch push). Local unshared
+    versions alone do not block. Remote extras, tip conflicts, or an obsolete
+    merged branch require Compare → Update/resolve first.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -621,10 +721,13 @@ def ensure_can_share_with_shared(
         or compare.get("conflict")
         or compare.get("obsolete_merged")
     ):
+        verb = str(action or "share").strip().lower() or "share"
+        label = verb[:1].upper() + verb[1:]
         raise GitHubAuthError(
-            "Could not share. The shared project has versions that are not on "
+            "Could not %s. The shared project has versions that are not on "
             "this computer yet (or tips diverged).\n\n"
-            "Open Compare with shared (bell), Update or resolve, then Share again."
+            "Open Compare with shared (bell), Update or resolve, then %s again."
+            % (verb, label)
         )
 
 
@@ -1658,10 +1761,13 @@ def build_project_history_model(
         add_spec("main/%d" % index, sha, parent_id, "main")
 
     lane_shas: dict[str, list[str]] = {}
+    # Tip per lane (even when it still points at a main commit — empty task branch).
+    lane_tips: dict[str, str] = {}
 
     def remember_side(slug: str, tip: str) -> None:
         if not slug or not tip:
             return
+        lane_tips[slug] = tip
         lane_shas.setdefault(slug, []).extend(_unique_side_chain(commit_by_sha, tip, main_set))
 
     for login, tips in sorted(review_tips.items(), key=lambda item: item[0]):
@@ -1691,6 +1797,28 @@ def build_project_history_model(
             parent_id = id_by_sha.get(first)
             add_spec("%s/%d" % (slug, index), sha, parent_id, slug)
 
+    # Empty shared lanes (tip still on main): show a visible start node on the tree.
+    for slug, tip in sorted(lane_tips.items()):
+        prefix = "%s/" % slug
+        if any(str(vid).startswith(prefix) for vid in specs_by_id):
+            continue
+        parent_id = id_by_sha.get(tip)
+        if not parent_id:
+            continue
+        stub_id = "%s/start" % slug
+        if stub_id in specs_by_id:
+            continue
+        specs_by_id[stub_id] = {
+            "id": stub_id,
+            "parent": parent_id,
+            "branch": slug,
+            "tag": stub_id,
+            "merge": False,
+            "lane_start": True,
+        }
+        tags[stub_id] = stub_id
+        sha_by_id[stub_id] = tip
+
     leftover = []
     if head_sha:
         for sha in reversed(_first_parent_chain(commit_by_sha, head_sha)):
@@ -1716,6 +1844,7 @@ def build_project_history_model(
             spec["merge_from"] = merge_from
 
     history_rows = []
+    seen_history_ids = set()
     for sha, version_id in id_by_sha.items():
         record = commit_by_sha.get(sha) or {}
         status = _lane_status(sha, shared_shas or set())
@@ -1732,6 +1861,29 @@ def build_project_history_model(
                 ],
             )
         )
+        seen_history_ids.add(version_id)
+    # Lane-start stubs share a main SHA; still list them so Status/pick can see them.
+    for version_id, spec in specs_by_id.items():
+        if version_id in seen_history_ids:
+            continue
+        sha = sha_by_id.get(version_id) or ""
+        record = commit_by_sha.get(sha) or {}
+        status = _lane_status(sha, shared_shas or set())
+        label = "Task start" if spec.get("lane_start") else str(record.get("message") or "")
+        history_rows.append(
+            (
+                record.get("date") or "",
+                version_id,
+                [
+                    version_id,
+                    _format_git_date(str(record.get("date") or "")),
+                    str(record.get("author") or ""),
+                    label,
+                    status,
+                ],
+            )
+        )
+        seen_history_ids.add(version_id)
     history_rows.sort(key=lambda item: item[0], reverse=True)
     specs = []
     seen_specs = set()
@@ -3248,6 +3400,9 @@ def _normalize_stored_tasks(document) -> list[dict]:
             entry["anchor_sha"] = anchor_sha
         if anchor_label:
             entry["anchor_label"] = anchor_label
+        branch_slug = normalize_branch_slug(item.get("branch_slug") or "")
+        if branch_slug:
+            entry["branch_slug"] = branch_slug
         submitted = normalize_task_title(item.get("submitted_description") or "")
         if submitted:
             entry["submitted_description"] = submitted
