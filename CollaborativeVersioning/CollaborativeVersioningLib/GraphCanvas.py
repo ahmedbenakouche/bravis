@@ -1145,6 +1145,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
         diff_side=None,
         minimum_height=480,
         fit_tight=False,
+        pick_mode=False,
     ):
         InteractiveGraphView.__init__(self, parent)
         self.logic = logic
@@ -1154,6 +1155,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.active_version_id = active_version_id
         self.commit_history_by_id = dict(commit_history_by_id or {})
         self.read_only = bool(read_only)
+        self.pick_mode = bool(pick_mode)
         self.conflict_ids = set(conflict_ids or ())
         # "local" | "shared" — caption wording next to the red diff pointer
         self.diff_side = str(diff_side or "").strip().lower()
@@ -1249,7 +1251,9 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.reset_view()
 
     def create_toolbar(self):
-        if self.read_only:
+        if self.pick_mode:
+            hint = qt.QLabel("Click a node to set the task start version")
+        elif self.read_only:
             hint = qt.QLabel("Read-only · Double-click for details")
         else:
             hint = qt.QLabel("Click a node to check out · Double-click for details")
@@ -1287,7 +1291,13 @@ class VersionHistoryCanvas(InteractiveGraphView):
     def _on_single_click_timeout(self):
         node_id = self._pending_node_id
         self._pending_node_id = None
-        if not node_id or self.read_only:
+        if not node_id:
+            return
+        if self.pick_mode:
+            if hasattr(self.logic, "onVersionPickedForTask"):
+                self.logic.onVersionPickedForTask(node_id)
+            return
+        if self.read_only:
             return
         if hasattr(self.logic, "onVersionCheckedOut"):
             self.logic.onVersionCheckedOut(node_id)
@@ -1311,7 +1321,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
             scene_pos = self.mapToScene(_qt_event_pos(event))
             node_id = self._node_at_scene_pos(scene_pos)
             if node_id:
-                if self.read_only:
+                if self.read_only and not self.pick_mode:
                     event.accept()
                     return
                 self._pending_node_id = node_id
@@ -1327,6 +1337,12 @@ class VersionHistoryCanvas(InteractiveGraphView):
             scene_pos = self.mapToScene(_qt_event_pos(event))
             node_id = self._node_at_scene_pos(scene_pos)
             if node_id:
+                if self.pick_mode:
+                    # In pick mode a double-click also selects the start version.
+                    if hasattr(self.logic, "onVersionPickedForTask"):
+                        self.logic.onVersionPickedForTask(node_id)
+                    event.accept()
+                    return
                 self._show_version_info(node_id)
                 event.accept()
                 return

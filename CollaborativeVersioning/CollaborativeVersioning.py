@@ -1702,6 +1702,56 @@ def _task_excerpt(description: str) -> str:
     return text[:_TASK_EXCERPT_LEN].rstrip() + "…"
 
 
+def _task_junior_logins(task) -> list[str]:
+    """Juniors on a task (multi-assign). Falls back to legacy single ``junior``."""
+    names = []
+    seen = set()
+    raw = (task or {}).get("juniors") if isinstance(task, dict) else None
+    if isinstance(raw, (list, tuple)):
+        candidates = raw
+    else:
+        one = (task or {}).get("junior") if isinstance(task, dict) else None
+        candidates = [one] if one else []
+    for item in candidates:
+        login = str(item or "").strip()
+        key = login.lower()
+        if not login or key in seen:
+            continue
+        seen.add(key)
+        names.append(login)
+    return names
+
+
+def _task_juniors_label(task) -> str:
+    names = _task_junior_logins(task)
+    if not names:
+        return "no juniors"
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return "%s and %s" % (names[0], names[1])
+    return "%s, and %s" % (", ".join(names[:-1]), names[-1])
+
+
+def _task_status_mark(task) -> str:
+    """List / detail mark: in progress, submitted (awaiting review), or closed."""
+    status = str((task or {}).get("status") or "").strip().lower()
+    if status == "accepted":
+        return "✅"
+    if status == "submitted":
+        return "🔵"
+    return "🟠"
+
+
+def _task_status_label(task) -> str:
+    status = str((task or {}).get("status") or "").strip().lower()
+    if status == "accepted":
+        return "Closed"
+    if status == "submitted":
+        return "Submitted — awaiting review"
+    return "In progress"
+
+
 def _notification_text(text: str, limit: int = _NOTIFICATION_TEXT_LEN) -> str:
     cleaned = " ".join(str(text or "").split())
     if len(cleaned) <= limit:
@@ -1710,12 +1760,23 @@ def _notification_text(text: str, limit: int = _NOTIFICATION_TEXT_LEN) -> str:
 
 
 class TaskDialog(qt.QDialog):
-    """Assign tasks (senior) or view your assigned task (junior)."""
+    """Assign tasks to one or more juniors (senior), or browse all project tasks."""
 
-    def __init__(self, parent, people=None, tasks=None, me="", can_assign=False) -> None:
+    # Close Tasks so the senior can click a start version on the Version tree.
+    PICK_START_VERSION = 2
+
+    def __init__(
+        self,
+        parent,
+        people=None,
+        tasks=None,
+        me="",
+        can_assign=False,
+        draft=None,
+    ) -> None:
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("Tasks")
-        self.setFixedWidth(460)
+        self.setFixedWidth(520)
         self.setModal(True)
         self._people = list(people or [])
         # Voluntary tasks are retired — only assigned tasks remain.
@@ -1727,6 +1788,8 @@ class TaskDialog(qt.QDialog):
         self._can_assign = bool(can_assign)
         self._assign_handler = None
         self._cancel_handler = None
+        self._anchor_sha = ""
+        self._anchor_label = ""
 
         layout = qt.QVBoxLayout(self)
         layout.setSpacing(10)
@@ -1735,9 +1798,6 @@ class TaskDialog(qt.QDialog):
         form = qt.QFormLayout(self.assignPanel)
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
-        self.juniorCombo = qt.QComboBox()
-        self.juniorCombo.setStyleSheet(FIELD_STYLE)
-        form.addRow("Junior:", self.juniorCombo)
         self.descriptionEdit = qt.QPlainTextEdit()
         self.descriptionEdit.setStyleSheet(FIELD_STYLE)
         self.descriptionEdit.setPlaceholderText("What should they work on?")
@@ -1749,18 +1809,85 @@ class TaskDialog(qt.QDialog):
         except (AttributeError, TypeError, RuntimeError):
             pass
         form.addRow("Description:", self.descriptionEdit)
+        self.juniorList = qt.QListWidget()
+        # Slicer's default list indicators are often invisible; draw a clear box.
+        accent = ACCENT_ICE or "#5b9fd4"
+        self.juniorList.setStyleSheet(
+            """
+            QListWidget {
+                background-color: palette(base);
+                color: palette(text);
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                outline: none;
+                padding: 2px;
+            }
+            QListWidget::item {
+                padding: 4px 6px;
+                margin: 1px 0px;
+            }
+            QListWidget::indicator {
+                width: 15px;
+                height: 15px;
+                border: 1px solid palette(text);
+                border-radius: 3px;
+                background-color: palette(base);
+            }
+            QListWidget::indicator:unchecked {
+                border: 1px solid palette(text);
+                background-color: palette(base);
+            }
+            QListWidget::indicator:checked {
+                border: 1px solid %s;
+                background-color: %s;
+            }
+            """
+            % (accent, accent)
+        )
+        self.juniorList.setMinimumHeight(96)
+        self.juniorList.setMaximumHeight(140)
+        self.juniorList.setSelectionMode(qt.QAbstractItemView.NoSelection)
+        form.addRow("Juniors:", self.juniorList)
         hint = qt.QLabel(
-            "This junior will work with you. One junior can only have one task at a time."
+            "Check one or more juniors. A junior can be on several tasks."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(DIALOG_HINT_STYLE)
         form.addRow(hint)
+        start_row = qt.QWidget()
+        start_layout = qt.QHBoxLayout(start_row)
+        start_layout.setContentsMargins(0, 0, 0, 0)
+        start_layout.setSpacing(8)
+        self.startVersionLabel = qt.QLabel("")
+        self.startVersionLabel.setWordWrap(True)
+        self.startVersionLabel.setMinimumHeight(32)
+        self.startVersionLabel.setAlignment(qt.Qt.AlignVCenter | qt.Qt.AlignLeft)
+        self.pickStartButton = qt.QPushButton("Choose on tree")
+        self.pickStartButton.setStyleSheet(BTN_HISTORY)
+        self.pickStartButton.setMinimumHeight(32)
+        self.pickStartButton.connect("clicked()", self._onPickStartClicked)
+        start_layout.addWidget(self.startVersionLabel, 1)
+        start_layout.addWidget(self.pickStartButton, 0)
+        form.addRow("Start version:", start_row)
+        start_hint = qt.QLabel(
+            "Required. Click Choose on tree, then pick a node (e.g. main/3)."
+        )
+        start_hint.setWordWrap(True)
+        start_hint.setStyleSheet(DIALOG_HINT_STYLE)
+        form.addRow(start_hint)
+        self._refreshStartVersionUi()
         layout.addWidget(self.assignPanel)
         self.assignPanel.setVisible(self._can_assign)
 
         active_label = qt.QLabel("Tasks:")
         active_label.setStyleSheet(DIALOG_HINT_STYLE)
         layout.addWidget(active_label)
+        legend = qt.QLabel(
+            "🟠 In progress   ·   🔵 Submitted (awaiting review)   ·   ✅ Closed"
+        )
+        legend.setWordWrap(True)
+        legend.setStyleSheet(DIALOG_HINT_STYLE)
+        layout.addWidget(legend)
         self.taskList = qt.QListWidget()
         self.taskList.setMinimumHeight(200)
         self.taskList.setMaximumHeight(280)
@@ -1833,7 +1960,8 @@ class TaskDialog(qt.QDialog):
         self.taskList.connect("currentRowChanged(int)", self._onTaskRowChanged)
         self.taskList.connect("itemDoubleClicked(QListWidgetItem*)", self._onTaskDoubleClicked)
         if self._can_assign:
-            self._fillCombos()
+            self._fillJuniorList()
+            self.apply_draft(draft)
         self._fillTasks()
         self._updateDetail()
         self._updateActionButtons()
@@ -1844,6 +1972,105 @@ class TaskDialog(qt.QDialog):
     def set_cancel_handler(self, handler) -> None:
         self._cancel_handler = handler
 
+    def export_draft(self) -> dict:
+        return {
+            "description": self._raw_description(),
+            "juniors": self.selected_juniors(),
+            "anchor_sha": str(self._anchor_sha or "").strip(),
+            "anchor_label": str(self._anchor_label or "").strip(),
+        }
+
+    def apply_draft(self, draft) -> None:
+        data = draft if isinstance(draft, dict) else {}
+        text = str(data.get("description") or "")
+        try:
+            self.descriptionEdit.setPlainText(text)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+        chosen = {
+            str(name or "").strip().lower()
+            for name in (data.get("juniors") or [])
+            if str(name or "").strip()
+        }
+        if chosen:
+            try:
+                count = self.juniorList.count
+                if callable(count):
+                    count = count()
+                count = int(count)
+            except (TypeError, AttributeError, RuntimeError, ValueError):
+                count = 0
+            for index in range(count):
+                item = self.juniorList.item(index)
+                if item is None:
+                    continue
+                try:
+                    login = str(item.data(qt.Qt.UserRole) or "").strip().lower()
+                except (AttributeError, TypeError, RuntimeError):
+                    login = ""
+                if login and login in chosen:
+                    item.setCheckState(qt.Qt.Checked)
+        self.set_start_version(
+            data.get("anchor_sha") or "",
+            data.get("anchor_label") or "",
+        )
+
+    def set_start_version(self, sha: str, label: str) -> None:
+        self._anchor_sha = str(sha or "").strip()
+        self._anchor_label = str(label or "").strip()
+        self._refreshStartVersionUi()
+
+    def _refreshStartVersionUi(self) -> None:
+        label = getattr(self, "startVersionLabel", None)
+        if label is None:
+            return
+        accent = ACCENT_ICE or "#5b9fd4"
+        muted = TEXT_MUTED or "#8a8a8a"
+        border = BORDER or "#505050"
+        if self._anchor_label:
+            label.setText(self._anchor_label)
+            label.setStyleSheet(
+                "QLabel {"
+                " background-color: palette(base);"
+                " color: %s;"
+                " border: 1px solid %s;"
+                " border-radius: 6px;"
+                " padding: 6px 10px;"
+                " font-weight: 700;"
+                " font-size: 12px;"
+                "}"
+                % (accent, accent)
+            )
+        else:
+            label.setText("No start version yet")
+            label.setStyleSheet(
+                "QLabel {"
+                " background-color: palette(window);"
+                " color: %s;"
+                " border: 1px dashed %s;"
+                " border-radius: 6px;"
+                " padding: 6px 10px;"
+                " font-weight: 600;"
+                " font-size: 11px;"
+                "}"
+                % (muted, border)
+            )
+
+    def selected_start_version(self) -> tuple[str, str]:
+        return (str(self._anchor_sha or "").strip(), str(self._anchor_label or "").strip())
+
+    def _onPickStartClicked(self) -> None:
+        self.done(self.PICK_START_VERSION)
+
+    def _raw_description(self) -> str:
+        try:
+            text = self.descriptionEdit.toPlainText()
+            if callable(text):
+                text = text()
+        except (TypeError, AttributeError, RuntimeError):
+            text = ""
+        return str(text or "")
+
     def set_status(self, message: str, error: bool = False) -> None:
         text = (message or "").strip()
         self.statusLabel.setText(text)
@@ -1853,8 +2080,40 @@ class TaskDialog(qt.QDialog):
         color = FEED_COLOR_ERROR if error else ACCENT_MINT
         self.statusLabel.setStyleSheet("color: %s; font-size: 11px; font-weight: 600;" % color)
 
-    def selected_junior(self) -> str:
-        return self._combo_user(self.juniorCombo)
+    def selected_juniors(self) -> list[str]:
+        names = []
+        try:
+            count = self.juniorList.count
+            if callable(count):
+                count = count()
+            count = int(count)
+        except (TypeError, AttributeError, RuntimeError, ValueError):
+            count = 0
+        for index in range(count):
+            item = self.juniorList.item(index)
+            if item is None:
+                continue
+            try:
+                checked = item.checkState() == qt.Qt.Checked
+            except (AttributeError, TypeError, RuntimeError):
+                checked = False
+            if not checked:
+                continue
+            try:
+                login = str(item.data(qt.Qt.UserRole) or "").strip()
+            except (AttributeError, TypeError, RuntimeError):
+                login = ""
+            if not login:
+                try:
+                    text = item.text()
+                    if callable(text):
+                        text = text()
+                    login = str(text or "").strip()
+                except (AttributeError, TypeError, RuntimeError):
+                    login = ""
+            if login and login != "No junior on this project":
+                names.append(login)
+        return names
 
     def task_description(self) -> str:
         try:
@@ -1874,15 +2133,6 @@ class TaskDialog(qt.QDialog):
             return None
         return self._tasks[row]
 
-    def _combo_user(self, combo) -> str:
-        try:
-            label = combo.currentText
-            if callable(label):
-                label = label()
-        except (TypeError, AttributeError, RuntimeError):
-            label = ""
-        return str(label or "").strip()
-
     @staticmethod
     def _is_assigned_task(task: dict) -> bool:
         kind = str((task or {}).get("kind") or "").strip().lower()
@@ -1893,18 +2143,7 @@ class TaskDialog(qt.QDialog):
         # Legacy rows without kind: keep only if a senior is set.
         return bool(str((task or {}).get("senior") or "").strip())
 
-    def _busy_juniors(self) -> set:
-        busy = set()
-        for task in self._all_tasks:
-            if str(task.get("status") or "") == "accepted":
-                continue
-            login = str(task.get("junior") or "").strip().lower()
-            if login:
-                busy.add(login)
-        return busy
-
-    def _fillCombos(self) -> None:
-        busy = self._busy_juniors()
+    def _fillJuniorList(self) -> None:
         juniors = []
         for person in self._people:
             login = str(person.get("login") or "").strip()
@@ -1912,15 +2151,26 @@ class TaskDialog(qt.QDialog):
             if not login or role in ("pending", "owner"):
                 continue
             access = str(person.get("access") or PEOPLE_ACCESS_JUNIOR)
-            if access == PEOPLE_ACCESS_JUNIOR and login.lower() not in busy:
+            if access == PEOPLE_ACCESS_JUNIOR:
                 juniors.append(login)
-        self.juniorCombo.clear()
+        self.juniorList.clear()
         if juniors:
             for login in juniors:
-                self.juniorCombo.addItem(login)
+                item = qt.QListWidgetItem(login)
+                item.setFlags(
+                    item.flags()
+                    | qt.Qt.ItemIsUserCheckable
+                    | qt.Qt.ItemIsEnabled
+                )
+                item.setFlags(item.flags() & ~qt.Qt.ItemIsSelectable)
+                item.setData(qt.Qt.UserRole, login)
+                item.setCheckState(qt.Qt.Unchecked)
+                self.juniorList.addItem(item)
             self.assignButton.setEnabled(True)
         else:
-            self.juniorCombo.addItem("No junior is free")
+            item = qt.QListWidgetItem("No junior on this project")
+            item.setFlags(qt.Qt.NoItemFlags)
+            self.juniorList.addItem(item)
             self.assignButton.setEnabled(False)
 
     def _isMyActiveTask(self, task: dict) -> bool:
@@ -1931,15 +2181,18 @@ class TaskDialog(qt.QDialog):
             return False
         if str(task.get("status") or "") == "accepted":
             return False
-        return str(task.get("junior") or "").strip().lower() == me
+        return me in {name.lower() for name in _task_junior_logins(task)}
 
     def _task_list_label(self, task: dict) -> str:
-        junior = str(task.get("junior") or "").strip()
+        juniors = _task_juniors_label(task)
         senior = str(task.get("senior") or "").strip()
-        accepted = str(task.get("status") or "") == "accepted"
         excerpt = _task_excerpt(task.get("description") or "") or "No description."
-        mark = "✅" if accepted else "⏳"
-        label = "%s  %s -> %s : %s" % (mark, senior, junior, excerpt)
+        mark = _task_status_mark(task)
+        start = str(task.get("anchor_label") or "").strip()
+        if start:
+            label = "%s  %s -> %s · %s : %s" % (mark, senior, juniors, start, excerpt)
+        else:
+            label = "%s  %s -> %s : %s" % (mark, senior, juniors, excerpt)
         if self._isMyActiveTask(task):
             return "● Your task — %s" % label
         return label
@@ -1947,7 +2200,7 @@ class TaskDialog(qt.QDialog):
     def _emptyTasksMessage(self) -> str:
         if self._can_assign:
             return "No task yet."
-        return "No task yet for you. Wait for a senior to assign one."
+        return "No task yet. Wait for a senior to assign one."
 
     def _fillTasks(self) -> None:
         self.taskList.clear()
@@ -2024,20 +2277,29 @@ class TaskDialog(qt.QDialog):
 
     def _showTaskText(self, task) -> None:
         senior = str(task.get("senior") or "").strip()
-        junior = str(task.get("junior") or "").strip()
+        juniors = _task_juniors_label(task)
         description = str(task.get("description") or "").strip() or "No description."
+        start = str(task.get("anchor_label") or "").strip()
         dialog = qt.QDialog(self)
         dialog.setWindowTitle("Task")
         dialog.setFixedWidth(420)
         dialog.setModal(True)
         layout = qt.QVBoxLayout(dialog)
-        title_text = "%s assigned %s to this task." % (senior, junior)
-        title = qt.QLabel(title_text)
-        if str(task.get("status") or "") == "accepted":
-            title.setText("✅ " + title.text)
+        status_line = qt.QLabel(
+            "%s  %s" % (_task_status_mark(task), _task_status_label(task))
+        )
+        status_line.setWordWrap(True)
+        status_line.setStyleSheet(DIALOG_HINT_STYLE)
+        layout.addWidget(status_line)
+        title = qt.QLabel("%s assigned %s to this task." % (senior, juniors))
         title.setWordWrap(True)
         title.setStyleSheet(DIALOG_HINT_STYLE)
         layout.addWidget(title)
+        if start:
+            start_line = qt.QLabel("Start version: %s" % start)
+            start_line.setWordWrap(True)
+            start_line.setStyleSheet(DIALOG_HINT_STYLE)
+            layout.addWidget(start_line)
         body = qt.QPlainTextEdit()
         body.setReadOnly(True)
         body.setPlainText(description)
@@ -2056,17 +2318,21 @@ class TaskDialog(qt.QDialog):
         self.cancelTaskButton.setEnabled(self._canCancelSelected())
 
     def _onAssignClicked(self) -> None:
-        junior = self.selected_junior()
-        if not junior or junior == "No junior is free":
-            self.set_status("Select a junior first.", error=True)
+        juniors = self.selected_juniors()
+        if not juniors:
+            self.set_status("Select at least one junior.", error=True)
             return
         description = self.task_description()
         if not description:
             self.set_status("Write a short description first.", error=True)
             return
+        anchor_sha, anchor_label = self.selected_start_version()
+        if not anchor_sha or not anchor_label:
+            self.set_status("Choose a start version on the Version tree first.", error=True)
+            return
         handler = self._assign_handler
         if handler is not None:
-            handler(self, junior, description)
+            handler(self, juniors, description, anchor_sha, anchor_label)
 
     def _onCancelTaskClicked(self) -> None:
         task = self.selected_task()
@@ -5435,7 +5701,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not name:
             return ""
         for task in getattr(self, "_project_tasks", []) or []:
-            if str(task.get("junior") or "").strip().lower() != name:
+            if name not in {login.lower() for login in _task_junior_logins(task)}:
                 continue
             if str(task.get("status") or "") == "accepted":
                 continue
@@ -6251,16 +6517,27 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if op not in ("assign", "cancel", "submit", "accept"):
             return None
         author = str(message.get("author") or self._githubLogin() or "Someone")
-        junior = str(message.get("junior") or "").strip() or "a junior"
+        juniors = _task_juniors_label(message)
+        if juniors == "no juniors":
+            juniors = "a junior"
         if op == "assign":
             excerpt = _task_excerpt(message.get("description") or "")
-            text = (
-                "%s assigned %s to a task: %s" % (author, junior, excerpt)
-                if excerpt
-                else "%s assigned %s to a task." % (author, junior)
-            )
+            start = str(message.get("anchor_label") or "").strip()
+            if start and excerpt:
+                text = "%s assigned %s to a task from %s: %s" % (
+                    author,
+                    juniors,
+                    start,
+                    excerpt,
+                )
+            elif start:
+                text = "%s assigned %s to a task from %s." % (author, juniors, start)
+            elif excerpt:
+                text = "%s assigned %s to a task: %s" % (author, juniors, excerpt)
+            else:
+                text = "%s assigned %s to a task." % (author, juniors)
         elif op == "cancel":
-            text = "%s cancelled the task for %s." % (author, junior)
+            text = "%s cancelled the task for %s." % (author, juniors)
         elif op == "submit":
             excerpt = _task_excerpt(message.get("description") or "")
             text = (
@@ -6271,9 +6548,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         else:
             excerpt = _task_excerpt(message.get("description") or "")
             text = (
-                "%s accepted %s's line onto main for task: %s" % (author, junior, excerpt)
+                "%s accepted %s's line onto main for task: %s" % (author, juniors, excerpt)
                 if excerpt
-                else "%s accepted %s's line onto main." % (author, junior)
+                else "%s accepted %s's line onto main." % (author, juniors)
             )
         try:
             return build_project_activity(author, op, text)
@@ -6358,28 +6635,29 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         op = str((message or {}).get("task_op") or "").strip()
         if not op:
             return current
-        junior = str((message or {}).get("junior") or "").strip()
+        juniors = _task_junior_logins(message)
         senior = str((message or {}).get("senior") or "").strip()
         description = normalize_task_title((message or {}).get("description"))
         if op == "assign":
-            if not junior or not senior:
-                raise GitHubAuthError("Select a junior first.")
+            if not juniors or not senior:
+                raise GitHubAuthError("Select at least one junior.")
             if not description:
                 raise GitHubAuthError("Write a short description first.")
-            if any(
-                str(task.get("junior") or "").lower() == junior.lower()
-                and str(task.get("status") or "") != "accepted"
-                for task in current
-            ):
-                raise GitHubAuthError("%s already has a task." % junior)
+            anchor_sha = str((message or {}).get("anchor_sha") or "").strip().lower()
+            anchor_label = str((message or {}).get("anchor_label") or "").strip()
+            if not anchor_sha or not anchor_label:
+                raise GitHubAuthError("Choose a start version on the Version tree first.")
             current.append(
                 {
                     "id": str(message.get("task_id") or message.get("id") or ""),
-                    "junior": junior,
+                    "juniors": list(juniors),
+                    "junior": juniors[0],
                     "senior": senior,
                     "kind": "assigned",
                     "description": description,
                     "status": "",
+                    "anchor_sha": anchor_sha,
+                    "anchor_label": anchor_label,
                 }
             )
             return current
@@ -6397,7 +6675,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return self._tasksWithStatus(current, message, "accepted")
         if op == "cancel":
             tid = str((message or {}).get("task_id") or "").strip()
-            junior_key = junior.lower()
+            junior_keys = {name.lower() for name in juniors}
             kept = []
             removed = False
             for task in current:
@@ -6405,8 +6683,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     kept.append(task)
                     continue
                 matches = bool(tid) and str(task.get("id") or "") == tid
-                if not matches and not tid and junior_key:
-                    matches = str(task.get("junior") or "").lower() == junior_key
+                if not matches and not tid and junior_keys:
+                    task_keys = {name.lower() for name in _task_junior_logins(task)}
+                    matches = bool(junior_keys & task_keys)
                 if matches and not removed:
                     removed = True
                     continue
@@ -6416,7 +6695,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _tasksWithStatus(self, tasks, message, status: str, snapshot: str = ""):
         tid = str((message or {}).get("task_id") or "").strip()
-        junior_key = str((message or {}).get("junior") or "").strip().lower()
+        junior_keys = {name.lower() for name in _task_junior_logins(message)}
         updated = []
         matched = False
         for task in tasks or []:
@@ -6424,8 +6703,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 updated.append(task)
                 continue
             matches = bool(tid) and str(task.get("id") or "") == tid
-            if not matches and not tid and junior_key:
-                matches = str(task.get("junior") or "").lower() == junior_key
+            if not matches and not tid and junior_keys:
+                task_keys = {name.lower() for name in _task_junior_logins(task)}
+                matches = bool(junior_keys & task_keys)
             if matches and not matched:
                 task = dict(task)
                 task["status"] = status
@@ -6463,7 +6743,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not getattr(self, "_sending_message", False):
             self._startNextQueuedSend()
 
-    def onOpenTask(self) -> None:
+    def onOpenTask(self, draft=None) -> None:
         if not self._connected:
             self._appendFeed("Connect with GitHub first.", error=True)
             return
@@ -6495,6 +6775,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 tasks=getattr(self, "_project_tasks", []) or [],
                 me=self._githubLogin(),
                 can_assign=can_assign,
+                draft=draft if can_assign else None,
             )
         except Exception as error:
             if button is not None:
@@ -6507,39 +6788,132 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             dialog.set_assign_handler(self._onAssignTaskChosen)
         self._task_dialog_open = True
         try:
-            dialog.exec_()
+            result = dialog.exec_()
         finally:
             self._task_dialog_open = False
             if button is not None:
                 button.setEnabled(True)
             self._updateTaskButtonUi()
+        if can_assign and int(result) == TaskDialog.PICK_START_VERSION:
+            self._task_assign_draft = dialog.export_draft()
+            self._beginTaskAnchorPick()
 
-    def _onAssignTaskChosen(self, dialog, junior: str, description: str) -> None:
+    def _beginTaskAnchorPick(self) -> None:
+        if not self._projectDataIsLoaded():
+            self._appendFeed("Open the project first to choose a start version.", error=True)
+            draft = getattr(self, "_task_assign_draft", None)
+            qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
+            return
+        specs = list(
+            (getattr(self, "_project_history_bundle", None) or {}).get("version_specs") or []
+        )
+        if not specs:
+            self._appendFeed("No versions yet to choose as a start.", error=True)
+            draft = getattr(self, "_task_assign_draft", None)
+            qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
+            return
+        self._task_anchor_picking = True
+        self._task_anchor_pick_done = False
+        self._appendFeed("Click the start version in the Version tree.")
+        self.onOpenHistoryGraph(pick_mode=True)
+
+    def _finishTaskAnchorPick(self, version_id: str) -> None:
+        if not getattr(self, "_task_anchor_picking", False):
+            return
+        vid = str(version_id or "").strip()
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        sha = str((bundle.get("sha_by_id") or {}).get(vid) or "").strip().lower()
+        label = self._versionDisplayTag(vid) if vid else ""
+        if not sha or not label:
+            self._appendFeed("Could not use that version as a start.", error=True)
+            return
+        draft = dict(getattr(self, "_task_assign_draft", None) or {})
+        draft["anchor_sha"] = sha
+        draft["anchor_label"] = label
+        self._task_assign_draft = draft
+        self._task_anchor_pick_done = True
+        self._task_anchor_picking = False
+        self._closeHistoryDialog()
+        self._appendFeed("Start version set to %s." % label)
+        qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
+
+    def _cancelTaskAnchorPick(self) -> None:
+        if not getattr(self, "_task_anchor_picking", False):
+            return
+        if getattr(self, "_task_anchor_pick_done", False):
+            return
+        self._task_anchor_picking = False
+        draft = getattr(self, "_task_assign_draft", None)
+        self._appendFeed("Start version not chosen.")
+        qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
+
+    def _closeHistoryDialog(self) -> None:
+        logic = getattr(self, "logic", None)
+        if logic is None:
+            return
+        dialog = getattr(logic, "historyDialog", None)
+        logic.historyDialog = None
+        logic._historyCanvas = None
+        if dialog is None:
+            return
+        try:
+            dialog.close()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        try:
+            dialog.deleteLater()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+    def _onAssignTaskChosen(
+        self,
+        dialog,
+        juniors,
+        description: str,
+        anchor_sha: str = "",
+        anchor_label: str = "",
+    ) -> None:
+        names = [str(name or "").strip() for name in (juniors or []) if str(name or "").strip()]
+        if not names:
+            dialog.set_status("Select at least one junior.", error=True)
+            return
+        sha = str(anchor_sha or "").strip().lower()
+        start = str(anchor_label or "").strip()
+        if not sha or not start:
+            dialog.set_status("Choose a start version on the Version tree first.", error=True)
+            return
+        label = _task_juniors_label({"juniors": names})
         senior = self._githubLogin()
         try:
             message = build_project_message(
                 senior,
-                "assigned %s to this task: %s" % (junior, _task_excerpt(description)),
+                "assigned %s to this task from %s: %s"
+                % (label, start, _task_excerpt(description)),
                 kind="task",
             )
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             dialog.set_status(str(error).split("\n")[0], error=True)
             return
         message["task_op"] = "assign"
-        message["junior"] = junior
+        message["juniors"] = names
+        message["junior"] = names[0]
         message["senior"] = senior
         message["description"] = normalize_task_title(description)
         message["task_id"] = message.get("id")
+        message["anchor_sha"] = sha
+        message["anchor_label"] = start
         dialog.accept()
+        self._task_assign_draft = None
         self._enqueueTaskMessage(message)
-        self._appendFeed("Assigned %s to this task." % junior)
+        self._appendFeed("Assigned %s to this task (start %s)." % (label, start))
 
     def _onCancelTaskChosen(self, dialog, task: dict) -> None:
-        junior = str((task or {}).get("junior") or "").strip()
+        juniors = _task_junior_logins(task)
+        label = _task_juniors_label(task)
         try:
             message = build_project_message(
                 self._githubLogin(),
-                "cancelled the task for %s." % junior,
+                "cancelled the task for %s." % label,
                 kind="task",
             )
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
@@ -6547,11 +6921,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         message["task_op"] = "cancel"
         message["task_id"] = str((task or {}).get("id") or "")
-        message["junior"] = junior
+        message["juniors"] = list(juniors)
+        if juniors:
+            message["junior"] = juniors[0]
         message["senior"] = str((task or {}).get("senior") or "")
         dialog.accept()
         self._enqueueTaskMessage(message)
-        self._appendFeed("Cancelled the task for %s." % junior)
+        self._appendFeed("Cancelled the task for %s." % label)
 
     def _onSendMessage(self) -> None:
         if not self._connected or not self._hasSelectedProject():
@@ -6909,12 +7285,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "") == "accepted":
                 continue
-            junior = str(task.get("junior") or "").strip()
+            juniors = _task_junior_logins(task)
             senior = str(task.get("senior") or "").strip()
-            if not junior:
+            if not juniors:
                 continue
-            junior_key = junior.lower()
-            if junior_key == me:
+            junior_keys = {name.lower() for name in juniors}
+            if me in junior_keys:
                 if current_slug and lane_key == current_slug:
                     own = task
                 continue
@@ -6924,22 +7300,46 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 req = find_open_review_request_for_branch(full_name, lane_key)
             except (GitHubAuthError, OSError, RuntimeError, ValueError):
                 req = None
-            if req and str(req.get("author") or "").strip().lower() == junior_key:
+            author_key = str((req or {}).get("author") or "").strip().lower()
+            if req and author_key in junior_keys:
                 review = task
                 continue
-            try:
-                req2 = find_open_review_request(full_name, junior)
-            except (GitHubAuthError, OSError, RuntimeError, ValueError):
-                req2 = None
-            if req2:
+            for junior in juniors:
+                try:
+                    req2 = find_open_review_request(full_name, junior)
+                except (GitHubAuthError, OSError, RuntimeError, ValueError):
+                    req2 = None
+                if not req2:
+                    continue
                 head = str(req2.get("branch") or "").strip()
                 head_slug = head.split("/")[-1].lower() if head else ""
                 if head_slug == lane_key:
                     review = task
+                    break
         if own:
             return ("submit", own)
         if review:
             return ("review", review)
+        return None
+
+    def _openReviewForTask(self, task: dict, lane: str = "") -> dict | None:
+        """Find an open review from any junior on this task (prefers the lane)."""
+        lane_key = str(lane or "").strip()
+        if lane_key and lane_key.lower() != "main":
+            try:
+                by_lane = find_open_review_request_for_branch(
+                    self._currentProjectName(), lane_key
+                )
+            except (GitHubAuthError, OSError, RuntimeError, ValueError):
+                by_lane = None
+            if by_lane:
+                author = str(by_lane.get("author") or "").strip().lower()
+                if author in {name.lower() for name in _task_junior_logins(task)}:
+                    return by_lane
+        for junior in _task_junior_logins(task):
+            request = self._openReviewForJunior(junior, lane=lane)
+            if request:
+                return request
         return None
 
     def _openReviewForJunior(self, junior: str, lane: str = "") -> dict | None:
@@ -6997,7 +7397,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if kind == "submit":
             payload["submit"] = True
             return payload
-        request = self._openReviewForJunior(str(task.get("junior") or ""), lane=lane)
+        request = self._openReviewForTask(task, lane=lane)
         if not request:
             return {}
         payload["accept"] = True
@@ -7023,19 +7423,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         if not role or role[0] != "review":
             self._appendFeed(
-                "You can Accept / Decline only a task you assigned or claimed.",
+                "You can Accept / Decline only a task you assigned.",
                 error=True,
             )
             return
         try:
-            request = self._openReviewForJunior(str(role[1].get("junior") or ""), lane=lane)
+            request = self._openReviewForTask(role[1], lane=lane)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
         if not request:
             self._appendFeed("Nothing is waiting for review on this branch.", error=True)
             return
-        junior = str(role[1].get("junior") or "this junior")
+        junior = str(request.get("author") or "").strip() or "this junior"
         if action == "accept":
             confirmed = slicer.util.confirmYesNoDisplay(
                 "Accept %s's version onto main and publish it to the shared project?"
@@ -7045,7 +7445,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not confirmed:
                 return
             if self._acceptReviewedShareRequest(request):
-                self._markTaskAccepted(role[1])
+                # Multi-junior tasks stay open until every junior is handled later.
+                if len(_task_junior_logins(role[1])) <= 1:
+                    self._markTaskAccepted(role[1])
         else:
             confirmed = slicer.util.confirmYesNoDisplay(
                 "Decline %s's branch?\n\nThe versions stay in the version tree." % junior,
@@ -7125,7 +7527,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._appendFeed("Review requested. This branch is not on main yet.")
 
     def _markTaskSubmitted(self, task: dict, description: str) -> None:
-        junior = str((task or {}).get("junior") or "").strip()
+        juniors = _task_junior_logins(task)
         excerpt = _task_excerpt(description)
         body = (
             "requested a review for this task: %s" % excerpt
@@ -7139,13 +7541,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         message["task_op"] = "submit"
         message["task_id"] = str((task or {}).get("id") or "")
-        message["junior"] = junior
+        message["juniors"] = list(juniors)
+        if juniors:
+            message["junior"] = juniors[0]
         message["senior"] = str((task or {}).get("senior") or "")
         message["description"] = normalize_task_title(description)
         self._enqueueTaskMessage(message)
 
     def _markTaskAccepted(self, task: dict) -> None:
-        junior = str((task or {}).get("junior") or "").strip()
+        juniors = _task_junior_logins(task)
         description = str(
             (task or {}).get("submitted_description")
             or (task or {}).get("description")
@@ -7162,7 +7566,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         message["task_op"] = "accept"
         message["task_id"] = str((task or {}).get("id") or "")
-        message["junior"] = junior
+        message["juniors"] = list(juniors)
+        if juniors:
+            message["junior"] = juniors[0]
         message["senior"] = str((task or {}).get("senior") or "")
         message["description"] = normalize_task_title(description)
         self._enqueueTaskMessage(message)
@@ -7578,19 +7984,24 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if share_event:
             self._recordActivity(self._currentProjectName(), event=share_event)
 
-    def _activeTaskAsJunior(self):
+    def _activeTasksAsJunior(self) -> list:
         me = (self._githubLogin() or "").strip().lower()
         if not me:
-            return None
+            return []
+        found = []
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "") == "accepted":
                 continue
-            if str(task.get("junior") or "").strip().lower() == me:
-                return task
-        return None
+            if me in {login.lower() for login in _task_junior_logins(task)}:
+                found.append(task)
+        return found
+
+    def _activeTaskAsJunior(self):
+        tasks = self._activeTasksAsJunior()
+        return tasks[0] if tasks else None
 
     def _hasActiveTaskAsJunior(self) -> bool:
-        return self._activeTaskAsJunior() is not None
+        return bool(self._activeTasksAsJunior())
 
     def _shareLineNextStepMessage(self) -> str:
         if self._canAssignTask():
@@ -7665,27 +8076,31 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if badge is not None:
                 badge.hide()
             return
-        task = self._activeTaskAsJunior()
-        if task is None:
+        mine = self._activeTasksAsJunior()
+        if not mine:
             button.setToolTip("No active task — wait for a senior to Assign you one.")
             if badge is not None:
                 badge.hide()
             return
-        excerpt = _task_excerpt(
-            task.get("submitted_description") or task.get("description") or ""
-        )
-        senior = str(task.get("senior") or "").strip()
-        if excerpt and senior:
-            tip = "%s (Assigned by %s)" % (excerpt, senior)
-        elif excerpt:
-            tip = excerpt
-        elif senior:
-            tip = "Assigned by %s" % senior
+        if len(mine) == 1:
+            task = mine[0]
+            excerpt = _task_excerpt(
+                task.get("submitted_description") or task.get("description") or ""
+            )
+            senior = str(task.get("senior") or "").strip()
+            if excerpt and senior:
+                tip = "%s (Assigned by %s)" % (excerpt, senior)
+            elif excerpt:
+                tip = excerpt
+            elif senior:
+                tip = "Assigned by %s" % senior
+            else:
+                tip = "You have an active task"
         else:
-            tip = "You have an active task"
+            tip = "You have %d active tasks — open Tasks to see them." % len(mine)
         button.setToolTip(tip)
         if badge is not None:
-            badge.setText("1")
+            badge.setText(str(len(mine)))
             badge.show()
             badge.raise_()
             self._positionTaskBadge()
@@ -8092,12 +8507,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self.logic.openDependencyGraph()
 
-    def onOpenHistoryGraph(self) -> None:
+    def onOpenHistoryGraph(self, pick_mode: bool = False) -> None:
         if not self._canOpenVersionTree():
             payload = self.getVersionTreePayload()
             self._appendFeed(payload["description"], error=True)
+            if pick_mode:
+                draft = getattr(self, "_task_assign_draft", None)
+                self._task_anchor_picking = False
+                qt.QTimer.singleShot(0, lambda: self.onOpenTask(draft=draft))
             return
-        self.logic.openVersionHistoryGraph()
+        self.logic.openVersionHistoryGraph(pick_mode=bool(pick_mode))
 
     def _normalizeHistoryVersionId(self, value) -> str:
         text = str(value or "").strip()
@@ -8214,7 +8633,16 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
         widget = self.widget
         if not widget:
             return
+        if getattr(widget, "_task_anchor_picking", False):
+            widget._finishTaskAnchorPick(version_id)
+            return
         widget._checkoutVersion(version_id, notify=True, sync_table=True)
+
+    def onVersionPickedForTask(self, version_id: str) -> None:
+        widget = self.widget
+        if not widget:
+            return
+        widget._finishTaskAnchorPick(version_id)
 
     def reviewActionsForVersion(self, spec, history) -> dict:
         widget = self.widget
@@ -8281,7 +8709,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
         if widget:
             qt.QTimer.singleShot(100, widget._refreshAnatomyTreeCoverage)
 
-    def openVersionHistoryGraph(self) -> None:
+    def openVersionHistoryGraph(self, pick_mode: bool = False) -> None:
         graph_module = self._loadGraphModule()
 
         if self.historyDialog:
@@ -8305,13 +8733,25 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
 
         self.historyDialog = qt.QDialog(slicer.util.mainWindow())
         self.historyDialog.setWindowFlags(qt.Qt.Window)
-        self.historyDialog.setWindowTitle("Version tree")
+        if pick_mode:
+            self.historyDialog.setWindowTitle("Choose start version")
+        else:
+            self.historyDialog.setWindowTitle("Version tree")
         self.historyDialog.resize(820, 620)
 
         layout = qt.QVBoxLayout(self.historyDialog)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        hint = qt.QLabel(graph_description or "Version tree built from the project version history.")
+        if pick_mode:
+            hint_text = (
+                "Click the version where juniors should start "
+                "(shown as main/3 on the tree)."
+            )
+        else:
+            hint_text = graph_description or (
+                "Version tree built from the project version history."
+            )
+        hint = qt.QLabel(hint_text)
         hint.setStyleSheet(DIALOG_HINT_STYLE)
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -8323,10 +8763,20 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             graph_description=graph_description,
             active_version_id=getattr(widget, "_currentVersionId", None) if widget else None,
             commit_history_by_id=commit_history_by_id,
+            pick_mode=bool(pick_mode),
         )
         self._historyCanvas = canvas
         layout.addWidget(canvas.create_toolbar())
         layout.addWidget(canvas, 1)
+
+        if pick_mode and widget is not None:
+            try:
+                self.historyDialog.connect(
+                    "finished(int)",
+                    lambda *_args: widget._cancelTaskAnchorPick(),
+                )
+            except (AttributeError, TypeError, RuntimeError):
+                pass
 
         self.historyDialog.show()
         self.historyDialog.raise_()

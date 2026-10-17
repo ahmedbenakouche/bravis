@@ -3186,7 +3186,27 @@ def _normalize_stored_messages(document) -> list[dict[str, str]]:
     return messages
 
 
-def _normalize_stored_tasks(document) -> list[dict[str, str]]:
+def _normalize_task_juniors(item: dict) -> list[str]:
+    """One task may list several juniors (``juniors``). Legacy single ``junior`` still loads."""
+    names = []
+    seen = set()
+    raw = item.get("juniors") if isinstance(item, dict) else None
+    if isinstance(raw, (list, tuple)):
+        candidates = list(raw)
+    else:
+        one = item.get("junior") if isinstance(item, dict) else None
+        candidates = [one] if one else []
+    for value in candidates:
+        login = normalize_github_username(str(value or ""))
+        key = login.lower()
+        if not login or key in seen:
+            continue
+        seen.add(key)
+        names.append(login)
+    return names
+
+
+def _normalize_stored_tasks(document) -> list[dict]:
     raw = document.get("tasks") if isinstance(document, dict) else None
     if not isinstance(raw, list):
         return []
@@ -3195,11 +3215,13 @@ def _normalize_stored_tasks(document) -> list[dict[str, str]]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        junior = normalize_github_username(str(item.get("junior") or ""))
+        juniors = _normalize_task_juniors(item)
         senior = normalize_github_username(str(item.get("senior") or ""))
-        if not junior or not senior:
+        if not juniors or not senior:
             continue
-        tid = str(item.get("id") or "").strip() or ("%s-%s" % (junior, senior))
+        tid = str(item.get("id") or "").strip() or (
+            "%s-%s" % ("+".join(juniors), senior)
+        )
         key = tid.lower()
         if key in seen:
             continue
@@ -3207,13 +3229,25 @@ def _normalize_stored_tasks(document) -> list[dict[str, str]]:
         status = str(item.get("status") or "").strip().lower()
         if status not in ("accepted", "submitted"):
             status = ""
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind not in ("assigned", "voluntary"):
+            kind = "assigned"
         entry = {
             "id": tid,
-            "junior": junior,
+            "juniors": juniors,
+            # First junior kept for older readers; UI prefers ``juniors``.
+            "junior": juniors[0],
             "senior": senior,
+            "kind": kind,
             "description": normalize_task_title(item.get("description") or item.get("task") or ""),
             "status": status,
         }
+        anchor_sha = str(item.get("anchor_sha") or "").strip().lower()
+        anchor_label = str(item.get("anchor_label") or "").strip()
+        if anchor_sha:
+            entry["anchor_sha"] = anchor_sha
+        if anchor_label:
+            entry["anchor_label"] = anchor_label
         submitted = normalize_task_title(item.get("submitted_description") or "")
         if submitted:
             entry["submitted_description"] = submitted
