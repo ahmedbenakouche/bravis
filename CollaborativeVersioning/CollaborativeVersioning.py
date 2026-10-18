@@ -1245,7 +1245,7 @@ class _CompareGraphLogic(object):
 class NotificationDetailDialog(qt.QDialog):
     """Read one notification. Invitations can Join / Decline here."""
 
-    def __init__(self, parent, item: dict) -> None:
+    def __init__(self, parent, item: dict, guidance: str = "") -> None:
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("Notification")
         self.setFixedWidth(420)
@@ -1261,7 +1261,7 @@ class NotificationDetailDialog(qt.QDialog):
             body = "You were invited to %s." % (item.get("full_name") or "a project")
         else:
             title = _notification_detail_title(item)
-            body = _notification_text(item.get("text") or "Project update", 120)
+            body = _notification_text(item.get("text") or "Project update", 160)
         head = qt.QLabel(title)
         head.setStyleSheet("font-weight: 600; font-size: 13px;")
         layout.addWidget(head)
@@ -1270,10 +1270,21 @@ class NotificationDetailDialog(qt.QDialog):
         body_label.setWordWrap(True)
         body_label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
         try:
-            body_label.setMaximumHeight(96)
+            body_label.setMaximumHeight(120)
         except (AttributeError, TypeError, RuntimeError):
             pass
         layout.addWidget(body_label)
+
+        guide = str(guidance or item.get("guidance") or "").strip()
+        if guide:
+            guide_label = qt.QLabel(guide)
+            guide_label.setWordWrap(True)
+            guide_label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
+            guide_label.setStyleSheet(
+                "color: %s; font-size: 11px; font-weight: 600;"
+                % (TEXT_SECONDARY or "#c8c8c8")
+            )
+            layout.addWidget(guide_label)
 
         when = str(item.get("when") or item.get("at_label") or "").strip()
         if when:
@@ -6660,11 +6671,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             text = "%s cancelled the task for %s." % (author, juniors)
         elif op == "submit":
             excerpt = _task_excerpt(message.get("description") or "")
-            text = (
-                "%s requested a review for task: %s" % (author, excerpt)
-                if excerpt
-                else "%s requested a review on their line." % author
-            )
+            branch = str(message.get("branch_slug") or "").strip()
+            if excerpt and branch:
+                text = "%s requested a review for task on branch %s: %s" % (
+                    author,
+                    branch,
+                    excerpt,
+                )
+            elif branch:
+                text = "%s requested a review on branch %s." % (author, branch)
+            elif excerpt:
+                text = "%s requested a review for task: %s" % (author, excerpt)
+            else:
+                text = "%s requested a review on their line." % author
         else:
             excerpt = _task_excerpt(message.get("description") or "")
             text = (
@@ -7501,7 +7520,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Added shared, then yours on %s." % lanes_label)
 
     def _openNotificationDetail(self, item: dict) -> None:
-        detail = NotificationDetailDialog(slicer.util.mainWindow(), item)
+        detail = NotificationDetailDialog(
+            slicer.util.mainWindow(),
+            item,
+            guidance=self._notificationGuidance(item),
+        )
         detail.exec_()
         if str((item or {}).get("kind") or "") != "invite":
             return
@@ -7532,8 +7555,102 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             return ""
 
+    def _notificationGuidance(self, item: dict) -> str:
+        """Extra help under the notif body (role-specific for review requests)."""
+        if str((item or {}).get("kind") or "") != "activity":
+            return ""
+        if str((item or {}).get("activity_kind") or "").strip().lower() != "submit":
+            return ""
+        branch = self._branchSlugFromSubmitNotification(item)
+        branch_bit = (" on branch %s" % branch) if branch else ""
+        if self._canAssignTask():
+            return (
+                "Open the Version tree, find the node marked 🔵 (awaiting review)%s, "
+                "double-click it, then Accept or Decline."
+                % branch_bit
+            )
+        return (
+            "A teammate already requested a review%s. "
+            "Wait for a senior — no need to request again. "
+            "The Version tree shows 🔵 on that branch."
+            % branch_bit
+        )
+
+    def _branchSlugFromSubmitNotification(self, item: dict) -> str:
+        text = str((item or {}).get("text") or "")
+        found = re.search(r"\bbranch\s+([A-Za-z0-9._-]+)", text, flags=re.IGNORECASE)
+        if found:
+            return normalize_branch_slug(found.group(1)) or found.group(1)
+        for task in getattr(self, "_project_tasks", []) or []:
+            if str(task.get("status") or "") != "submitted":
+                continue
+            slug = normalize_branch_slug(task.get("branch_slug") or "")
+            if slug:
+                return slug
+        return ""
+
+    def _activeTaskForBranchSlug(self, lane: str):
+        """Active (non-accepted) task whose unified lane is this branch slug."""
+        lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
+        if not lane_key or lane_key == "main":
+            return None
+        for task in getattr(self, "_project_tasks", []) or []:
+            if str(task.get("status") or "") == "accepted":
+                continue
+            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            if slug and slug.lower() == lane_key:
+                return task
+        return None
+
+    def _reviewPendingVersionIds(self) -> set:
+        """Tip version ids of submitted task lanes (show 🔵 on the Version tree)."""
+        pending_slugs = set()
+        for task in getattr(self, "_project_tasks", []) or []:
+            if str(task.get("status") or "") != "submitted":
+                continue
+            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            if slug:
+                pending_slugs.add(slug.lower())
+        if not pending_slugs:
+            return set()
+        marked = set()
+        for slug in pending_slugs:
+            tip_id = self._tipVersionIdForLane(slug)
+            if tip_id:
+                marked.add(tip_id)
+        return marked
+
+    def _tipVersionIdForLane(self, lane: str) -> str:
+        """Highest …/N (or …/start) id for this branch in the current history bundle."""
+        lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
+        if not lane_key:
+            return ""
+        best_id = ""
+        best_rank = -1
+        for spec in (
+            (getattr(self, "_project_history_bundle", None) or {}).get("version_specs")
+            or []
+        ):
+            if str((spec or {}).get("branch") or "").strip().lower() != lane_key:
+                continue
+            vid = str((spec or {}).get("id") or "").strip()
+            if not vid:
+                continue
+            suffix = vid.rsplit("/", 1)[-1]
+            if suffix == "start":
+                rank = 0
+            else:
+                try:
+                    rank = int(suffix)
+                except ValueError:
+                    rank = 0
+            if rank >= best_rank:
+                best_rank = rank
+                best_id = vid
+        return best_id
+
     def _taskRoleForLane(self, lane: str):
-        lane_key = str(lane or "").strip().lower()
+        lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
         if not lane_key or lane_key == "main":
             return None
         me = (self._githubLogin() or "").strip().lower()
@@ -7551,8 +7668,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not juniors:
                 continue
             junior_keys = {name.lower() for name in juniors}
+            task_slug = normalize_branch_slug(task.get("branch_slug") or "").lower()
+            status = str(task.get("status") or "").strip().lower()
+            lane_matches = (task_slug and task_slug == lane_key) or (
+                current_slug and lane_key == current_slug
+            )
             if me in junior_keys:
-                if current_slug and lane_key == current_slug:
+                # Already submitted: no second Request review (🔵 shows the state).
+                if status == "submitted":
+                    continue
+                if lane_matches:
                     own = task
                 continue
             if senior.lower() != me:
@@ -7563,6 +7688,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 req = None
             author_key = str((req or {}).get("author") or "").strip().lower()
             if req and author_key in junior_keys:
+                review = task
+                continue
+            if task_slug == lane_key and status == "submitted":
                 review = task
                 continue
             for junior in juniors:
@@ -7640,41 +7768,92 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _reviewActionsForVersion(self, spec, history) -> dict:
         lane = str((spec or {}).get("branch") or "")
-        # Owner / senior: merge their own shared line onto main (no task required).
+        # Task lanes first — never show bare "Merge" instead of Accept/Decline.
+        task = self._activeTaskForBranchSlug(lane)
+        if task is not None:
+            return self._reviewActionsForTaskLane(task, lane)
+        # Owner / senior: merge their own shared line onto main (no task).
         if self._canAssignTask() and self._isOwnReviewLane(lane):
             return {"merge": True}
         role = self._taskRoleForLane(lane)
         if not role:
             return {}
-        kind, task = role
+        kind, linked = role
         if kind == "review":
-            text = str(task.get("submitted_description") or task.get("description") or "").strip()
+            text = str(
+                linked.get("submitted_description") or linked.get("description") or ""
+            ).strip()
         else:
-            text = str(task.get("description") or "").strip()
+            text = str(linked.get("description") or "").strip()
         payload = {
             "task_text": text,
-            "task_senior": str(task.get("senior") or "").strip(),
+            "task_senior": str(linked.get("senior") or "").strip(),
         }
         if kind == "submit":
             payload["submit"] = True
             return payload
-        request = self._openReviewForTask(task, lane=lane)
+        request = self._openReviewForTask(linked, lane=lane)
         if not request:
             return {}
         payload["accept"] = True
         payload["decline"] = True
         return payload
 
+    def _reviewActionsForTaskLane(self, task: dict, lane: str) -> dict:
+        """Actions for a unified task branch (1 task = 1 lane)."""
+        status = str((task or {}).get("status") or "").strip().lower()
+        me = (self._githubLogin() or "").strip().lower()
+        senior = str((task or {}).get("senior") or "").strip().lower()
+        juniors = {name.lower() for name in _task_junior_logins(task)}
+        text = str(
+            (task.get("submitted_description") if status == "submitted" else "")
+            or task.get("description")
+            or ""
+        ).strip()
+        payload = {
+            "task_text": text,
+            "task_senior": str(task.get("senior") or "").strip(),
+        }
+        if status == "submitted":
+            if self._canAssignTask() and senior and senior == me:
+                request = self._openReviewForTask(task, lane=lane)
+                if request:
+                    payload["accept"] = True
+                    payload["decline"] = True
+                else:
+                    # No open PR found — Merge still closes the unified task lane.
+                    payload["merge"] = True
+            return payload
+        if me in juniors and status != "accepted":
+            payload["submit"] = True
+        return payload
+
     def onVersionReviewAction(self, action: str, spec) -> None:
         lane = str((spec or {}).get("branch") or "")
+        task = self._activeTaskForBranchSlug(lane)
         role = self._taskRoleForLane(lane)
         if action == "merge":
+            if task is not None:
+                # Task lanes use Accept; Merge here still closes the task after merge.
+                if not self._canAssignTask():
+                    self._appendFeed("Only a senior can merge a task branch.", error=True)
+                    return
+                self._mergeOwnReviewLine(lane)
+                return
             if not self._canAssignTask() or not self._isOwnReviewLane(lane):
                 self._appendFeed("You can merge only your own branch.", error=True)
                 return
             self._mergeOwnReviewLine(lane)
             return
         if action == "submit":
+            if task is not None:
+                if str(task.get("status") or "") == "submitted":
+                    self._appendFeed(
+                        "A review is already requested for this task (🔵 on the Version tree).",
+                        error=True,
+                    )
+                    return
+                role = ("submit", task)
             if not role or role[0] != "submit":
                 self._appendFeed("You can request a review only on your own branch.", error=True)
                 return
@@ -7682,14 +7861,23 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         if action not in ("accept", "decline"):
             return
-        if not role or role[0] != "review":
+        review_task = task if task is not None else (role[1] if role and role[0] == "review" else None)
+        if review_task is None:
+            self._appendFeed(
+                "You can Accept / Decline only a task you assigned.",
+                error=True,
+            )
+            return
+        me = (self._githubLogin() or "").strip().lower()
+        senior = str(review_task.get("senior") or "").strip().lower()
+        if not self._canAssignTask() or (senior and senior != me):
             self._appendFeed(
                 "You can Accept / Decline only a task you assigned.",
                 error=True,
             )
             return
         try:
-            request = self._openReviewForTask(role[1], lane=lane)
+            request = self._openReviewForTask(review_task, lane=lane)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
@@ -7706,9 +7894,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not confirmed:
                 return
             if self._acceptReviewedShareRequest(request):
-                # Multi-junior tasks stay open until every junior is handled later.
-                if len(_task_junior_logins(role[1])) <= 1:
-                    self._markTaskAccepted(role[1])
+                # 1 task = 1 branch: Accept closes the task for every assigned junior.
+                self._markTaskAccepted(review_task)
         else:
             confirmed = slicer.util.confirmYesNoDisplay(
                 "Decline %s's branch?\n\nThe versions stay in the version tree." % junior,
@@ -7718,9 +7905,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 return
             self._declineReviewedShareRequest(request)
         self._updateActiveVersionIndicators()
+        self._updateTaskButtonUi()
 
     def _mergeOwnReviewLine(self, lane: str = "") -> None:
-        """Senior/owner: put their own shared named branch onto main (same merge as Accept)."""
+        """Senior/owner: put a shared named branch onto main (same merge as Accept)."""
         me = (self._githubLogin() or "").strip()
         if not me or not self._canAssignTask():
             self._appendFeed("Only a senior can merge their branch onto main.", error=True)
@@ -7729,6 +7917,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not slug:
             self._appendFeed("Switch to your branch first.", error=True)
             return
+        task = self._activeTaskForBranchSlug(slug)
         confirmed = slicer.util.confirmYesNoDisplay(
             "Merge branch %s onto main and publish it to the shared project?" % slug,
             windowTitle="Merge",
@@ -7742,12 +7931,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             "author": me,
         }
         if self._acceptReviewedShareRequest(request):
-            self._recordActivity(
-                self._currentProjectName(),
-                "accept",
-                "%s merged branch %s onto main." % (me or "Someone", slug),
-            )
+            if task is not None and str(task.get("status") or "") != "accepted":
+                # Merging a task lane closes the task for everyone assigned.
+                self._markTaskAccepted(task)
+            else:
+                self._recordActivity(
+                    self._currentProjectName(),
+                    "accept",
+                    "%s merged branch %s onto main." % (me or "Someone", slug),
+                )
             self._updateActiveVersionIndicators()
+            self._updateTaskButtonUi()
 
     def _submitOwnReviewLine(self, lane: str = "") -> None:
         slug = normalize_branch_slug(lane) or self._currentNamedBranchSlug()
@@ -7807,7 +8001,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             message["junior"] = juniors[0]
         message["senior"] = str((task or {}).get("senior") or "")
         message["description"] = normalize_task_title(description)
+        branch_slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+        if branch_slug:
+            message["branch_slug"] = branch_slug
         self._enqueueTaskMessage(message)
+        self._updateTaskButtonUi()
 
     def _markTaskAccepted(self, task: dict) -> None:
         juniors = _task_junior_logins(task)
@@ -7832,7 +8030,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             message["junior"] = juniors[0]
         message["senior"] = str((task or {}).get("senior") or "")
         message["description"] = normalize_task_title(description)
+        branch_slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+        if branch_slug:
+            message["branch_slug"] = branch_slug
         self._enqueueTaskMessage(message)
+        self._updateTaskButtonUi()
 
     def _acceptReviewedShareRequest(self, request: dict) -> None:
         full_name = request.get("full_name") or ""
@@ -9091,6 +9293,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
         layout.setContentsMargins(12, 12, 12, 12)
 
         write_locked_ids = set()
+        review_pending_ids = set()
         if pick_mode:
             hint_text = (
                 "Click a shared version (solid border), e.g. main/3. "
@@ -9105,6 +9308,23 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
                     write_locked_ids = set(widget._writeLockedVersionIds() or ())
                 except (AttributeError, TypeError, RuntimeError):
                     write_locked_ids = set()
+                try:
+                    review_pending_ids = set(widget._reviewPendingVersionIds() or ())
+                except (AttributeError, TypeError, RuntimeError):
+                    review_pending_ids = set()
+            extra_bits = []
+            if review_pending_ids:
+                extra_bits.append(
+                    "🔵 = awaiting senior review (double-click to Accept or Decline)"
+                )
+            if write_locked_ids:
+                extra_bits.append(
+                    "🔒 = view only — Switch OK, Save / Share blocked"
+                )
+            if extra_bits:
+                hint_text = (hint_text + "\n" if hint_text else "") + "   ·   ".join(
+                    extra_bits
+                )
         hint = qt.QLabel(hint_text)
         hint.setStyleSheet(DIALOG_HINT_STYLE)
         hint.setWordWrap(True)
@@ -9119,6 +9339,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             commit_history_by_id=commit_history_by_id,
             pick_mode=bool(pick_mode),
             write_locked_ids=write_locked_ids,
+            review_pending_ids=review_pending_ids,
         )
         self._historyCanvas = canvas
         layout.addWidget(canvas.create_toolbar())

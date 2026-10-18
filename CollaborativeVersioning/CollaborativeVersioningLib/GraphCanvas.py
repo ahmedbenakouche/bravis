@@ -766,6 +766,8 @@ def _draw_version_box_node(scene, node, font_size=7):
     label.setDefaultTextColor(qt.QColor(_ui.GRAPH_NODE_TEXT))
     bounds = label.boundingRect()
     label.setPos(x + (w - bounds.width()) / 2.0, y + (h - bounds.height()) / 2.0)
+    if node.get("review_pending"):
+        _draw_review_pending_badge(scene, node)
     if node.get("write_locked"):
         _draw_write_lock_badge(scene, node)
 
@@ -775,7 +777,19 @@ def _draw_write_lock_badge(scene, node):
     lock = scene.addText("🔒")
     lock.setFont(qt.QFont("Arial", 9))
     bounds = lock.boundingRect()
-    lock.setPos(
+    # Bottom-right when a review mark already occupies the top-right.
+    y = node["y"] - bounds.height() + 6
+    if node.get("review_pending"):
+        y = node["y"] + node["h"] - 4
+    lock.setPos(node["x"] + node["w"] - bounds.width() + 2, y)
+
+
+def _draw_review_pending_badge(scene, node):
+    """Same mark as Tasks Submitted (🔵) — tip awaiting senior review."""
+    mark = scene.addText("🔵")
+    mark.setFont(qt.QFont("Arial", 9))
+    bounds = mark.boundingRect()
+    mark.setPos(
         node["x"] + node["w"] - bounds.width() + 2,
         node["y"] - bounds.height() + 6,
     )
@@ -800,6 +814,18 @@ def _draw_write_lock_legend(scene, x, y):
     """Legend for junior write locks on the Version tree."""
     text = scene.addText(
         "🔒 = view only — you can Switch here, but Save / Share are blocked"
+    )
+    text.setFont(qt.QFont("Arial", 8))
+    text.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT or _ui.GRAPH_TITLE or "#888888"))
+    text.setPos(x, y)
+    bounds = text.boundingRect()
+    return qt.QRectF(float(x), float(y), float(bounds.width()), float(bounds.height()))
+
+
+def _draw_review_pending_legend(scene, x, y):
+    """Legend for submitted task tips awaiting Accept/Decline."""
+    text = scene.addText(
+        "🔵 = awaiting senior review (double-click that node to Accept or Decline)"
     )
     text.setFont(qt.QFont("Arial", 8))
     text.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT or _ui.GRAPH_TITLE or "#888888"))
@@ -1172,6 +1198,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
         fit_tight=False,
         pick_mode=False,
         write_locked_ids=None,
+        review_pending_ids=None,
     ):
         InteractiveGraphView.__init__(self, parent)
         self.logic = logic
@@ -1185,6 +1212,8 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.conflict_ids = set(conflict_ids or ())
         # Junior write locks: Switch/view OK, Save/Share blocked on these nodes.
         self.write_locked_ids = set(write_locked_ids or ())
+        # Submitted task lane tips awaiting senior Accept/Decline.
+        self.review_pending_ids = set(review_pending_ids or ())
         # "local" | "shared" — caption wording next to the red diff pointer
         self.diff_side = str(diff_side or "").strip().lower()
         # Result preview: green dashed marks (id -> "shared" | "local")
@@ -1415,12 +1444,18 @@ class VersionHistoryCanvas(InteractiveGraphView):
 
         any_unshared = False
         any_write_locked = False
+        any_review_pending = False
         locked_ids = set(getattr(self, "write_locked_ids", None) or ())
+        pending_ids = set(getattr(self, "review_pending_ids", None) or ())
         for node in nodes_by_id.values():
             unshared = _node_is_unshared(node["id"], self.commit_history_by_id)
             node["unshared"] = unshared
             if unshared:
                 any_unshared = True
+            review_pending = (not self.pick_mode) and (node["id"] in pending_ids)
+            node["review_pending"] = review_pending
+            if review_pending:
+                any_review_pending = True
             write_locked = (not self.pick_mode) and (node["id"] in locked_ids)
             node["write_locked"] = write_locked
             if write_locked:
@@ -1519,6 +1554,8 @@ class VersionHistoryCanvas(InteractiveGraphView):
         footer_lines = 1
         if any_unshared:
             footer_lines += 1
+        if any_review_pending:
+            footer_lines += 1
         if any_write_locked:
             footer_lines += 1
         footer_h = 10 + (20 * footer_lines)
@@ -1544,6 +1581,9 @@ class VersionHistoryCanvas(InteractiveGraphView):
         legend_y = scene_h + 22
         if any_unshared:
             _draw_share_status_legend(self._graphe_scene, MARGIN, legend_y)
+            legend_y += 18
+        if any_review_pending:
+            _draw_review_pending_legend(self._graphe_scene, MARGIN, legend_y)
             legend_y += 18
         if any_write_locked:
             _draw_write_lock_legend(self._graphe_scene, MARGIN, legend_y)
