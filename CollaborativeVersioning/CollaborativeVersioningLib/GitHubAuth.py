@@ -718,6 +718,7 @@ def ensure_can_share_with_shared(
     compare = read_compare_project_histories(repo_dir, local_history=local_history)
     if (
         compare.get("has_remote_extras")
+        or compare.get("has_new_remote_lanes")
         or compare.get("conflict")
         or compare.get("obsolete_merged")
     ):
@@ -2314,7 +2315,25 @@ def read_compare_project_histories(
     only_local_main = local_main_shas - remote_main_shas
     has_remote_extras = bool(only_remote_shas)
     has_local_extras = bool(only_local_shas)
-    aligned = not has_remote_extras and not has_local_extras
+    # Empty task lanes share a main SHA — SHA diff misses them. Detect new remote
+    # branch names that are not yet on the frozen Version tree / local heads.
+    local_lane_slugs = _history_lane_slugs(local_model) | {
+        str(name).strip().lower()
+        for name in local_review_tips
+        if str(name).strip()
+    }
+    new_remote_lanes = sorted(
+        str(name).strip().lower()
+        for name in remote_review_tips
+        if str(name).strip()
+        and str(name).strip().lower() not in local_lane_slugs
+    )
+    has_new_remote_lanes = bool(new_remote_lanes)
+    aligned = (
+        not has_remote_extras
+        and not has_local_extras
+        and not has_new_remote_lanes
+    )
 
     conflict_lanes: list[str] = []
     conflict_local_shas: set[str] = set()
@@ -2436,6 +2455,28 @@ def read_compare_project_histories(
         sha_by_id = model.get("sha_by_id") or {}
         return {vid for vid, sha in sha_by_id.items() if sha in shas}
 
+    def _ids_for_lanes(model: dict[str, Any], lanes) -> set[str]:
+        wanted = {str(name).strip().lower() for name in (lanes or ()) if str(name).strip()}
+        if not wanted:
+            return set()
+        found: set[str] = set()
+        for spec in (model or {}).get("version_specs") or []:
+            if not isinstance(spec, dict):
+                continue
+            branch = str(spec.get("branch") or "").strip().lower()
+            vid = str(spec.get("id") or "").strip()
+            if vid and branch in wanted:
+                found.add(vid)
+        return found
+
+    only_remote_ids = _ids_for_shas(remote_model, only_remote_shas) | _ids_for_lanes(
+        remote_model, new_remote_lanes
+    )
+    # Result / Update preview uses the union model — mark new empty lanes there too.
+    only_remote_ids_result = only_remote_ids | _ids_for_lanes(
+        result_model, new_remote_lanes
+    )
+
     return {
         "local": local_model,
         "remote": remote_model,
@@ -2445,7 +2486,8 @@ def read_compare_project_histories(
         "only_local_shas": only_local_shas,
         "only_remote_shas": only_remote_shas,
         "only_local_ids_local": _ids_for_shas(local_model, only_local_shas),
-        "only_remote_ids_remote": _ids_for_shas(remote_model, only_remote_shas),
+        "only_remote_ids_remote": only_remote_ids,
+        "only_remote_ids_result": only_remote_ids_result,
         "conflict_ids_local": _ids_for_shas(local_model, conflict_local_shas),
         "conflict_ids_remote": _ids_for_shas(remote_model, conflict_remote_shas),
         "conflict_lanes": list(conflict_lanes),
@@ -2455,9 +2497,23 @@ def read_compare_project_histories(
         "reset_lanes": list(reset_lanes),
         "has_local_extras": has_local_extras,
         "has_remote_extras": has_remote_extras,
+        "has_new_remote_lanes": has_new_remote_lanes,
+        "new_remote_lanes": list(new_remote_lanes),
         "conflict": conflict,
         "aligned": aligned,
     }
+
+
+def _history_lane_slugs(model: dict[str, Any] | None) -> set[str]:
+    """Side-lane names already shown in a history model (excludes main)."""
+    slugs: set[str] = set()
+    for spec in (model or {}).get("version_specs") or []:
+        if not isinstance(spec, dict):
+            continue
+        branch = str(spec.get("branch") or "").strip().lower()
+        if branch and branch != "main":
+            slugs.add(branch)
+    return slugs
 
 
 def _first_tip(tips) -> str:

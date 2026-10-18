@@ -610,6 +610,12 @@ class CompareWithSharedDialog(qt.QDialog):
         ]
         self._aligned = bool(self._compare.get("aligned"))
         self._has_remote = bool(self._compare.get("has_remote_extras"))
+        self._has_new_remote_lanes = bool(self._compare.get("has_new_remote_lanes"))
+        self._new_remote_lanes = [
+            str(name).strip()
+            for name in (self._compare.get("new_remote_lanes") or ())
+            if str(name).strip()
+        ]
         self._has_local = bool(self._compare.get("has_local_extras"))
         self._graph_module = None
 
@@ -1005,14 +1011,31 @@ class CompareWithSharedDialog(qt.QDialog):
             self._reset_btn.show()
             self._selectChoice(self.ACTION_RESET, silent=True)
             return
-        if self._has_remote:
-            # No tip fork: show shared updates in the Version tree. Local unshared stay.
+        if self._has_remote or self._has_new_remote_lanes:
+            # No tip fork: show shared updates / new empty lanes. Local unshared stay.
+            lanes = self._lanesLabel(self._new_remote_lanes)
             if self._has_local:
+                if self._has_new_remote_lanes and not self._has_remote:
+                    self._setConflictsMessage(
+                        "No tip conflict — the shared project has new branches (%s), "
+                        "and you also have local versions not shared yet.\n"
+                        "Preview: Update version tree (your local unshared versions stay). "
+                        "Click Validate to apply."
+                        % lanes
+                    )
+                else:
+                    self._setConflictsMessage(
+                        "No tip conflict — the shared project has newer versions, "
+                        "and you also have local versions not shared yet.\n"
+                        "Preview: Update version tree (your local unshared versions stay). "
+                        "Click Validate to apply."
+                    )
+            elif self._has_new_remote_lanes and not self._has_remote:
                 self._setConflictsMessage(
-                    "No tip conflict — the shared project has newer versions, "
-                    "and you also have local versions not shared yet.\n"
-                    "Preview: Update version tree (your local unshared versions stay). "
+                    "No conflicts — the shared project has new branches (%s). "
+                    "Preview below shows the result after integrating them into your local folder. "
                     "Click Validate to apply."
+                    % lanes
                 )
             else:
                 self._setConflictsMessage(
@@ -1069,8 +1092,14 @@ class CompareWithSharedDialog(qt.QDialog):
                 roles[vid] = "local"
         elif choice == self.ACTION_UPDATE:
             # Shared tips acknowledged + local unshared kept.
-            for vid in self._idsForShas(model, only_remote):
-                roles[vid] = "shared"
+            # Include new empty remote lanes (same SHA as main — not in only_remote_shas).
+            shared_ids = set(self._idsForShas(model, only_remote))
+            shared_ids.update(self._compare.get("only_remote_ids_result") or ())
+            shared_ids.update(self._compare.get("only_remote_ids_remote") or ())
+            model_ids = set((model or {}).get("sha_by_id") or {})
+            for vid in shared_ids:
+                if vid in model_ids:
+                    roles[vid] = "shared"
             for vid in self._idsForShas(model, only_local):
                 roles[vid] = "local"
         elif choice == self.ACTION_KEEP:
