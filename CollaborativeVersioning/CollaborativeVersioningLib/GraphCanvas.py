@@ -766,6 +766,19 @@ def _draw_version_box_node(scene, node, font_size=7):
     label.setDefaultTextColor(qt.QColor(_ui.GRAPH_NODE_TEXT))
     bounds = label.boundingRect()
     label.setPos(x + (w - bounds.width()) / 2.0, y + (h - bounds.height()) / 2.0)
+    if node.get("write_locked"):
+        _draw_write_lock_badge(scene, node)
+
+
+def _draw_write_lock_badge(scene, node):
+    """Padlock on nodes the junior may view but not Save/Share from."""
+    lock = scene.addText("🔒")
+    lock.setFont(qt.QFont("Arial", 9))
+    bounds = lock.boundingRect()
+    lock.setPos(
+        node["x"] + node["w"] - bounds.width() + 2,
+        node["y"] - bounds.height() + 6,
+    )
 
 
 def _draw_share_status_legend(scene, x, y):
@@ -775,6 +788,18 @@ def _draw_share_status_legend(scene, x, y):
     """
     text = scene.addText(
         "Solid box = shared    ·    Dashed box = saved here · not shared yet"
+    )
+    text.setFont(qt.QFont("Arial", 8))
+    text.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT or _ui.GRAPH_TITLE or "#888888"))
+    text.setPos(x, y)
+    bounds = text.boundingRect()
+    return qt.QRectF(float(x), float(y), float(bounds.width()), float(bounds.height()))
+
+
+def _draw_write_lock_legend(scene, x, y):
+    """Legend for junior write locks on the Version tree."""
+    text = scene.addText(
+        "🔒 = view only — you can Switch here, but Save / Share are blocked"
     )
     text.setFont(qt.QFont("Arial", 8))
     text.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT or _ui.GRAPH_TITLE or "#888888"))
@@ -1146,6 +1171,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
         minimum_height=480,
         fit_tight=False,
         pick_mode=False,
+        write_locked_ids=None,
     ):
         InteractiveGraphView.__init__(self, parent)
         self.logic = logic
@@ -1157,6 +1183,8 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.read_only = bool(read_only)
         self.pick_mode = bool(pick_mode)
         self.conflict_ids = set(conflict_ids or ())
+        # Junior write locks: Switch/view OK, Save/Share blocked on these nodes.
+        self.write_locked_ids = set(write_locked_ids or ())
         # "local" | "shared" — caption wording next to the red diff pointer
         self.diff_side = str(diff_side or "").strip().lower()
         # Result preview: green dashed marks (id -> "shared" | "local")
@@ -1386,11 +1414,17 @@ class VersionHistoryCanvas(InteractiveGraphView):
             )
 
         any_unshared = False
+        any_write_locked = False
+        locked_ids = set(getattr(self, "write_locked_ids", None) or ())
         for node in nodes_by_id.values():
             unshared = _node_is_unshared(node["id"], self.commit_history_by_id)
             node["unshared"] = unshared
             if unshared:
                 any_unshared = True
+            write_locked = (not self.pick_mode) and (node["id"] in locked_ids)
+            node["write_locked"] = write_locked
+            if write_locked:
+                any_write_locked = True
             _draw_version_box_node(self._graphe_scene, node, font_size=7)
 
         if self.fit_tight:
@@ -1482,9 +1516,12 @@ class VersionHistoryCanvas(InteractiveGraphView):
         max_y = max(node["y"] for node in nodes_by_id.values())
         scene_w = max(940, max_x + MARGIN + 40)
         scene_h = max_y + NODE_H + 40
-        footer_h = 28
+        footer_lines = 1
         if any_unshared:
-            footer_h = 48
+            footer_lines += 1
+        if any_write_locked:
+            footer_lines += 1
+        footer_h = 10 + (20 * footer_lines)
         self._graphe_scene.setSceneRect(0, 0, scene_w, scene_h + footer_h)
 
         title_text = "%s — %d version(s)" % (
@@ -1504,8 +1541,12 @@ class VersionHistoryCanvas(InteractiveGraphView):
         title.setFont(qt.QFont("Arial", 8))
         title.setDefaultTextColor(qt.QColor(_ui.GRAPH_TITLE))
         title.setPos(MARGIN, scene_h + 4)
+        legend_y = scene_h + 22
         if any_unshared:
-            _draw_share_status_legend(self._graphe_scene, MARGIN, scene_h + 22)
+            _draw_share_status_legend(self._graphe_scene, MARGIN, legend_y)
+            legend_y += 18
+        if any_write_locked:
+            _draw_write_lock_legend(self._graphe_scene, MARGIN, legend_y)
 
 
 def _compute_scene_bounds(nodes, padding=30):

@@ -2382,6 +2382,8 @@ def read_compare_project_histories(
     obsolete_merged_lanes: list[str] = []
     if commit_by_sha and origin:
         main_reach = _all_reachable_shas(commit_by_sha, origin)
+        # First-parent main line only (not merge second-parents).
+        main_first_parent = set(_first_parent_chain(commit_by_sha, origin))
         for slug in sorted(
             set(local_review_tips.keys()) | set(remote_review_tips.keys()),
             key=lambda name: str(name).lower(),
@@ -2389,6 +2391,10 @@ def read_compare_project_histories(
             local_tip = _first_tip(local_review_tips.get(slug))
             remote_tip = _first_tip(remote_review_tips.get(slug))
             if not local_tip or local_tip in main_reach:
+                continue
+            # Empty task lanes keep origin tip on main (e.g. tache1/start). Local
+            # Save ahead of that tip is normal — not an obsolete-merged branch.
+            if remote_tip and remote_tip in main_first_parent:
                 continue
             if not _branch_merged_into_main(commit_by_sha, origin, remote_tip or local_tip):
                 continue

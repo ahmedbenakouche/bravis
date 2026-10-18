@@ -3167,9 +3167,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Switch version")
         box.setText("Switch to %s?" % self._versionDisplayTag(version_id))
-        box.setInformativeText(
-            "Click Save first if you want to keep your current work."
-        )
+        info = "Click Save first if you want to keep your current work."
+        if self._isVersionWriteLocked(version_id):
+            info = (
+                "You can view this version, but you can't Save or Share from here "
+                "(🔒 view only).\n\n"
+                "To work, switch to your task branch (nodes without a lock).\n\n"
+                "Click Save first if you want to keep your current work."
+            )
+        box.setInformativeText(info)
         switch_btn = box.addButton("Switch version", qt.QMessageBox.AcceptRole)
         cancel_btn = box.addButton("Cancel", qt.QMessageBox.RejectRole)
         box.setDefaultButton(cancel_btn)
@@ -3803,6 +3809,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _canShare(self) -> bool:
         if not self._projectDataIsLoaded():
             return False
+        if self._isCurrentVersionWriteLocked():
+            return False
         if not self._unshared_version:
             return False
         repo = self._currentRemoteRepo()
@@ -3817,6 +3825,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "Create or open a project first."
         if not self._projectDataIsLoaded():
             return "Open the project first."
+        if self._isCurrentVersionWriteLocked():
+            return self._writeLockBlockedReason("Share")
         repo = self._currentRemoteRepo()
         if repo and not repo.get("can_push"):
             return "This project is read-only for your account."
@@ -3826,6 +3836,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _canSaveVersion(self) -> bool:
         if not self._projectDataIsLoaded():
+            return False
+        if self._isCurrentVersionWriteLocked():
             return False
         if not self._hasExplicitUnsavedEdits():
             return False
@@ -3838,6 +3850,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "Create or open a project first."
         if not self._projectDataIsLoaded():
             return "Open the project first."
+        if self._isCurrentVersionWriteLocked():
+            return self._writeLockBlockedReason("Save")
         if not self._hasExplicitUnsavedEdits():
             return "No changes to save."
         missing = []
@@ -6117,6 +6131,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._renderMessagesView()
         self._updateMessagesBadge()
         self._updateTaskButtonUi()
+        # Task assign/cancel can change junior write-lock lanes (Save/Share).
+        self._updateVersionActionButtons()
         self._syncNotificationActivityFromProject(announce=True)
 
     def _markMessagesRead(self) -> None:
@@ -8012,6 +8028,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not self._connected:
             self._appendFeed("Connect with GitHub first.", error=True)
             return
+        if self._warnIfWriteLocked("Save"):
+            return
         if not self._canSaveVersion():
             reason = self._saveVersionDisabledReason()
             if reason:
@@ -8139,6 +8157,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not self._connected:
             self._appendFeed("Connect with GitHub first.", error=True)
             return
+        if self._warnIfWriteLocked("Share"):
+            return
         if not self._canShare():
             reason = self._shareDisabledReason()
             if reason:
@@ -8247,6 +8267,82 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _hasActiveTaskAsJunior(self) -> bool:
         return bool(self._activeTasksAsJunior())
+
+    def _juniorWriteLockApplies(self) -> bool:
+        """Seniors are unrestricted; everyone else follows task write-lock rules."""
+        if not self._projectDataIsLoaded():
+            return False
+        if self._canAssignTask():
+            return False
+        return True
+
+    def _writableTaskLaneSlugs(self):
+        """None = no locks. Empty set = lock all writes. Else only those lane slugs."""
+        if not self._juniorWriteLockApplies():
+            return None
+        slugs = set()
+        for task in self._activeTasksAsJunior():
+            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            if slug:
+                slugs.add(slug.lower())
+        return slugs
+
+    def _isVersionWriteLocked(self, version_id: str) -> bool:
+        allowed = self._writableTaskLaneSlugs()
+        if allowed is None:
+            return False
+        lane = (self._historyLaneForVersion(version_id) or "main").strip().lower()
+        if not lane or lane == "main":
+            return True
+        return lane not in allowed
+
+    def _isCurrentVersionWriteLocked(self) -> bool:
+        return self._isVersionWriteLocked(
+            str(getattr(self, "_currentVersionId", None) or "")
+        )
+
+    def _writeLockedVersionIds(self) -> set:
+        allowed = self._writableTaskLaneSlugs()
+        if allowed is None:
+            return set()
+        locked = set()
+        for spec in (
+            (getattr(self, "_project_history_bundle", None) or {}).get("version_specs")
+            or []
+        ):
+            vid = str((spec or {}).get("id") or "").strip()
+            if not vid:
+                continue
+            branch = str((spec or {}).get("branch") or "main").strip().lower() or "main"
+            if branch == "main" or branch not in allowed:
+                locked.add(vid)
+        return locked
+
+    def _writeLockBlockedReason(self, action: str = "Save") -> str:
+        verb = str(action or "Save").strip() or "Save"
+        if self._hasActiveTaskAsJunior():
+            return (
+                "%s is blocked here (🔒 view only). "
+                "Switch to your task branch to %s."
+                % (verb, verb.lower())
+            )
+        return (
+            "%s is blocked (🔒 view only). "
+            "Ask a senior to Assign you a task first."
+            % verb
+        )
+
+    def _warnIfWriteLocked(self, action: str = "Save") -> bool:
+        """If current version is write-locked, show a box and return True."""
+        if not self._isCurrentVersionWriteLocked():
+            return False
+        message = self._writeLockBlockedReason(action)
+        try:
+            slicer.util.warningDisplay(message, windowTitle="View only")
+        except TypeError:
+            slicer.util.warningDisplay(message)
+        self._appendFeed(message, error=True)
+        return True
 
     def _shareLineNextStepMessage(self) -> str:
         if self._canAssignTask():
@@ -8994,6 +9090,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
         layout = qt.QVBoxLayout(self.historyDialog)
         layout.setContentsMargins(12, 12, 12, 12)
 
+        write_locked_ids = set()
         if pick_mode:
             hint_text = (
                 "Click a shared version (solid border), e.g. main/3. "
@@ -9003,6 +9100,11 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             hint_text = graph_description or (
                 "Version tree built from the project version history."
             )
+            if widget is not None:
+                try:
+                    write_locked_ids = set(widget._writeLockedVersionIds() or ())
+                except (AttributeError, TypeError, RuntimeError):
+                    write_locked_ids = set()
         hint = qt.QLabel(hint_text)
         hint.setStyleSheet(DIALOG_HINT_STYLE)
         hint.setWordWrap(True)
@@ -9016,6 +9118,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             active_version_id=getattr(widget, "_currentVersionId", None) if widget else None,
             commit_history_by_id=commit_history_by_id,
             pick_mode=bool(pick_mode),
+            write_locked_ids=write_locked_ids,
         )
         self._historyCanvas = canvas
         layout.addWidget(canvas.create_toolbar())
