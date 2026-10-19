@@ -603,23 +603,6 @@ def start_local_review_branch(repo_dir: str, branch_name: str) -> str:
     return slug
 
 
-def suggest_task_branch_slug(description: str, task_id: str = "") -> str:
-    """Auto lane name for a task (shown on the Version tree as <slug>/N)."""
-    desc = normalize_branch_slug(description) or "task"
-    if desc.lower() == "task":
-        base = "task"
-    elif desc.lower().startswith("task-"):
-        base = desc[:40]
-    else:
-        base = ("task-%s" % desc)[:40]
-    token = re.sub(r"[^A-Za-z0-9]+", "", str(task_id or ""))[-8:]
-    if not token:
-        token = os.urandom(3).hex()
-    return normalize_branch_slug("%s-%s" % (base.rstrip("-"), token)) or (
-        "task-%s" % token
-    )
-
-
 def sha_is_shared_on_remote(repo_dir: str, sha: str) -> bool:
     """True when this commit is already on origin/main or origin/cv-review/*."""
     tip = _git_rev_parse(repo_dir, sha)

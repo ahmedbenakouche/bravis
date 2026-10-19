@@ -128,7 +128,6 @@ from CollaborativeVersioningLib.OntologyLoader import (
 )
 from CollaborativeVersioningLib.UiStyles import (
     ACCENT_ICE,
-    ACCENT_INDIGO,
     ACCENT_MINT,
     BG_ELEVATED,
     BORDER,
@@ -2054,14 +2053,6 @@ class TaskDialog(qt.QDialog):
     def set_pick_start_handler(self, handler) -> None:
         self._pick_start_handler = handler
 
-    def export_draft(self) -> dict:
-        return {
-            "description": self._raw_description(),
-            "juniors": self.selected_juniors(),
-            "anchor_sha": str(self._anchor_sha or "").strip(),
-            "anchor_label": str(self._anchor_label or "").strip(),
-        }
-
     def apply_draft(self, draft) -> None:
         data = draft if isinstance(draft, dict) else {}
         text = str(data.get("description") or "")
@@ -2148,15 +2139,6 @@ class TaskDialog(qt.QDialog):
             return
         self.set_status("Click a shared version in the Version tree…")
         handler(self)
-
-    def _raw_description(self) -> str:
-        try:
-            text = self.descriptionEdit.toPlainText()
-            if callable(text):
-                text = text()
-        except (TypeError, AttributeError, RuntimeError):
-            text = ""
-        return str(text or "")
 
     def set_status(self, message: str, error: bool = False) -> None:
         text = (message or "").strip()
@@ -5171,6 +5153,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     dialog.exec_()
                 finally:
                     self._people_dialog_open = False
+                    self._flushMessagesUiAfterModal()
             except (RuntimeError, TypeError, AttributeError, ValueError) as error:
                 self._appendFeed(str(error).split("\n")[0], error=True)
                 return
@@ -6065,12 +6048,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         if getattr(self, "_offering_invitations", False):
             return
-        if getattr(self, "_people_dialog_open", False):
-            return
-        if getattr(self, "_task_dialog_open", False):
-            return
-        if getattr(self, "_notifications_popup_open", False):
-            return
+        # People / Tasks / Notifications open: keep polling (and presence), but
+        # _applyProjectMessages will skip UI refresh until those dialogs close.
         gh = find_gh()
         if not gh:
             return
@@ -6093,6 +6072,31 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messagesFetchProject = name
         self._refreshing_messages = True
         fetch.start(gh, project_messages_fetch_args(name))
+
+    def _messagesUiRefreshBlocked(self) -> bool:
+        """True while a modal project dialog should not have lists rewritten under it."""
+        return bool(
+            getattr(self, "_people_dialog_open", False)
+            or getattr(self, "_task_dialog_open", False)
+            or getattr(self, "_notifications_popup_open", False)
+        )
+
+    def _flushMessagesUiAfterModal(self) -> None:
+        """Apply cached Messages/presence state to the UI after a blocking dialog closes."""
+        if self._messagesUiRefreshBlocked():
+            return
+        if not self._connected or not self._projectDataIsLoaded():
+            return
+        self._applyProjectMessages(
+            list(getattr(self, "_messages", []) or []),
+            tasks=list(getattr(self, "_project_tasks", []) or []),
+            activity=list(getattr(self, "_project_activity", []) or []),
+            reads=None,
+            presence=dict(getattr(self, "_project_presence", {}) or {}),
+            refresh_ui=True,
+            announce_activity=False,
+        )
+        self._maybeTouchPresence(force=False)
 
     def _onMessagesFetchFinished(self, _code=0) -> None:
         process = getattr(self, "_messagesProcess", None)
@@ -6120,7 +6124,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             return
-        self._applyProjectMessages(incoming, tasks, activity, reads, presence)
+        blocked = self._messagesUiRefreshBlocked()
+        self._applyProjectMessages(
+            incoming,
+            tasks,
+            activity,
+            reads,
+            presence,
+            refresh_ui=not blocked,
+            announce_activity=not blocked,
+        )
         self._maybeTouchPresence(force=False)
 
     def _messagesCursor(self) -> str:
@@ -6135,7 +6148,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return newest
 
     def _applyProjectMessages(
-        self, incoming: list, tasks=None, activity=None, reads=None, presence=None
+        self,
+        incoming: list,
+        tasks=None,
+        activity=None,
+        reads=None,
+        presence=None,
+        refresh_ui: bool = True,
+        announce_activity: bool = True,
     ) -> None:
         if tasks is not None:
             self._project_tasks = list(tasks or [])
@@ -6183,7 +6203,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._reads_by_project = by_project
             by_project[project] = dict(self._project_reads)
         cursor = self._messagesCursor()
-        if self._messagesPanelOpen():
+        # While a modal dialog is open, do not auto-mark the chat as read.
+        panel_open = self._messagesPanelOpen() and refresh_ui
+        if panel_open:
             newest = self._newestMessageStamp(messages)
             if project and newest and newest > cursor:
                 self._persistReadCursor(project, messages_at=newest)
@@ -6201,13 +6223,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     unread += 1
             self._messages_unread = unread
         self._messages = self._mergePendingMessages(messages)
+        if not refresh_ui:
+            # Memory + presence heartbeat only; UI catches up when the dialog closes.
+            return
         self._renderMessagesView()
         self._updateMessagesPresenceBanner()
         self._updateMessagesBadge()
         self._updateTaskButtonUi()
         # Task assign/cancel can change junior write-lock lanes (Save/Share).
         self._updateVersionActionButtons()
-        self._syncNotificationActivityFromProject(announce=True)
+        self._syncNotificationActivityFromProject(announce=bool(announce_activity))
 
     def _onlinePresenceLogins(self, *, exclude_me: bool = False) -> list[str]:
         presence = getattr(self, "_project_presence", {}) or {}
@@ -7163,6 +7188,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._closeHistoryDialog()
             if button is not None:
                 button.setEnabled(True)
+            self._flushMessagesUiAfterModal()
             self._updateTaskButtonUi()
 
     def _onPickStartFromTaskDialog(self, dialog) -> None:
@@ -7399,7 +7425,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         message["anchor_label"] = start
         message["branch_slug"] = branch_slug
         dialog.accept()
-        self._task_assign_draft = None
         self._enqueueTaskMessage(message)
         self._appendFeed(
             "Assigned %s to this task (start %s, branch %s)."
@@ -7498,6 +7523,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             result = dialog.exec_()
         finally:
             self._notifications_popup_open = False
+            self._flushMessagesUiAfterModal()
         if getattr(dialog, "compare_requested", False) or getattr(
             dialog, "sync_requested", False
         ):
@@ -8683,10 +8709,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if me in {login.lower() for login in _task_junior_logins(task)}:
                 found.append(task)
         return found
-
-    def _activeTaskAsJunior(self):
-        tasks = self._activeTasksAsJunior()
-        return tasks[0] if tasks else None
 
     def _hasActiveTaskAsJunior(self) -> bool:
         return bool(self._activeTasksAsJunior())
