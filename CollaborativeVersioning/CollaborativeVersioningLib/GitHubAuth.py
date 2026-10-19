@@ -59,8 +59,97 @@ class GitHubNotSignedInError(GitHubAuthError):
     pass
 
 
+class GitHubOfflineError(GitHubAuthError):
+    """GitHub/Git could not be reached (no internet, DNS, etc.)."""
+
+
 class GitHubMissingDeletePermissionError(GitHubAuthError):
     pass
+
+
+def offline_message() -> str:
+    return (
+        "Cannot reach GitHub.\n\n"
+        "Check your internet connection, then try again."
+    )
+
+
+def looks_like_offline_error(text: str) -> bool:
+    """True when CLI/Git stderr (or our own message) points to no network / unreachable GitHub."""
+    lower = (text or "").lower()
+    if not lower.strip():
+        return False
+    markers = (
+        "cannot reach github",
+        "no internet connection",
+        "could not resolve host",
+        "unable to resolve host",
+        "name or service not known",
+        "nodename nor servname provided",
+        "temporary failure in name resolution",
+        "no such host",
+        "getaddrinfo failed",
+        "getaddrinfo(",
+        "dial tcp",
+        "connectex:",
+        "network is unreachable",
+        "no route to host",
+        "failed to connect to",
+        "error connecting to api.github.com",
+        "couldn't connect to server",
+        "could not connect to the server",
+        "could not connect to server",
+        "connection timed out",
+        "i/o timeout",
+        "tls handshake timeout",
+        "handshake timeout",
+        "server misbehaving",
+        "github cli timed out",
+        "errno 11001",
+        "winerror 10060",
+        "winerror 10061",
+        "winerror 11001",
+    )
+    if any(marker in lower for marker in markers):
+        return True
+    # git fetch/push often: unable to access 'https://github.com/.../'
+    if "unable to access" in lower and "github.com" in lower:
+        authish = (
+            "authentication failed",
+            "permission denied",
+            "write access",
+            "403",
+            "401",
+            "invalid username",
+            "access denied",
+        )
+        if any(part in lower for part in authish):
+            return False
+        return True
+    return False
+
+
+def is_offline_error(error) -> bool:
+    if isinstance(error, GitHubOfflineError):
+        return True
+    return looks_like_offline_error(str(error or ""))
+
+
+def user_facing_github_error(error) -> str:
+    """Map any GitHub/Git failure to a clinician-facing string (unified offline text)."""
+    if is_offline_error(error):
+        return offline_message()
+    return str(error or "").strip() or "Something went wrong talking to GitHub."
+
+
+def raise_github_cli_error(detail: str, fallback: str) -> None:
+    """Raise Offline or a normal GitHubAuthError from CLI/Git stderr."""
+    if looks_like_offline_error(detail) or looks_like_offline_error(fallback):
+        raise GitHubOfflineError(offline_message())
+    detail = (detail or "").strip()
+    if detail:
+        raise GitHubAuthError("%s\n%s" % (fallback, detail[:400]))
+    raise GitHubAuthError(fallback)
 
 
 def _windows_create_no_window():
@@ -195,6 +284,9 @@ def _run_captured(
             process.kill()
             for reader in readers:
                 reader.join(timeout=1)
+            # Network waits are the usual cause; surface as the unified offline message.
+            if "github" in (timeout_label or "").lower() or "git" in (timeout_label or "").lower():
+                raise GitHubOfflineError(offline_message())
             raise GitHubAuthError("%s timed out." % timeout_label)
         if process.poll() is not None:
             for reader in readers:
@@ -243,7 +335,7 @@ def _run_gh_blocking(args: list[str], timeout: int = 25) -> subprocess.Completed
             **_windows_create_no_window(),
         )
     except subprocess.TimeoutExpired as error:
-        raise GitHubAuthError("GitHub CLI timed out.") from error
+        raise GitHubOfflineError(offline_message()) from error
 
 
 def ensure_tools() -> None:
@@ -313,16 +405,54 @@ def open_delete_permission_window() -> None:
     subprocess.Popen(args, start_new_session=True)
 
 
+def _login_from_auth_status() -> str | None:
+    """Read the active GitHub CLI account from local auth status (works offline)."""
+    result = _run_gh(["auth", "status", "--hostname", GITHUB_HOST], timeout=20)
+    text = "%s\n%s" % (result.stdout or "", result.stderr or "")
+    fallback = None
+    current = None
+    for line in text.splitlines():
+        match = re.search(
+            r"logged in to\s+github\.com\s+(?:account\s+)?([A-Za-z0-9-]+)",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            current = match.group(1)
+            if fallback is None:
+                fallback = current
+            continue
+        if current and "active account: true" in line.lower():
+            return current
+    return fallback
+
+
 def current_login() -> str | None:
+    """Return the signed-in GitHub login.
+
+    Uses the network API when possible. If GitHub is unreachable, falls back to the
+    local GitHub CLI auth status so offline Open/Save still know who you are.
+    Raises ``GitHubOfflineError`` only when there is no usable local login either.
+    """
     result = _run_gh(["api", "user"], timeout=30)
-    if result.returncode != 0:
-        return None
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return None
-    login = payload.get("login")
-    return str(login) if login else None
+    if result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        login = payload.get("login")
+        if login:
+            return str(login)
+    detail = (result.stderr or result.stdout or "").strip()
+    local_login = _login_from_auth_status()
+    if looks_like_offline_error(detail):
+        if local_login:
+            return local_login
+        raise GitHubOfflineError(offline_message())
+    # API failed for another reason (token expired, etc.) — still try local identity.
+    if local_login:
+        return local_login
+    return None
 
 
 def logout_github_cli(login: str | None = None) -> None:
@@ -348,7 +478,7 @@ def list_accessible_repos(login: str) -> list[dict[str, Any]]:
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise GitHubAuthError("Could not list GitHub repositories.\n%s" % detail[:400])
+        raise_github_cli_error(detail, "Could not list GitHub repositories.")
     try:
         chunk = json.loads(result.stdout or "[]")
     except json.JSONDecodeError as error:
@@ -465,7 +595,7 @@ def create_private_repository(name: str, description: str = "") -> dict[str, Any
     result = _run_gh(args, timeout=120, cwd=parent_dir)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise GitHubAuthError("Could not create the project.\n%s" % detail[:500])
+        raise_github_cli_error(detail, "Could not create the project.")
     if not os.path.isdir(dest):
         raise GitHubAuthError("The project was created on GitHub but was not cloned to:\n%s" % dest)
     _configure_repo_identity(dest, login)
@@ -750,9 +880,7 @@ def create_and_publish_task_branch(repo_dir: str, sha: str, branch_name: str) ->
         timeout=180,
     )
     if push.returncode != 0:
-        raise GitHubAuthError(
-            _share_failure_message((push.stderr or push.stdout or "").strip())
-        )
+        _raise_share_failure((push.stderr or push.stdout or "").strip())
     _run_git(
         ["update-ref", "refs/remotes/origin/%s" % branch, tip],
         cwd=repo_dir,
@@ -876,6 +1004,8 @@ def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
 
 
 def _share_failure_message(detail: str) -> str:
+    if looks_like_offline_error(detail):
+        return offline_message()
     lower = (detail or "").lower()
     if (
         "non-fast-forward" in lower
@@ -890,6 +1020,13 @@ def _share_failure_message(detail: str) -> str:
     if "permission" in lower or "403" in lower or "write access" in lower:
         return "Could not share. This project is read-only for your account."
     return "Could not share the project yet.\n%s" % (detail or "")[:400]
+
+
+def _raise_share_failure(detail: str) -> None:
+    message = _share_failure_message(detail)
+    if looks_like_offline_error(message) or looks_like_offline_error(detail):
+        raise GitHubOfflineError(offline_message())
+    raise GitHubAuthError(message)
 
 
 def share_local_versions(repo_dir: str) -> None:
@@ -941,7 +1078,7 @@ def share_local_versions(repo_dir: str) -> None:
         timeout=180,
     )
     if push.returncode != 0:
-        raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+        _raise_share_failure((push.stderr or push.stdout or "").strip())
     _run_git(["update-ref", "refs/remotes/origin/main", share_sha], cwd=repo_dir, timeout=20)
     _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
 
@@ -986,7 +1123,7 @@ def _merge_head_into_shared_project(repo_dir: str, login: str) -> None:
         timeout=180,
     )
     if push.returncode != 0:
-        raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+        _raise_share_failure((push.stderr or push.stdout or "").strip())
     _run_git(["update-ref", "refs/remotes/origin/main", merge_sha], cwd=repo_dir, timeout=20)
     checkout_local_version(repo_dir, merge_sha, "main")
     _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
@@ -1081,7 +1218,7 @@ def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
         timeout=180,
     )
     if push.returncode != 0:
-        raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+        _raise_share_failure((push.stderr or push.stdout or "").strip())
     _run_git(["update-ref", "refs/remotes/origin/%s" % branch, head], cwd=repo_dir, timeout=20)
     # Do not move refs/heads/main — Share publishes this branch only. Recolling
     # main onto origin/main would hide local unshared main versions from the tree.
@@ -1474,7 +1611,7 @@ def accept_share_request(full_name: str, branch: str, number) -> str:
             timeout=180,
         )
         if push.returncode != 0:
-            raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
+            _raise_share_failure((push.stderr or push.stdout or "").strip())
         _run_git(["update-ref", "refs/remotes/origin/main", merge_sha], cwd=dest, timeout=20)
         _run_git(["update-ref", "refs/heads/main", merge_sha], cwd=dest, timeout=20)
     if number not in (None, ""):
@@ -1594,7 +1731,7 @@ def fetch_remote_updates(repo_dir: str) -> None:
     fetch = _run_git(["fetch", "origin"], cwd=repo_dir, timeout=180)
     if fetch.returncode != 0:
         detail = (fetch.stderr or fetch.stdout or "").strip()
-        raise GitHubAuthError("Could not get the latest shared versions.\n%s" % detail[:400])
+        raise_github_cli_error(detail, "Could not get the latest shared versions.")
 
 
 def _update_local_from_origin(repo_dir: str) -> None:
@@ -1611,7 +1748,7 @@ def _update_local_from_origin(repo_dir: str) -> None:
             pull = _run_git(["pull", "origin", "main"], cwd=repo_dir, timeout=180)
         if pull.returncode != 0:
             detail = (pull.stderr or pull.stdout or "").strip()
-            raise GitHubAuthError("Could not update the local project.\n%s" % detail[:400])
+            raise_github_cli_error(detail, "Could not update the local project.")
         _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
         return
     if not local_main or local_main == origin_main or _is_ancestor(repo_dir, local_main, origin_main):
@@ -3167,7 +3304,7 @@ def delete_owned_repository(full_name: str) -> None:
             raise GitHubMissingDeletePermissionError(
                 "GitHub needs an extra permission to delete a project."
             )
-        raise GitHubAuthError("Could not delete the project.\n%s" % detail[:400])
+        raise_github_cli_error(detail, "Could not delete the project.")
     remove_local_project_dir(local_project_dir(full_name))
 
 
@@ -3181,7 +3318,7 @@ def _split_project_name(full_name: str) -> tuple[str, str]:
 def _load_gh_json(result: subprocess.CompletedProcess, fail_message: str):
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise GitHubAuthError("%s\n%s" % (fail_message, detail[:400]) if detail else fail_message)
+        raise_github_cli_error(detail, fail_message)
     raw = (result.stdout or "").strip()
     if not raw:
         return None
@@ -3749,7 +3886,7 @@ def parse_project_messages_output(
         if _is_github_missing(result):
             return [], "", [], [], {}, {}
         detail = (stderr or stdout or "").strip()
-        raise GitHubAuthError("Could not read messages.\n%s" % detail[:400])
+        raise_github_cli_error(detail, "Could not read messages.")
     try:
         payload = json.loads(stdout or "{}")
     except json.JSONDecodeError:

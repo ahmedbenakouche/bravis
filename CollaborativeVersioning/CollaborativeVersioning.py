@@ -48,6 +48,11 @@ from CollaborativeVersioningLib.GitHubAuth import (
     GitHubAuthError,
     GitHubMissingDeletePermissionError,
     GitHubNotSignedInError,
+    GitHubOfflineError,
+    is_offline_error,
+    looks_like_offline_error,
+    offline_message,
+    user_facing_github_error,
     accept_project_invitation,
     commit_and_push,
     commit_local_version,
@@ -4565,8 +4570,28 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.connectButton.setEnabled(True)
         self.connectionStatusLabel.text = "Not connected"
         self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
-        slicer.util.warningDisplay(str(error))
-        self._appendFeed(str(error).split("\n")[0], error=True)
+        self._showGithubError(error, box=True)
+
+    def _showGithubError(self, error, *, box: bool = True) -> None:
+        """Show a clinician-facing GitHub/Git error; unify offline into one clear box/feed line.
+
+        User-triggered actions (Connect / Open / Share / …) always get feedback again on
+        each click — no throttle. Background paths use ``box=False`` and may throttle feed.
+        """
+        text = user_facing_github_error(error)
+        feed_line = text.split("\n")[0].strip() or "Something went wrong talking to GitHub."
+        if is_offline_error(error) or isinstance(error, GitHubOfflineError):
+            if box:
+                slicer.util.warningDisplay(
+                    offline_message(),
+                    windowTitle="Cannot reach GitHub",
+                )
+            # force=True so a second Connect/Open/Share while offline still logs in the feed.
+            self._appendFeed(feed_line, error=True, force=True)
+            return
+        if box:
+            slicer.util.warningDisplay(text, windowTitle="GitHub")
+        self._appendFeed(feed_line, error=True, force=True)
 
     def _signInThenConnect(self) -> dict | None:
         try:
@@ -4652,8 +4677,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             logout_github_cli(login or None)
         except GitHubAuthError as error:
             self._closeProgress()
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         self._closeProgress()
         self._connected = False
@@ -4743,8 +4767,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._closeProgress()
             self.createButton.setEnabled(True)
             self._updateVersionActionButtons()
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         login = self._githubLogin()
         try:
@@ -5134,7 +5157,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._updateVersionActionButtons()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         self._closeProgress()
         self._updateVersionActionButtons()
@@ -5264,7 +5287,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             people = list_project_people(full_name)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return current
         self._closeProgress()
         if outcome == "already":
@@ -5300,7 +5323,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             forget_people_access(full_name, login)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return current
         self._closeProgress()
         login_key = login.lower()
@@ -7591,7 +7614,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         self._closeProgress()
         # Re-assert frozen UI (fetch must never rewrite the Version tree panel).
@@ -7653,7 +7676,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._persistReadCursor(project, versions_at=stamp)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         self._closeProgress()
         unshared = self._historyHasUnsharedVersion(history)
@@ -7709,7 +7732,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._persistReadCursor(project, versions_at=stamp)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         self._closeProgress()
         unshared = self._historyHasUnsharedVersion(history)
@@ -7763,12 +7786,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._persistReadCursor(project, versions_at=stamp)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
+            if is_offline_error(error):
+                self._showGithubError(error, box=True)
+                return
             detail = str(error).strip()
             first = detail.split("\n")[0]
             self._appendFeed(first, error=True)
             # Second line often has the real git reason.
             rest = "\n".join(detail.split("\n")[1:]).strip()
-            if rest:
+            if rest and not looks_like_offline_error(rest):
                 self._appendFeed(rest.split("\n")[0], error=True)
             return
         self._closeProgress()
@@ -8271,8 +8297,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._updateVersionActionButtons()
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         self._closeProgress()
         self._updateCommitHistoryPanel()
@@ -8543,14 +8568,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             except GitHubAuthError as error:
                 self._closeProgress()
                 self._updateVersionActionButtons()
-                slicer.util.warningDisplay(str(error))
-                self._appendFeed(str(error).split("\n")[0], error=True)
+                self._showGithubError(error, box=True)
                 return
         except GitHubAuthError as error:
             self._closeProgress()
             self._updateVersionActionButtons()
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         repos = list((self._github_session or {}).get("repos") or [])
         if self._github_session is not None:
@@ -8577,8 +8600,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         try:
             open_delete_permission_window()
         except GitHubAuthError as error:
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             self._updateVersionActionButtons()
             return False
         self._appendFeed("GitHub permission window opened.")
@@ -8722,8 +8744,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._updateVersionActionButtons()
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         finally:
             self._suppress_dirty -= 1
@@ -8803,8 +8824,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._updateVersionActionButtons()
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         unshared = self._historyHasUnsharedVersion(history)
         self._applyProjectHistoryBundle(history, follow_head=True)
@@ -9059,8 +9079,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._updateVersionActionButtons()
-            slicer.util.warningDisplay(str(error))
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         unshared = self._historyHasUnsharedVersion(history)
         self._suppress_dirty += 1
@@ -9352,8 +9371,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     self._clearDirtyAssets()
                 except Exception:
                     pass
-                slicer.util.warningDisplay(str(error))
-                self._appendFeed(str(error).split("\n")[0], error=True)
+                self._showGithubError(error, box=True)
                 return False
             self._currentVersionId = version_id
             self._updateActiveVersionIndicators()
@@ -9522,7 +9540,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             except (RuntimeError, ValueError, TypeError):
                 return
 
-    def _appendFeed(self, message: str, error: bool = False) -> None:
+    def _appendFeed(self, message: str, error: bool = False, *, force: bool = False) -> None:
+        # Unify technical offline/DNS errors into one readable feed line.
+        # Throttle only background spam (force=False); each user click uses force=True.
+        if error and looks_like_offline_error(message):
+            message = offline_message().split("\n")[0]
+            if not force:
+                now = time.time()
+                last = float(getattr(self, "_last_offline_feed_at", 0.0) or 0.0)
+                if (now - last) < 8.0:
+                    return
+                self._last_offline_feed_at = now
         timestamp = datetime.now().strftime("%H:%M")
         prefix = "[ERROR]" if error else "[INFO]"
         line = f"[{timestamp}] {prefix} {message}"
