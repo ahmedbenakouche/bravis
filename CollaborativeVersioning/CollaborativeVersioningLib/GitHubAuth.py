@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import calendar
 import json
 import os
 import re
@@ -3157,6 +3158,10 @@ PEOPLE_ACCESS_JUNIOR = "junior"
 _PEOPLE_RIGHTS_PATH = ".collaborative-versioning/people.json"
 _MESSAGES_PATH = ".collaborative-versioning/messages.json"
 _PROJECT_INFO_BRANCH = "project-info"
+# UI treats a collaborator as online when their last presence stamp is this fresh.
+PRESENCE_ONLINE_SECONDS = 150
+# Callers should not rewrite presence more often than this (throttle).
+PRESENCE_PUBLISH_INTERVAL_SECONDS = 60
 _MESSAGE_MAX_LEN = 2000
 _TASK_TITLE_MAX_LEN = 200
 _ACTIVITY_MAX = 100
@@ -3562,6 +3567,78 @@ def _normalize_stored_reads(document) -> dict[str, dict]:
     return reads
 
 
+def _presence_stamp_epoch(stamp: str) -> float | None:
+    text = str(stamp or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z") or text.endswith("z"):
+        text = text[:-1]
+    if "." in text:
+        text = text.split(".", 1)[0]
+    try:
+        parsed = time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return float(calendar.timegm(parsed))
+
+
+def _normalize_stored_presence(document) -> dict[str, dict[str, str]]:
+    """Per-login last-seen stamps published while a project is open."""
+    raw = document.get("presence") if isinstance(document, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    presence: dict[str, dict[str, str]] = {}
+    for key, value in raw.items():
+        login = normalize_github_username(str(key or ""))
+        if not login:
+            continue
+        if isinstance(value, dict):
+            stamp = str(value.get("at") or "").strip()
+        else:
+            stamp = str(value or "").strip()
+        if not stamp or _presence_stamp_epoch(stamp) is None:
+            continue
+        presence[login.lower()] = {"login": login, "at": stamp}
+    return presence
+
+
+def presence_is_online(
+    stamp: str,
+    *,
+    now_epoch: float | None = None,
+    threshold_sec: int = PRESENCE_ONLINE_SECONDS,
+) -> bool:
+    """True when ``stamp`` is newer than the online threshold (default ~2.5 min)."""
+    epoch = _presence_stamp_epoch(stamp)
+    if epoch is None:
+        return False
+    now = time.time() if now_epoch is None else float(now_epoch)
+    return (now - epoch) <= max(1, int(threshold_sec))
+
+
+def format_presence_ago(stamp: str, *, now_epoch: float | None = None) -> str:
+    """Short relative label for People / Messages (e.g. '12 min ago')."""
+    epoch = _presence_stamp_epoch(stamp)
+    if epoch is None:
+        return ""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    delta = max(0, int(now - epoch))
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        minutes = delta // 60
+        return "%d min ago" % minutes
+    if delta < 86400:
+        hours = delta // 3600
+        return "%d h ago" % hours
+    days = delta // 86400
+    return "%d d ago" % days
+
+
+def utc_now_stamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def parse_project_messages_output(
     stdout: str, stderr: str = "", returncode: int = 0
 ) -> tuple[
@@ -3569,6 +3646,7 @@ def parse_project_messages_output(
     str,
     list[dict[str, str]],
     list[dict[str, str]],
+    dict[str, dict[str, str]],
     dict[str, dict[str, str]],
 ]:
     class _Result:
@@ -3580,15 +3658,15 @@ def parse_project_messages_output(
     result.returncode = returncode
     if returncode != 0:
         if _is_github_missing(result):
-            return [], "", [], [], {}
+            return [], "", [], [], {}, {}
         detail = (stderr or stdout or "").strip()
         raise GitHubAuthError("Could not read messages.\n%s" % detail[:400])
     try:
         payload = json.loads(stdout or "{}")
     except json.JSONDecodeError:
-        return [], "", [], [], {}
+        return [], "", [], [], {}, {}
     if not isinstance(payload, dict):
-        return [], "", [], [], {}
+        return [], "", [], [], {}, {}
     try:
         document = json.loads(_decode_github_file_content(payload) or "{}")
     except json.JSONDecodeError:
@@ -3599,6 +3677,7 @@ def parse_project_messages_output(
         _normalize_stored_tasks(document),
         _normalize_stored_activity(document),
         _normalize_stored_reads(document),
+        _normalize_stored_presence(document),
     )
 
 
@@ -3647,6 +3726,7 @@ def project_messages_put_args(
     tasks: list | None = None,
     activity: list | None = None,
     reads: dict | None = None,
+    presence: dict | None = None,
 ) -> list[str]:
     owner, repo = _split_project_name(full_name)
     stored = []
@@ -3663,12 +3743,18 @@ def project_messages_put_args(
         if kind:
             entry["kind"] = kind
         stored.append(entry)
+    presence_stored = {}
+    for key, value in _normalize_stored_presence({"presence": dict(presence or {})}).items():
+        stamp = str((value or {}).get("at") or "").strip()
+        if stamp:
+            presence_stored[key] = {"at": stamp}
     document = json.dumps(
         {
             "messages": stored,
             "tasks": _normalize_stored_tasks({"tasks": list(tasks or [])}),
             "activity": _normalize_stored_activity({"activity": list(activity or [])}),
             "reads": _normalize_stored_reads({"reads": dict(reads or {})}),
+            "presence": presence_stored,
         },
         separators=(",", ":"),
     )
@@ -3719,7 +3805,7 @@ def publish_project_activity(
     for _attempt in range(4):
         fetch = _run_gh(project_messages_fetch_args(full_name), timeout=40)
         try:
-            messages, sha, tasks, activity, reads = parse_project_messages_output(
+            messages, sha, tasks, activity, reads, presence = parse_project_messages_output(
                 fetch.stdout or "",
                 fetch.stderr or "",
                 fetch.returncode,
@@ -3738,6 +3824,7 @@ def publish_project_activity(
                 tasks=tasks,
                 activity=merged,
                 reads=reads,
+                presence=presence,
             ),
             timeout=40,
         )

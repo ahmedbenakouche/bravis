@@ -110,6 +110,10 @@ from CollaborativeVersioningLib.GitHubAuth import (
     find_open_review_request_for_branch,
     PEOPLE_ACCESS_SENIOR,
     PEOPLE_ACCESS_JUNIOR,
+    PRESENCE_PUBLISH_INTERVAL_SECONDS,
+    presence_is_online,
+    format_presence_ago,
+    utc_now_stamp,
 )
 from CollaborativeVersioningLib.OntologyLoader import (
     _qt_input_text,
@@ -1323,12 +1327,21 @@ class NotificationDetailDialog(qt.QDialog):
 class PeopleDialog(qt.QDialog):
     """See who is on the project. Owners can add or remove a colleague."""
 
-    def __init__(self, parent=None, people=None, can_add=False) -> None:
+    def __init__(
+        self,
+        parent=None,
+        people=None,
+        can_add=False,
+        presence=None,
+        me="",
+    ) -> None:
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("People")
         self.setMinimumWidth(460)
         self.setModal(True)
         self._people = []
+        self._presence = dict(presence or {})
+        self._me = str(me or "").strip()
         self._can_add = bool(can_add)
         self._add_handler = None
         self._remove_handler = None
@@ -1339,6 +1352,12 @@ class PeopleDialog(qt.QDialog):
         people_label = qt.QLabel("People on this project:")
         people_label.setStyleSheet(DIALOG_HINT_STYLE)
         layout.addWidget(people_label)
+        presence_hint = qt.QLabel(
+            "🟢 Online = active in the last ~2–3 min   ·   ⚫ Offline = last seen earlier"
+        )
+        presence_hint.setWordWrap(True)
+        presence_hint.setStyleSheet(DIALOG_HINT_STYLE)
+        layout.addWidget(presence_hint)
 
         self.peopleList = qt.QListWidget()
         self.peopleList.setMinimumHeight(110)
@@ -1431,7 +1450,7 @@ class PeopleDialog(qt.QDialog):
         self.removeButton.setVisible(self._can_add)
         if self._can_add:
             self.peopleList.connect("currentRowChanged(int)", self._onRowChanged)
-        self.set_people(people or [])
+        self.set_people(people or [], presence=self._presence)
         if self._can_add:
             self.usernameEdit.setFocus()
         self._suggestionNames = []
@@ -1669,8 +1688,25 @@ class PeopleDialog(qt.QDialog):
     def people(self) -> list:
         return list(self._people)
 
-    def set_people(self, people) -> None:
+    def _presence_label_for(self, login: str) -> str:
+        name = str(login or "").strip()
+        key = name.lower()
+        me = str(getattr(self, "_me", "") or "").strip().lower()
+        entry = (getattr(self, "_presence", {}) or {}).get(key) or {}
+        stamp = str(entry.get("at") or "").strip()
+        if me and key == me:
+            return "🟢 Online"
+        if presence_is_online(stamp):
+            return "🟢 Online"
+        ago = format_presence_ago(stamp)
+        if ago:
+            return "⚫ Offline · last seen %s" % ago
+        return "⚫ Offline"
+
+    def set_people(self, people, presence=None) -> None:
         self._people = list(people or [])
+        if presence is not None:
+            self._presence = dict(presence or {})
         self.peopleList.clear()
         if not self._people:
             self.peopleList.addItem("No one listed yet.")
@@ -1684,12 +1720,13 @@ class PeopleDialog(qt.QDialog):
                 role_label = "senior"
             else:
                 role_label = "junior"
+            status = self._presence_label_for(login)
             if role == "owner":
-                label = "%s (owner-senior)" % login
+                label = "%s (owner-senior)  %s" % (login, status)
             elif role == "pending":
-                label = "%s (invitation pending · %s)" % (login, role_label)
+                label = "%s (invitation pending · %s)  %s" % (login, role_label, status)
             else:
-                label = "%s (%s)" % (login, role_label)
+                label = "%s (%s)  %s" % (login, role_label, status)
             self.peopleList.addItem(label)
         self._updateRemoveEnabled()
 
@@ -2481,6 +2518,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._project_reads = {}
         self._messageSendActivity = []
         self._messageSendReads = {}
+        self._messageSendPresence = {}
+        self._project_presence = {}
+        self._presence_last_publish_mono = 0.0
         self._people_dialog_open = False
         self._task_dialog_open = False
         self._open_task_dialog = None
@@ -2809,6 +2849,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         messagesLayout.setSpacing(6)
         messagesLayout.setContentsMargins(0, 6, 0, 0)
 
+        self.messagesPresenceLabel = qt.QLabel("")
+        self.messagesPresenceLabel.setWordWrap(True)
+        self.messagesPresenceLabel.setStyleSheet(DIALOG_HINT_STYLE)
+        self.messagesPresenceLabel.setVisible(False)
+
         self.messagesView = qt.QTextEdit()
         self.messagesView.setReadOnly(True)
         self.messagesView.setStyleSheet(MESSAGES_VIEW_STYLE)
@@ -2832,6 +2877,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         composeLayout.addWidget(self.messagesInput, 1)
         composeLayout.addWidget(self.messagesSend, 0)
 
+        messagesLayout.addWidget(self.messagesPresenceLabel)
         messagesLayout.addWidget(self.messagesView)
         messagesLayout.addWidget(compose)
         messagesBody.hide()
@@ -5100,11 +5146,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _showPeopleDialog(self, full_name: str, people, can_add: bool) -> None:
         current = list(people or [])
+        # Presence comes from the Messages poll (same project-info document).
+        self._maybeTouchPresence(force=False)
         while True:
             self._pending_people_action = None
             dialog = None
             try:
-                dialog = PeopleDialog(slicer.util.mainWindow(), current, can_add=can_add)
+                dialog = PeopleDialog(
+                    slicer.util.mainWindow(),
+                    current,
+                    can_add=can_add,
+                    presence=getattr(self, "_project_presence", {}) or {},
+                    me=self._githubLogin() or "",
+                )
                 if can_add:
                     dialog.set_add_handler(
                         lambda dlg, name=full_name: self._queueAddColleague(name, dlg)
@@ -5893,6 +5947,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if checked:
             self._markMessagesRead()
             self._scrollMessagesToEnd()
+            self._updateMessagesPresenceBanner()
+            self._maybeTouchPresence(force=False)
         button = getattr(self, "messagesButton", None)
         if button is not None:
             try:
@@ -5907,11 +5963,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._project_tasks = []
         self._project_activity = []
         self._project_reads = {}
+        self._project_presence = {}
+        self._presence_last_publish_mono = 0.0
         self._messages_unread = 0
         self._messages_project = project or ""
         self._notification_activity = []
         self._rebuildNotificationsDisplay()
         self._renderMessagesView()
+        self._updateMessagesPresenceBanner()
         self._updateMessagesBadge()
         self._updateTaskButtonUi()
 
@@ -6056,12 +6115,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if expected != self._currentProjectName():
             return
         try:
-            incoming, _sha, tasks, activity, reads = parse_project_messages_output(
+            incoming, _sha, tasks, activity, reads, presence = parse_project_messages_output(
                 stdout, stderr, code
             )
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             return
-        self._applyProjectMessages(incoming, tasks, activity, reads)
+        self._applyProjectMessages(incoming, tasks, activity, reads, presence)
+        self._maybeTouchPresence(force=False)
 
     def _messagesCursor(self) -> str:
         return str((getattr(self, "_project_reads", {}) or {}).get("messages_at") or "")
@@ -6075,12 +6135,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return newest
 
     def _applyProjectMessages(
-        self, incoming: list, tasks=None, activity=None, reads=None
+        self, incoming: list, tasks=None, activity=None, reads=None, presence=None
     ) -> None:
         if tasks is not None:
             self._project_tasks = list(tasks or [])
         if activity is not None:
             self._project_activity = list(activity or [])
+        if presence is not None:
+            self._project_presence = dict(presence or {})
         messages = list(incoming or [])
         me = (self._githubLogin() or "").lower()
         project = self._currentProjectName() if self._hasSelectedProject() else ""
@@ -6140,11 +6202,126 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._messages_unread = unread
         self._messages = self._mergePendingMessages(messages)
         self._renderMessagesView()
+        self._updateMessagesPresenceBanner()
         self._updateMessagesBadge()
         self._updateTaskButtonUi()
         # Task assign/cancel can change junior write-lock lanes (Save/Share).
         self._updateVersionActionButtons()
         self._syncNotificationActivityFromProject(announce=True)
+
+    def _onlinePresenceLogins(self, *, exclude_me: bool = False) -> list[str]:
+        presence = getattr(self, "_project_presence", {}) or {}
+        me = (self._githubLogin() or "").strip().lower()
+        names = []
+        for key, entry in sorted(presence.items(), key=lambda item: item[0]):
+            login = str((entry or {}).get("login") or key or "").strip()
+            stamp = str((entry or {}).get("at") or "").strip()
+            if not login:
+                continue
+            if exclude_me and me and login.lower() == me:
+                continue
+            if presence_is_online(stamp) or (me and login.lower() == me):
+                names.append(login)
+        if me and not exclude_me:
+            # Always count myself when the project is open locally.
+            if not any(name.lower() == me for name in names):
+                names.insert(0, self._githubLogin() or me)
+        names.sort(key=lambda item: item.lower())
+        return names
+
+    def _updateMessagesPresenceBanner(self) -> None:
+        label = getattr(self, "messagesPresenceLabel", None)
+        if label is None or not _qt_widget_is_valid(label):
+            return
+        if not self._connected or not self._projectDataIsLoaded():
+            label.setText("")
+            label.setVisible(False)
+            return
+        others = self._onlinePresenceLogins(exclude_me=True)
+        if others:
+            text = "🟢 Online: %s" % ", ".join(others)
+        else:
+            text = "🟢 Online: only you (nobody else in the last ~2–3 min)"
+        label.setText(text)
+        label.setVisible(True)
+
+    def _maybeTouchPresence(self, force: bool = False) -> None:
+        """Publish my last-seen stamp (throttled) while this project is open."""
+        if not self._connected or not self._projectDataIsLoaded():
+            return
+        project = self._currentProjectName()
+        me = (self._githubLogin() or "").strip()
+        if not project or not me:
+            return
+        now_mono = time.monotonic()
+        last = float(getattr(self, "_presence_last_publish_mono", 0.0) or 0.0)
+        if not force and last and (now_mono - last) < PRESENCE_PUBLISH_INTERVAL_SECONDS:
+            return
+        # Optimistic local mark so People/Messages update before the PUT returns.
+        stamp = utc_now_stamp()
+        presence = dict(getattr(self, "_project_presence", {}) or {})
+        presence[me.lower()] = {"login": me, "at": stamp}
+        self._project_presence = presence
+        self._presence_last_publish_mono = now_mono
+        self._updateMessagesPresenceBanner()
+        self._enqueuePresenceTouch(project, stamp)
+
+    def _enqueuePresenceTouch(self, full_name: str, stamp: str = "") -> None:
+        project = str(full_name or "").strip()
+        me = (self._githubLogin() or "").strip()
+        at = str(stamp or "").strip() or utc_now_stamp()
+        if not project or not me:
+            return
+        current = getattr(self, "_messageSendCurrent", None) or {}
+        if (
+            getattr(self, "_sending_message", False)
+            and str(current.get("kind") or "") == "presence"
+            and str(current.get("full_name") or "") == project
+        ):
+            current["at"] = at
+            current["author"] = me
+            return
+        queue = list(getattr(self, "_messageSendQueue", []) or [])
+        for item in queue:
+            if (
+                str(item.get("kind") or "") == "presence"
+                and str(item.get("full_name") or "") == project
+            ):
+                item["at"] = at
+                item["author"] = me
+                self._messageSendQueue = queue
+                return
+        queue.append(
+            {
+                "id": "presence-%s-%s" % (project, int(time.time() * 1000)),
+                "kind": "presence",
+                "full_name": project,
+                "author": me,
+                "text": "",
+                "at": at,
+            }
+        )
+        self._messageSendQueue = queue
+        if not getattr(self, "_sending_message", False):
+            self._startNextQueuedSend()
+
+    def _mergePresenceForPut(self, remote_presence, touch_stamp: str = "") -> dict:
+        merged = dict(remote_presence or {})
+        local = dict(getattr(self, "_project_presence", {}) or {})
+        for key, entry in local.items():
+            remote_entry = merged.get(key) or {}
+            local_at = str((entry or {}).get("at") or "")
+            remote_at = str((remote_entry or {}).get("at") or "")
+            if local_at and local_at >= remote_at:
+                merged[key] = {
+                    "login": str((entry or {}).get("login") or key),
+                    "at": local_at,
+                }
+        me = (self._githubLogin() or "").strip()
+        stamp = str(touch_stamp or "").strip()
+        if me and stamp:
+            merged[me.lower()] = {"login": me, "at": stamp}
+        return merged
 
     def _markMessagesRead(self) -> None:
         project = self._currentProjectName() if self._hasSelectedProject() else ""
@@ -6416,7 +6593,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         message = queue.pop(0)
         self._messageSendQueue = queue
         self._messageSendCurrent = message
-        if str(message.get("kind") or "") == "reads":
+        kind = str(message.get("kind") or "")
+        if kind in ("reads", "presence"):
             self._messageSendProject = str(message.get("full_name") or "").strip()
         else:
             self._messageSendProject = self._currentProjectName()
@@ -6425,6 +6603,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messageSendTasks = list(getattr(self, "_project_tasks", []) or [])
         self._messageSendActivity = list(getattr(self, "_project_activity", []) or [])
         self._messageSendReads = {}
+        self._messageSendPresence = dict(getattr(self, "_project_presence", {}) or {})
         self._sending_message = True
         self._startMessageSendGet()
 
@@ -6489,16 +6668,41 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 process.deleteLater()
             except (RuntimeError, ValueError):
                 pass
-        if str(current.get("kind") or "") != "reads" and project != self._currentProjectName():
+        if (
+            str(current.get("kind") or "") not in ("reads", "presence")
+            and project != self._currentProjectName()
+        ):
             self._failPendingMessage(current, "Could not send the message.")
             return
         if phase == "get":
             try:
-                existing, sha, tasks, activity, reads = parse_project_messages_output(
+                existing, sha, tasks, activity, reads, presence = parse_project_messages_output(
                     stdout, stderr, code
                 )
             except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
                 self._failPendingMessage(current, str(error))
+                return
+            if str(current.get("kind") or "") == "presence":
+                merged_presence = self._mergePresenceForPut(
+                    presence, touch_stamp=str(current.get("at") or "")
+                )
+                self._messageSendExisting = existing
+                self._messageSendTasks = tasks
+                self._messageSendActivity = activity
+                self._messageSendReads = reads
+                self._messageSendPresence = merged_presence
+                self._messageSendPhase = "put"
+                self._startMessageSendProcess(
+                    project_messages_put_args(
+                        project,
+                        existing,
+                        sha,
+                        tasks=tasks,
+                        activity=activity,
+                        reads=reads,
+                        presence=merged_presence,
+                    )
+                )
                 return
             if str(current.get("kind") or "") == "reads":
                 me = (self._githubLogin() or "").strip().lower()
@@ -6539,10 +6743,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     entry["activity_ids"] = ids[-200:]
                 if me and entry:
                     merged_reads[me] = entry
+                merged_presence = self._mergePresenceForPut(presence)
                 self._messageSendExisting = existing
                 self._messageSendTasks = tasks
                 self._messageSendActivity = activity
                 self._messageSendReads = merged_reads
+                self._messageSendPresence = merged_presence
                 self._messageSendPhase = "put"
                 self._startMessageSendProcess(
                     project_messages_put_args(
@@ -6552,6 +6758,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                         tasks=tasks,
                         activity=activity,
                         reads=merged_reads,
+                        presence=merged_presence,
                     )
                 )
                 return
@@ -6561,12 +6768,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     self._messageSendTasks = tasks
                     self._messageSendActivity = activity
                     self._messageSendReads = reads
+                    self._messageSendPresence = presence
                     self._confirmPendingMessage(current, existing)
                     return
             elif any(item.get("id") == current.get("id") for item in existing):
                 self._messageSendTasks = tasks
                 self._messageSendActivity = activity
                 self._messageSendReads = reads
+                self._messageSendPresence = presence
                 self._confirmPendingMessage(current, existing)
                 return
             try:
@@ -6581,10 +6790,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 str(item.get("id") or "") == extra.get("id") for item in merged_activity
             ):
                 merged_activity.append(extra)
+            merged_presence = self._mergePresenceForPut(presence)
             self._messageSendExisting = existing
             self._messageSendTasks = tasks
             self._messageSendActivity = merged_activity
             self._messageSendReads = reads
+            self._messageSendPresence = merged_presence
             self._messageSendPhase = "put"
             if activity_only:
                 payload = list(existing)
@@ -6598,13 +6809,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     tasks=tasks,
                     activity=merged_activity,
                     reads=reads,
+                    presence=merged_presence,
                 )
             )
             return
         if code == 0:
             existing = list(getattr(self, "_messageSendExisting", []) or [])
             kind = str(current.get("kind") or "")
-            if kind not in ("activity", "reads"):
+            if kind not in ("activity", "reads", "presence"):
                 stored = self._storedMessage(current)
                 if not any(item.get("id") == stored.get("id") for item in existing):
                     existing.append(stored)
@@ -6700,18 +6912,27 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._sending_message = False
         self._messageSendCurrent = None
         self._messageSendPhase = ""
-        if str((message or {}).get("kind") or "") != "reads":
+        kind = str((message or {}).get("kind") or "")
+        presence = getattr(self, "_messageSendPresence", None)
+        if presence is not None:
+            self._project_presence = dict(presence or {})
+            self._updateMessagesPresenceBanner()
+        if kind not in ("reads", "presence"):
             self._applyProjectMessages(
                 existing,
                 getattr(self, "_messageSendTasks", None),
                 getattr(self, "_messageSendActivity", None),
                 getattr(self, "_messageSendReads", None),
+                presence,
             )
         self._startNextQueuedSend()
 
     def _failPendingMessage(self, message: dict, error_text: str) -> None:
         kind = str((message or {}).get("kind") or "")
-        if kind == "reads":
+        if kind in ("reads", "presence"):
+            if kind == "presence":
+                # Allow a retry on the next poll window.
+                self._presence_last_publish_mono = 0.0
             self._sending_message = False
             self._messageSendCurrent = None
             self._messageSendPhase = ""
