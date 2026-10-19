@@ -1107,6 +1107,20 @@ class InteractiveGraphView(qt.QGraphicsView):
                 except (AttributeError, TypeError, RuntimeError):
                     pass
                 self.fitInView(rect, qt.Qt.KeepAspectRatio)
+                # Shrink-only: never enlarge a tiny graph (1 node) to fill the pane.
+                try:
+                    scale = abs(float(self.transform().m11()))
+                except (AttributeError, TypeError, RuntimeError, ValueError):
+                    scale = 1.0
+                if scale > 1.0:
+                    self.resetTransform()
+                    self._zoom_level = 1.0
+                    try:
+                        self.centerOn(rect.center())
+                    except (AttributeError, TypeError, RuntimeError):
+                        pass
+                else:
+                    self._zoom_level = max(scale, getattr(self, "ZOOM_MIN", 0.05) or 0.05)
                 return
             rect = self._graphe_scene.sceneRect
             if rect.width() <= 0 or rect.height() <= 0:
