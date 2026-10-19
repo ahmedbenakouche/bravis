@@ -1662,7 +1662,20 @@ class _VersionInfoDialog(qt.QDialog):
             or allowed.get("merge")
             or allowed.get("accept")
             or allowed.get("decline")
+            or allowed.get("delete")
         )
+        if allowed.get("delete"):
+            note = qt.QLabel(
+                str(allowed.get("delete_note") or "").strip()
+                or (
+                    "Delete is only for versions saved on this computer "
+                    "and not shared yet (dashed border)."
+                )
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("color: %s; font-size: 11px;" % (_ui.TEXT_MUTED or "#9ca3af"))
+            layout.addSpacing(8)
+            layout.addWidget(note)
         if has_action:
             actions_row = qt.QHBoxLayout()
             actions_row.setSpacing(16)
@@ -1685,6 +1698,8 @@ class _VersionInfoDialog(qt.QDialog):
                 add_action("Accept", self._chooseAccept, _ui.BTN_CREATE)
             if allowed.get("decline"):
                 add_action("Decline", self._chooseDecline, _ui.BTN_DELETE)
+            if allowed.get("delete"):
+                add_action("Delete", self._chooseDelete, _ui.BTN_DELETE)
             layout.addSpacing(14)
             layout.addLayout(actions_row)
 
@@ -1710,6 +1725,9 @@ class _VersionInfoDialog(qt.QDialog):
 
     def _chooseDecline(self):
         self._choose("decline")
+
+    def _chooseDelete(self):
+        self._choose("delete")
 
     def _choose(self, name):
         self.chosen = name

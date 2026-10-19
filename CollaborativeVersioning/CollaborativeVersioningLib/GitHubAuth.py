@@ -602,6 +602,111 @@ def sha_is_shared_on_remote(repo_dir: str, sha: str) -> bool:
     return tip.lower() in {item.lower() for item in shared}
 
 
+def _abort_rebase_if_any(repo_dir: str) -> None:
+    git_dir = os.path.join(repo_dir, ".git")
+    if os.path.isdir(os.path.join(git_dir, "rebase-merge")) or os.path.isdir(
+        os.path.join(git_dir, "rebase-apply")
+    ):
+        _run_git(["rebase", "--abort"], cwd=repo_dir, timeout=60)
+
+
+def _commit_tree_with_parent(
+    repo_dir: str, tree_sha: str, parent_sha: str, message: str
+) -> str:
+    """Create a commit with an exact tree (snapshot) and one parent."""
+    commit = _run_git(
+        [
+            "commit-tree",
+            tree_sha,
+            "-p",
+            parent_sha,
+            "-m",
+            message or "New version",
+        ],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    new_sha = (commit.stdout or "").strip()
+    if commit.returncode != 0 or not new_sha:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise GitHubAuthError("Could not delete that version.\n%s" % detail[:400])
+    return new_sha
+
+
+def delete_local_unshared_version(repo_dir: str, sha: str, lane: str = "main") -> str:
+    """Drop a local commit that was never shared. Returns the SHA to check out after.
+
+    Works for any unshared commit on the lane's first-parent line (tip or middle).
+    Shared commits are refused.
+
+    Tip → move branch to parent.
+    Middle → rebuild newer commits with the same file trees onto the parent
+    (no patch rebase — avoids conflicts on full project snapshots).
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    # Clear a stuck rebase from a previous failed delete attempt.
+    _abort_rebase_if_any(repo_dir)
+    target = _git_rev_parse(repo_dir, sha)
+    if not target:
+        raise GitHubAuthError("Could not find that version.")
+    branch = git_branch_for_history_lane(lane)
+    branch_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
+    if not branch_tip:
+        raise GitHubAuthError("Could not find that branch tip.")
+    if sha_is_shared_on_remote(repo_dir, target):
+        raise GitHubAuthError(
+            "Shared versions cannot be deleted.\n\n"
+            "Delete is only for versions saved on this computer and not shared yet."
+        )
+    commit_by_sha = _read_repo_commits(repo_dir)
+    chain = _first_parent_chain(commit_by_sha, branch_tip)
+    if target not in set(chain):
+        raise GitHubAuthError(
+            "That version is not on this branch line.\n\n"
+            "Open it on its own branch, then try Delete again."
+        )
+    # Do not rewrite history that already includes a shared newer tip.
+    for sha_on_line in chain:
+        if sha_on_line == target:
+            break
+        if sha_is_shared_on_remote(repo_dir, sha_on_line):
+            raise GitHubAuthError(
+                "Cannot delete this version: a newer shared version depends on it."
+            )
+    parents = (commit_by_sha.get(target) or {}).get("parents") or []
+    parent = parents[0] if parents else ""
+    if not parent:
+        raise GitHubAuthError("Cannot delete the first version of this project.")
+    login = current_login()
+    if login:
+        _configure_repo_identity(repo_dir, login)
+    if target.lower() == branch_tip.lower():
+        _checkout_branch_at(repo_dir, branch, parent)
+        return parent
+    # Newer commits on the line (tip → … → child of target), tip first.
+    newer = []
+    for sha_on_line in chain:
+        if sha_on_line == target:
+            break
+        newer.append(sha_on_line)
+    # Replay oldest-first, keeping each version's exact project tree.
+    new_parent = parent
+    for old_sha in reversed(newer):
+        tree = _run_git(
+            ["rev-parse", "%s^{tree}" % old_sha],
+            cwd=repo_dir,
+            timeout=20,
+        )
+        tree_sha = (tree.stdout or "").strip()
+        if tree.returncode != 0 or not tree_sha:
+            raise GitHubAuthError("Could not delete that version.")
+        message = str((commit_by_sha.get(old_sha) or {}).get("message") or "New version")
+        new_parent = _commit_tree_with_parent(repo_dir, tree_sha, new_parent, message)
+    _checkout_branch_at(repo_dir, branch, new_parent)
+    return new_parent
+
+
 def create_and_publish_task_branch(repo_dir: str, sha: str, branch_name: str) -> str:
     """Create cv-review/<slug> at sha and push only that ref. Does not move HEAD/main.
 

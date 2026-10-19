@@ -96,6 +96,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     ensure_can_share_with_shared,
     start_local_review_branch,
     create_and_publish_task_branch,
+    delete_local_unshared_version,
     sha_is_shared_on_remote,
     accept_share_request,
     decline_share_request,
@@ -7896,7 +7897,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 best_id = vid
         return best_id
 
-    def _taskRoleForLane(self, lane: str):
+    def _taskRoleForLane(self, lane: str, *, network: bool = True):
+        """Return submit/review role for a lane.
+
+        ``network=False`` uses only local task fields (fast — for Version details
+        dialog). ``network=True`` may query GitHub for open review PRs.
+        """
         lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
         if not lane_key or lane_key == "main":
             return None
@@ -7929,15 +7935,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 continue
             if senior.lower() != me:
                 continue
+            if task_slug == lane_key and status == "submitted":
+                review = task
+                continue
+            if not network:
+                continue
             try:
                 req = find_open_review_request_for_branch(full_name, lane_key)
             except (GitHubAuthError, OSError, RuntimeError, ValueError):
                 req = None
             author_key = str((req or {}).get("author") or "").strip().lower()
             if req and author_key in junior_keys:
-                review = task
-                continue
-            if task_slug == lane_key and status == "submitted":
                 review = task
                 continue
             for junior in juniors:
@@ -8013,18 +8021,62 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         current = self._currentNamedBranchSlug().lower()
         return bool(current and current == key)
 
+    def _versionHistoryStatus(self, version_id: str) -> str:
+        vid = str(version_id or "").strip()
+        if not vid:
+            return ""
+        for row in (
+            (getattr(self, "_project_history_bundle", None) or {}).get("commit_history")
+            or []
+        ):
+            if not row or str(row[0] or "").strip() != vid:
+                continue
+            if len(row) > 4:
+                return str(row[4] or "").strip().lower()
+            return ""
+        return ""
+
+    def _canDeleteLocalUnsharedVersion(self, spec) -> bool:
+        """True for any local (not shared) version on a lane — not stubs / shared."""
+        if not self._projectDataIsLoaded():
+            return False
+        if (spec or {}).get("lane_start"):
+            return False
+        version_id = str((spec or {}).get("id") or "").strip()
+        if not version_id:
+            return False
+        if self._versionHistoryStatus(version_id) != "local":
+            return False
+        # Juniors may only delete on their writable task lanes.
+        if self._isVersionWriteLocked(version_id):
+            return False
+        return True
+
+    def _withDeleteAction(self, payload: dict, spec) -> dict:
+        out = dict(payload or {})
+        if self._canDeleteLocalUnsharedVersion(spec):
+            out["delete"] = True
+            out["delete_note"] = (
+                "Delete removes this version only on this computer. "
+                "It works for any saved local version that is not shared yet "
+                "(dashed border). Shared versions cannot be deleted."
+            )
+        return out
+
     def _reviewActionsForVersion(self, spec, history) -> dict:
+        """Build Version-details actions from local state only (no GitHub round-trip)."""
         lane = str((spec or {}).get("branch") or "")
         # Task lanes first — never show bare "Merge" instead of Accept/Decline.
         task = self._activeTaskForBranchSlug(lane)
         if task is not None:
-            return self._reviewActionsForTaskLane(task, lane)
+            return self._withDeleteAction(self._reviewActionsForTaskLane(task, lane), spec)
         # Owner / senior: merge their own shared line onto main (no task).
         if self._canAssignTask() and self._isOwnReviewLane(lane):
-            return {"merge": True}
-        role = self._taskRoleForLane(lane)
+            return self._withDeleteAction({"merge": True}, spec)
+        # Local task fields only — PR lookup happens when Accept/Decline is clicked.
+        role = self._taskRoleForLane(lane, network=False)
         if not role:
-            return {}
+            return self._withDeleteAction({}, spec)
         kind, linked = role
         if kind == "review":
             text = str(
@@ -8038,16 +8090,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         }
         if kind == "submit":
             payload["submit"] = True
-            return payload
-        request = self._openReviewForTask(linked, lane=lane)
-        if not request:
-            return {}
+            return self._withDeleteAction(payload, spec)
         payload["accept"] = True
         payload["decline"] = True
-        return payload
+        return self._withDeleteAction(payload, spec)
 
     def _reviewActionsForTaskLane(self, task: dict, lane: str) -> dict:
-        """Actions for a unified task branch (1 task = 1 lane)."""
+        """Actions for a unified task branch (1 task = 1 lane). Local-only (fast)."""
         status = str((task or {}).get("status") or "").strip().lower()
         me = (self._githubLogin() or "").strip().lower()
         senior = str((task or {}).get("senior") or "").strip().lower()
@@ -8063,13 +8112,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         }
         if status == "submitted":
             if self._canAssignTask() and senior and senior == me:
-                request = self._openReviewForTask(task, lane=lane)
-                if request:
-                    payload["accept"] = True
-                    payload["decline"] = True
-                else:
-                    # No open PR found — Merge still closes the unified task lane.
-                    payload["merge"] = True
+                # Show Accept/Decline immediately; resolve the open PR on click.
+                payload["accept"] = True
+                payload["decline"] = True
             return payload
         if me in juniors and status != "accepted":
             payload["submit"] = True
@@ -8077,6 +8122,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def onVersionReviewAction(self, action: str, spec) -> None:
         lane = str((spec or {}).get("branch") or "")
+        if action == "delete":
+            self._deleteLocalUnsharedVersion(spec)
+            return
         task = self._activeTaskForBranchSlug(lane)
         role = self._taskRoleForLane(lane)
         if action == "merge":
@@ -8129,6 +8177,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
         if not request:
+            if action == "accept" and task is not None:
+                # No open PR — still finish the task lane via Merge (same as before).
+                self._mergeOwnReviewLine(lane)
+                return
             self._appendFeed("Nothing is waiting for review on this branch.", error=True)
             return
         junior = str(request.get("author") or "").strip() or "this junior"
@@ -8153,6 +8205,75 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._declineReviewedShareRequest(request)
         self._updateActiveVersionIndicators()
         self._updateTaskButtonUi()
+
+    def _deleteLocalUnsharedVersion(self, spec) -> None:
+        """Remove a local unsaved-to-shared version (this computer only)."""
+        if not self._canDeleteLocalUnsharedVersion(spec):
+            self._appendFeed(
+                "Delete is only for local versions that are not shared yet.",
+                error=True,
+            )
+            return
+        version_id = str((spec or {}).get("id") or "").strip()
+        lane = str((spec or {}).get("branch") or "main").strip() or "main"
+        display = self._versionDisplayTag(version_id)
+        tip_id = self._tipVersionIdForLane(lane)
+        middle_note = ""
+        if tip_id and tip_id != version_id:
+            middle_note = (
+                "\n\nNewer local versions on this branch will be kept "
+                "(same content, new ids may appear on the tree)."
+            )
+        confirmed = slicer.util.confirmYesNoDisplay(
+            "Delete %s from this computer?\n\n"
+            "This only removes a saved local version that is not shared yet.\n"
+            "Shared versions cannot be deleted. This cannot be undone."
+            "%s" % (display, middle_note),
+            windowTitle="Delete version",
+        )
+        if not confirmed:
+            return
+        local_path = getattr(self, "_local_project_path", None) or ""
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        sha = str((bundle.get("sha_by_id") or {}).get(version_id) or "").strip()
+        if not local_path or not sha:
+            self._appendFeed("Could not delete that version.", error=True)
+            return
+        self._openProgress("Delete version", "Removing %s…" % display)
+        try:
+            self._updateProgress("Updating the local branch…")
+            delete_local_unshared_version(local_path, sha, lane)
+            self._updateProgress("Reloading project files…")
+            self._loadOpenedProjectAssets(local_path, volume_folder=local_path)
+            self._syncAssetDataObservers()
+            self._clearDirtyAssets()
+            self._updateProgress("Updating version history…")
+            history = read_project_history(local_path)
+            version_id_after = self._applyProjectHistoryBundle(history, follow_head=True)
+            self._unshared_version = self._historyHasUnsharedVersion(history)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            self._updateVersionActionButtons()
+            slicer.util.warningDisplay(str(error))
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        self._closeProgress()
+        self._updateCommitHistoryPanel()
+        self._updateActiveVersionIndicators()
+        self._updateVersionActionButtons()
+        self._armLoadSettle()
+        if version_id_after:
+            self._appendFeed(
+                "Deleted %s (local only). Now on %s."
+                % (display, self._versionDisplayTag(version_id_after))
+            )
+        else:
+            self._appendFeed("Deleted %s (local only)." % display)
+        # Refresh an open Version tree so the node disappears immediately.
+        logic = getattr(self, "logic", None)
+        dialog = getattr(logic, "historyDialog", None) if logic is not None else None
+        if dialog is not None and _qt_widget_is_valid(dialog):
+            qt.QTimer.singleShot(0, lambda: self.onOpenHistoryGraph(pick_mode=False))
 
     def _mergeOwnReviewLine(self, lane: str = "") -> None:
         """Senior/owner: put a shared named branch onto main (same merge as Accept)."""
