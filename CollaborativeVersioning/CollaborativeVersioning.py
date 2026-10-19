@@ -2945,6 +2945,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             c if c.isalnum() or c in "-_" else "_" for c in (project_name or "project")
         ).strip("_") or "project"
 
+    def _alignProjectAssetNodeNames(self, volume_node, segmentation_node, project_name: str) -> None:
+        """Rename MRML nodes to match project file stems (scene only — never renames disk sources)."""
+        stem = self._projectFileStem(project_name)
+        volume_name = "%s_volume" % stem
+        segmentation_name = "%s_segmentation" % stem
+        try:
+            if volume_node is not None and hasattr(volume_node, "SetName"):
+                if str(volume_node.GetName() or "") != volume_name:
+                    volume_node.SetName(volume_name)
+            if segmentation_node is not None and hasattr(segmentation_node, "SetName"):
+                if str(segmentation_node.GetName() or "") != segmentation_name:
+                    segmentation_node.SetName(segmentation_name)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            logging.exception("Could not align project asset node names")
+
     def _setOntologyComboLoadedFilename(self, document=None, filename=None) -> None:
         if filename:
             self._project_ontology_path = filename
@@ -4753,6 +4768,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._applyProjectHistoryBundle(history)
         self._suppress_dirty += 1
         try:
+            # Match Open-project naming in the scene; original files outside the project stay untouched.
+            self._alignProjectAssetNodeNames(volume_node, segmentation_node, config["name"])
             if ontology_path:
                 self._setOntologyComboLoadedFilename(filename=ontology_path)
             self._clearChangeFlags()
