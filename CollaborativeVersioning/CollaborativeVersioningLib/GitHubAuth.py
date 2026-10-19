@@ -546,19 +546,6 @@ def _stage_and_commit(repo_dir: str, message: str, fail_prefix: str) -> None:
         raise GitHubAuthError("%s\n%s" % (fail_prefix, detail[:400]))
 
 
-def head_can_update_shared_project(repo_dir: str) -> bool:
-    """True when Share can add this computer's versions onto the shared project line."""
-    # Use main tip (not detached HEAD) so viewing an older version does not
-    # look like we are behind origin/main.
-    tip = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(repo_dir, "HEAD")
-    if not tip:
-        return False
-    origin = _git_rev_parse(repo_dir, "origin/main")
-    if not origin:
-        return True
-    return _is_ancestor(repo_dir, origin, tip)
-
-
 def work_is_on_review_branch(repo_dir: str) -> bool:
     return _current_branch_name(repo_dir).startswith("cv-review/")
 
@@ -801,10 +788,14 @@ def _share_failure_message(detail: str) -> str:
 
 
 def share_local_versions(repo_dir: str) -> None:
-    """Publish the current main-line tip to origin/main. Does not create a new version.
+    """Publish the current main-line version to origin/main. Does not create a new version.
 
     Named branches are published separately via ``publish_review_branch`` /
     ``publish_current_line`` — this path never creates or updates a side branch.
+
+    When Switch left HEAD on an older main commit (tip still ahead locally),
+    Share publishes only up to HEAD — later unshared tips (e.g. main/3 while
+    viewing main/2) stay local until you Switch there and Share again.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -813,30 +804,40 @@ def share_local_versions(repo_dir: str) -> None:
             "You are on a branch (not main).\n\n"
             "Share publishes this branch only. To put it on main, use Merge (or Accept)."
         )
-    # Prefer the main tip so Share still publishes unshared main/N while the
-    # worktree is temporarily on an older version (detached Switch).
-    main_tip = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
-        repo_dir, "HEAD"
-    )
-    origin = _run_git(["rev-parse", "--verify", "--quiet", "origin/main"], cwd=repo_dir, timeout=30)
-    if origin.returncode == 0 and not _unpushed_commit_shas(repo_dir):
+    head = _git_rev_parse(repo_dir, "HEAD")
+    main_tip = _git_rev_parse(repo_dir, "refs/heads/main") or head
+    if (
+        head
+        and main_tip
+        and head != main_tip
+        and _is_ancestor(repo_dir, head, main_tip)
+    ):
+        share_sha = head
+    else:
+        share_sha = main_tip or head
+    if not share_sha:
+        raise GitHubAuthError("Could not share the project yet.")
+    origin_sha = _git_rev_parse(repo_dir, "origin/main")
+    if origin_sha and (
+        origin_sha == share_sha
+        or (_is_ancestor(repo_dir, share_sha, origin_sha) and share_sha != origin_sha)
+    ):
         raise GitHubAuthError("No new versions to share.")
     login = current_login()
     if login:
         _configure_repo_identity(repo_dir, login)
-    if origin.returncode == 0 and not head_can_update_shared_project(repo_dir):
+    # Shared main diverged from this share point — merge using the worktree HEAD.
+    if origin_sha and not _is_ancestor(repo_dir, origin_sha, share_sha):
         _merge_head_into_shared_project(repo_dir, login or "owner")
         return
-    if not main_tip:
-        raise GitHubAuthError("Could not share the project yet.")
     push = _run_git(
-        ["push", "-u", "origin", "%s:refs/heads/main" % main_tip],
+        ["push", "-u", "origin", "%s:refs/heads/main" % share_sha],
         cwd=repo_dir,
         timeout=180,
     )
     if push.returncode != 0:
         raise GitHubAuthError(_share_failure_message((push.stderr or push.stdout or "").strip()))
-    _run_git(["update-ref", "refs/remotes/origin/main", main_tip], cwd=repo_dir, timeout=20)
+    _run_git(["update-ref", "refs/remotes/origin/main", share_sha], cwd=repo_dir, timeout=20)
     _run_git(["branch", "--set-upstream-to=origin/main", "main"], cwd=repo_dir, timeout=20)
 
 
