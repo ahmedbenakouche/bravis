@@ -3720,6 +3720,101 @@ def ensure_project_info_branch(full_name: str) -> None:
     _ensure_people_rights_branch(owner, repo)
 
 
+def _resolve_local_project_info_ref(repo_dir: str) -> str:
+    """Best local ref for project-info (no network). Empty if never fetched/cloned."""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return ""
+    for candidate in (
+        "refs/remotes/origin/%s" % _PROJECT_INFO_BRANCH,
+        "refs/heads/%s" % _PROJECT_INFO_BRANCH,
+        "origin/%s" % _PROJECT_INFO_BRANCH,
+        _PROJECT_INFO_BRANCH,
+    ):
+        if _git_rev_parse(repo_dir, candidate):
+            return candidate
+    return ""
+
+
+def _git_show_json(repo_dir: str, ref: str, path: str) -> dict[str, Any]:
+    """Read a JSON file from a local git ref (``git show ref:path``). No network."""
+    if not repo_dir or not ref or not path:
+        return {}
+    result = _run_git(["show", "%s:%s" % (ref, path)], cwd=repo_dir, timeout=30)
+    if result.returncode != 0:
+        return {}
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return {}
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def _people_from_local_document(full_name: str, document: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Owner + colleagues from a local people.json document (no collaborators API)."""
+    owner, _repo = _split_project_name(full_name)
+    people: list[dict[str, str]] = [{"login": owner, "role": "owner"}]
+    seen = {owner.lower()}
+    colleagues = document.get("colleagues") if isinstance(document, dict) else None
+    if not isinstance(colleagues, dict):
+        return people
+    rows = []
+    for login, value in colleagues.items():
+        name = normalize_github_username(str(login))
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        record = _normalize_people_record(name, value)
+        person = {"login": name, "role": "colleague"}
+        person.update(_person_access_fields({name.lower(): record}, name))
+        rows.append(person)
+    rows.sort(key=lambda item: item["login"].lower())
+    people.extend(rows)
+    return people
+
+
+def read_local_project_info(repo_dir: str, full_name: str, login: str | None = None) -> dict[str, Any]:
+    """One-shot offline snapshot of project-info from the local clone (no API, no fetch).
+
+    Reads ``messages.json`` + ``people.json`` from a local ``project-info`` ref if present.
+    Missing ref → empty messages/tasks/activity and owner-only people list.
+    """
+    owner, _repo = _split_project_name(full_name)
+    me = normalize_github_username(login or "") or str(login or "").strip()
+    ref = _resolve_local_project_info_ref(repo_dir)
+    messages_doc = _git_show_json(repo_dir, ref, _MESSAGES_PATH) if ref else {}
+    people_doc = _git_show_json(repo_dir, ref, _PEOPLE_RIGHTS_PATH) if ref else {}
+    people = _people_from_local_document(full_name, people_doc)
+    access_map: dict[str, str] = {}
+    colleagues = people_doc.get("colleagues") if isinstance(people_doc, dict) else None
+    if isinstance(colleagues, dict):
+        for login_key, value in colleagues.items():
+            name = normalize_github_username(str(login_key))
+            if not name:
+                continue
+            access_map[name.lower()] = normalize_people_access(
+                _normalize_people_record(name, value).get("access")
+            )
+    if me and me.lower() == owner.lower():
+        my_access = PEOPLE_ACCESS_SENIOR
+    elif me:
+        my_access = access_map.get(me.lower()) or PEOPLE_ACCESS_JUNIOR
+    else:
+        my_access = PEOPLE_ACCESS_JUNIOR
+    return {
+        "ref": ref,
+        "messages": _normalize_stored_messages(messages_doc),
+        "tasks": _normalize_stored_tasks(messages_doc),
+        "activity": _normalize_stored_activity(messages_doc),
+        "reads": _normalize_stored_reads(messages_doc),
+        "presence": _normalize_stored_presence(messages_doc),
+        "people": people,
+        "my_access": my_access,
+    }
+
+
 def _write_people_records_map(full_name: str, records: dict[str, dict[str, str]]) -> None:
     owner, repo = _split_project_name(full_name)
     colleagues = {}
