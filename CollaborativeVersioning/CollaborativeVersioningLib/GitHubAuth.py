@@ -1921,19 +1921,6 @@ def _unpushed_commit_shas(repo_dir: str) -> set[str]:
     }
 
 
-def inspect_local_project(full_name: str) -> dict[str, Any]:
-    """Look at the local copy without changing it."""
-    dest = local_project_dir(full_name)
-    git_dir = os.path.join(dest, ".git")
-    if not os.path.isdir(git_dir):
-        return {"path": dest, "exists": False, "unshared_count": 0}
-    return {
-        "path": dest,
-        "exists": True,
-        "unshared_count": len(_unpushed_commit_shas(dest)),
-    }
-
-
 def fetch_remote_updates(repo_dir: str) -> None:
     """Fetch remote refs into .git only. Does not change HEAD or the worktree."""
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
