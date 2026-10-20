@@ -100,6 +100,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     derive_remote_sync_caps_from_history,
     save_remote_sync_caps,
     people_access_for,
+    remote_people_access_or_none,
     read_project_history,
     read_compare_project_histories,
     remove_project_colleague,
@@ -9708,8 +9709,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
             if self._connected and not local_only:
                 try:
-                    # Optional fresher role from GitHub; keep snapshot if offline.
-                    self._rememberPeopleAccess(full_name)
+                    # Fresher role from GitHub only when people.json is readable.
+                    # Missing/deleted remote → None → keep local snapshot (avoid fake Junior).
+                    remote_access = remote_people_access_or_none(
+                        full_name, self._githubLogin()
+                    )
+                    if remote_access is not None:
+                        self._rememberPeopleAccess(full_name, remote_access)
                 except (GitHubAuthError, OSError, RuntimeError, ValueError):
                     pass
         finally:

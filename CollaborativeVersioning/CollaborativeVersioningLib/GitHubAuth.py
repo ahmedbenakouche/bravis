@@ -1313,6 +1313,41 @@ def people_access_for(full_name: str, login: str | None = None) -> str:
     return _people_access_map(full_name).get(name.lower()) or PEOPLE_ACCESS_JUNIOR
 
 
+def remote_people_access_or_none(full_name: str, login: str | None = None) -> str | None:
+    """Read Senior/Junior from GitHub people.json, or None if the remote file is unreadable.
+
+    None = network/404/deleted project/missing project-info — callers should keep a
+    local snapshot role instead of treating that as Junior.
+    A successful read with no entry for this login still returns Junior (explicit default).
+    """
+    owner, repo = _split_project_name(full_name)
+    name = normalize_github_username(login or current_login() or "")
+    if not name:
+        return None
+    payload = _github_contents_payload(owner, repo, _PEOPLE_RIGHTS_PATH, _PROJECT_INFO_BRANCH)
+    if payload is None:
+        return None
+    if name.lower() == owner.lower():
+        return PEOPLE_ACCESS_SENIOR
+    try:
+        document = json.loads(_decode_github_file_content(payload) or "{}")
+    except json.JSONDecodeError:
+        return PEOPLE_ACCESS_JUNIOR
+    colleagues = document.get("colleagues") if isinstance(document, dict) else None
+    if not isinstance(colleagues, dict):
+        return PEOPLE_ACCESS_JUNIOR
+    record = colleagues.get(name) or colleagues.get(name.lower())
+    if record is None:
+        # Case-insensitive lookup
+        for key, value in colleagues.items():
+            if normalize_github_username(str(key)).lower() == name.lower():
+                record = value
+                break
+    if record is None:
+        return PEOPLE_ACCESS_JUNIOR
+    return normalize_people_access(_normalize_people_record(name, record).get("access"))
+
+
 def normalize_branch_slug(name: str) -> str:
     """Safe lane / git-ref slug for a named work branch (not tied to a login)."""
     text = " ".join(str(name or "").strip().split())
