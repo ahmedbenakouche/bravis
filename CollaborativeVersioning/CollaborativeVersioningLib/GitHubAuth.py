@@ -32,15 +32,24 @@ def _pump_wait() -> None:
 
 
 def default_workspace_dir() -> str:
-    """Fixed clone location — clinicians are not asked to pick a folder."""
+    """Fixed clone root — clinicians are not asked to pick a folder.
+
+    Per-user clones live under ``{workspace}/{github_login}/{owner}/{repo}``.
+    """
     return os.path.join(os.path.expanduser("~"), "Documents", WORKSPACE_FOLDER_NAME)
 
 
-def local_project_dir(full_name: str) -> str:
+def local_project_dir(full_name: str, login: str | None = None) -> str:
+    """Local clone path for the signed-in GitHub user (isolated per account on a shared PC)."""
     owner, _, repo = full_name.partition("/")
     if not owner or not repo:
         raise GitHubAuthError("Invalid project name: %s" % full_name)
-    return os.path.join(default_workspace_dir(), owner, repo)
+    user = str(login or current_login() or "").strip()
+    if not user:
+        raise GitHubNotSignedInError(not_signed_in_message())
+    # GitHub logins are path-safe; keep a thin guard for odd values.
+    safe_user = re.sub(r"[^A-Za-z0-9._-]+", "-", user).strip(".-") or "user"
+    return os.path.join(default_workspace_dir(), safe_user, owner, repo)
 
 
 def sanitize_repo_name(name: str) -> str:
@@ -582,9 +591,9 @@ def create_private_repository(name: str, description: str = "") -> dict[str, Any
         raise GitHubNotSignedInError(not_signed_in_message())
     slug = sanitize_repo_name(name)
     full_name = "%s/%s" % (login, slug)
-    parent_dir = os.path.join(default_workspace_dir(), login)
+    dest = local_project_dir(full_name, login)
+    parent_dir = os.path.dirname(dest)
     os.makedirs(parent_dir, exist_ok=True)
-    dest = local_project_dir(full_name)
     if github_project_exists(full_name):
         raise GitHubAuthError("A project named %s already exists." % full_name)
     if os.path.exists(dest):
@@ -1232,7 +1241,7 @@ def submit_review_line(full_name: str, branch_name: str | None = None) -> str:
         raise GitHubNotSignedInError(not_signed_in_message())
     slug = normalize_branch_slug(branch_name) if branch_name else ""
     if not slug:
-        dest = local_project_dir(full_name)
+        dest = local_project_dir(full_name, login)
         slug = current_review_branch_slug(dest)
     if not slug:
         raise GitHubAuthError("Share a branch first.")
@@ -1771,7 +1780,7 @@ def open_or_update_local_project(full_name: str, mode: str = "update") -> str:
     login = current_login()
     if not login:
         raise GitHubNotSignedInError(not_signed_in_message())
-    dest = local_project_dir(full_name)
+    dest = local_project_dir(full_name, login)
     parent = os.path.dirname(dest)
     os.makedirs(parent, exist_ok=True)
     git_dir = os.path.join(dest, ".git")
@@ -3305,7 +3314,7 @@ def delete_owned_repository(full_name: str) -> None:
                 "GitHub needs an extra permission to delete a project."
             )
         raise_github_cli_error(detail, "Could not delete the project.")
-    remove_local_project_dir(local_project_dir(full_name))
+    remove_local_project_dir(local_project_dir(full_name, login))
 
 
 def _split_project_name(full_name: str) -> tuple[str, str]:
