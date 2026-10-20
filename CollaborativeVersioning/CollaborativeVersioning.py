@@ -3530,6 +3530,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 return repo
         return None
 
+    def _isCurrentProjectLocalOnly(self) -> bool:
+        """True for Connected list entries marked (not shared) — local clone, not on GitHub."""
+        repo = self._currentRemoteRepo()
+        return bool(repo and (repo or {}).get("local_only"))
+
+    def _projectUsesLocalInfoOnly(self) -> bool:
+        """No remote project-info poll: offline local mode, or Connected (not shared) project."""
+        if getattr(self, "_local_mode", False) and not self._connected:
+            return True
+        return self._isCurrentProjectLocalOnly()
+
     def _hasWorkspaceSession(self) -> bool:
         """Online Connected or offline local mode (identity known)."""
         return bool(self._connected or getattr(self, "_local_mode", False))
@@ -3714,7 +3725,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateTaskButtonUi()
 
     def _setMessagesComposerEnabled(self, enabled: bool) -> None:
-        can_write = bool(enabled and self._connected and self._projectDataIsLoaded())
+        can_write = bool(
+            enabled
+            and self._connected
+            and self._projectDataIsLoaded()
+            and not self._projectUsesLocalInfoOnly()
+        )
         for name in ("messagesInput", "messagesSend"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -4044,6 +4060,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return False
         if not self._projectDataIsLoaded():
             return False
+        if self._isCurrentProjectLocalOnly():
+            return False
         if self._isCurrentVersionWriteLocked():
             return False
         if not self._unshared_version:
@@ -4060,6 +4078,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "Create or open a project first."
         if not self._projectDataIsLoaded():
             return "Open the project first."
+        if self._isCurrentProjectLocalOnly():
+            return "This project is not on GitHub (not shared)."
         if self._isCurrentVersionWriteLocked():
             return self._writeLockBlockedReason("Share")
         repo = self._currentRemoteRepo()
@@ -4185,8 +4205,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if access is None:
             if self._isCurrentProjectOwner() or self._repoOwnerMatchesLogin():
                 access = PEOPLE_ACCESS_SENIOR
-            elif getattr(self, "_local_mode", False) and not self._connected:
-                # Offline: never hit the API; default junior until snapshot sets access.
+            elif self._projectUsesLocalInfoOnly():
+                # Offline / (not shared): never hit the API; default junior until snapshot.
                 access = PEOPLE_ACCESS_JUNIOR
             else:
                 access = people_access_for(name, self._githubLogin())
@@ -4778,6 +4798,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _promptOfflineLocalMode(self, login: str) -> str:
         """Cannot reach GitHub after Continue — Try again / Local mode / Cancel."""
         box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setIcon(qt.QMessageBox.Warning)
         box.setWindowTitle("Cannot reach GitHub")
         box.setText(offline_message())
         if login:
@@ -4985,12 +5006,54 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         # allow_signin=False avoids looping back into this dialog.
         return self._connectOnlineWithOfflineFallback(login_hint, allow_signin=False)
 
+    def _replaceSessionReposMerged(
+        self, remote_repos: list | None, login: str | None = None
+    ) -> list:
+        """Set session repos = remote ∪ local clones (not shared). Never drop known local-only."""
+        user = str(
+            login
+            or (getattr(self, "_github_session", None) or {}).get("login")
+            or self._githubLogin()
+            or ""
+        ).strip()
+        merged = merge_remote_and_local_repos(user, remote_repos or [])
+        seen = {
+            str((repo or {}).get("full_name") or "").strip().lower()
+            for repo in merged
+            if str((repo or {}).get("full_name") or "").strip()
+        }
+        # Keep prior (not shared) entries still on disk if the folder scan missed them.
+        for old in (getattr(self, "_github_session", None) or {}).get("repos") or []:
+            if not (old or {}).get("local_only"):
+                continue
+            full_name = str((old or {}).get("full_name") or "").strip()
+            key = full_name.lower()
+            if not full_name or key in seen:
+                continue
+            try:
+                dest = local_project_dir(full_name, user or None)
+                still_there = os.path.isdir(os.path.join(dest, ".git"))
+            except (GitHubAuthError, OSError, TypeError, ValueError):
+                still_there = False
+            if not still_there:
+                continue
+            entry = dict(old)
+            entry["local_only"] = True
+            merged.append(entry)
+            seen.add(key)
+        merged.sort(key=lambda item: str((item or {}).get("full_name") or "").lower())
+        previous = getattr(self, "_github_session", None) or {}
+        self._github_session = {
+            "login": user or previous.get("login") or "unknown",
+            "repos": merged,
+        }
+        return merged
+
     def _applyGitHubSession(self, session: dict) -> None:
         self._closeProgress()
         login = session.get("login") or "unknown"
         # Merge GitHub-accessible repos with local clones; local-only → (not shared).
-        merged = merge_remote_and_local_repos(login, session.get("repos") or [])
-        self._github_session = {"login": login, "repos": merged}
+        merged = self._replaceSessionReposMerged(session.get("repos") or [], login)
         self._connected = True
         self._local_mode = False
         repo_count = len(merged)
@@ -5135,17 +5198,30 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         login = self._githubLogin()
         try:
-            self._github_session["repos"] = list_accessible_repos(login)
+            remote_repos = list_accessible_repos(login)
         except GitHubAuthError:
-            repos = list(self._github_session.get("repos") or [])
-            if not any(item.get("full_name") == created["full_name"] for item in repos):
-                repos.append(created)
-            self._github_session["repos"] = repos
+            remote_repos = [
+                item
+                for item in ((self._github_session or {}).get("repos") or [])
+                if not (item or {}).get("local_only")
+            ]
+            if not any(item.get("full_name") == created["full_name"] for item in remote_repos):
+                remote_repos.append(created)
+        # Keep (not shared) locals — same merge as Connect / Accept invite.
+        self._replaceSessionReposMerged(remote_repos, login)
         full_name = created["full_name"]
         local_path = created.get("local_path") or ""
         self.projectCombo.blockSignals(True)
         self._populateProjectCombo()
-        restore = self.projectCombo.findText(full_name)
+        restore = -1
+        for index in range(_qt_combo_count(self.projectCombo)):
+            try:
+                data = self.projectCombo.itemData(index)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                data = None
+            if str(data or "").strip() == full_name:
+                restore = index
+                break
         if restore >= 0:
             self.projectCombo.setCurrentIndex(restore)
         self._loaded_project_name = full_name
@@ -5515,8 +5591,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         full_name = self._currentProjectName()
         self.peopleButton.setEnabled(False)
-        # Local mode: show colleagues from the Open snapshot (no API). Add stays off.
-        if getattr(self, "_local_mode", False) and not self._connected:
+        # Local mode / (not shared): colleagues from Open snapshot (no API). Add stays off.
+        if self._projectUsesLocalInfoOnly():
             people = list(getattr(self, "_local_project_people", None) or [])
             if not people and full_name and "/" in full_name:
                 owner = full_name.split("/", 1)[0].strip()
@@ -5553,14 +5629,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._pending_people_action = None
             dialog = None
             try:
-                local_view = bool(
-                    getattr(self, "_local_mode", False) and not self._connected
-                )
+                local_view = self._projectUsesLocalInfoOnly()
                 dialog = PeopleDialog(
                     slicer.util.mainWindow(),
                     current,
                     can_add=can_add,
-                    # Local mode: no live presence — list people without online stamps.
+                    # Snapshot-only projects: no live presence stamps.
                     presence=(
                         {}
                         if local_view
@@ -5573,10 +5647,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     and not can_add
                     and getattr(dialog, "colleagueHint", None) is not None
                 ):
-                    dialog.colleagueHint.setText(
-                        "Local mode — viewing colleagues from this computer. "
-                        "Add or remove requires Connect with GitHub."
-                    )
+                    if self._isCurrentProjectLocalOnly():
+                        dialog.colleagueHint.setText(
+                            "This project is not on GitHub (not shared) — "
+                            "viewing colleagues from this computer. "
+                            "Add or remove is unavailable."
+                        )
+                    else:
+                        dialog.colleagueHint.setText(
+                            "Local mode — viewing colleagues from this computer. "
+                            "Add or remove requires Connect with GitHub."
+                        )
                 if can_add:
                     dialog.set_add_handler(
                         lambda dlg, name=full_name: self._queueAddColleague(name, dlg)
@@ -5754,13 +5835,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             accept_project_invitation(invitation.get("id"))
             self._updateProgress("Refreshing project list…")
             session = connect_session()
-            self._github_session = session
+            login = str(session.get("login") or self._githubLogin() or "").strip()
+            # Same merge as Connect (+ keep prior not-shared still on disk).
+            self._replaceSessionReposMerged(session.get("repos") or [], login)
+            # Rebuild list; keep the currently selected project (do not auto-switch).
             self._populateProjectCombo()
-            restore = self.projectCombo.findText(full_name)
-            if restore >= 0:
-                self.projectCombo.blockSignals(True)
-                self.projectCombo.setCurrentIndex(restore)
-                self.projectCombo.blockSignals(False)
             self._refreshUiState()
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
@@ -5973,6 +6052,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _syncNotificationActivityFromProject(self, announce: bool = False) -> None:
         """Fill the bell with activity for the selected project (from Messages poll)."""
+        # Local mode / (not shared): no project activity in the bell.
+        if self._projectUsesLocalInfoOnly():
+            self._notification_activity = []
+            self._rebuildNotificationsDisplay()
+            return
         project = self._currentProjectName() if self._hasSelectedProject() else ""
         me = (self._githubLogin() or "").lower()
         items = []
@@ -6315,7 +6399,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         bell = getattr(self, "notificationsBell", None)
         count = self._unreadNotificationCount()
         behind = bool(
-            self._projectDataIsLoaded() and self._projectVersionsBehind()
+            self._projectDataIsLoaded()
+            and not self._projectUsesLocalInfoOnly()
+            and self._projectVersionsBehind()
         )
         if badge is not None:
             if count <= 0:
@@ -6397,11 +6483,28 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         """Only after Open: Messages / project activity / versions sync are for the loaded copy."""
         if not self._connected or not self._projectDataIsLoaded():
             return ""
+        # (not shared) local-only projects: no Connected project-info poll.
+        if self._projectUsesLocalInfoOnly():
+            return ""
         return self._currentProjectName()
 
     def _syncMessagesPolling(self) -> None:
         name = self._messagesProjectActive()
-        changed = name != getattr(self, "_messages_project", "")
+        seeded = str(getattr(self, "_messages_project", "") or "").strip()
+        loaded = (
+            self._projectDataIsLoaded()
+            and seeded
+            and seeded == self._currentProjectName()
+        )
+        # Local mode / (not shared): keep Open snapshot in memory; no poll.
+        if not name and loaded and self._projectUsesLocalInfoOnly():
+            self._stopMessagesPolling()
+            self._setMessagesComposerEnabled(False)
+            self._renderMessagesView()
+            self._updateMessagesBadge()
+            self._updateTaskButtonUi()
+            return
+        changed = name != seeded
         if changed:
             self._resetMessagesState(name)
         self._setMessagesComposerEnabled(bool(name))
@@ -6478,6 +6581,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 return
         if not self._connected or not self._hasSelectedProject():
+            return
+        if self._projectUsesLocalInfoOnly():
             return
         progress = getattr(self, "_progressDialog", None)
         if progress is not None and _qt_widget_is_valid(progress):
@@ -6698,8 +6803,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             label.setText("")
             label.setVisible(False)
             return
-        # Local mode: no live presence poll — hide the online banner.
-        if not self._connected:
+        # Local mode / (not shared): no live presence poll — hide the online banner.
+        if not self._connected or self._projectUsesLocalInfoOnly():
             label.setText("")
             label.setVisible(False)
             return
@@ -6714,6 +6819,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _maybeTouchPresence(self, force: bool = False) -> None:
         """Publish my last-seen stamp (throttled) while this project is open."""
         if not self._connected or not self._projectDataIsLoaded():
+            return
+        if self._projectUsesLocalInfoOnly():
             return
         project = self._currentProjectName()
         me = (self._githubLogin() or "").strip()
@@ -7451,6 +7558,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         """Assign needs a live GitHub session (writes project-info remotely)."""
         if not self._connected or not self._hasSelectedProject():
             return False
+        if self._projectUsesLocalInfoOnly():
+            return False
         return self._hasSeniorProjectAccess()
 
     def _tasksAfterMessageOp(self, message, tasks):
@@ -7585,7 +7694,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         button = getattr(self, "messagesTaskButton", None)
         if button is not None:
             button.setEnabled(False)
-        if getattr(self, "_local_mode", False) and not self._connected:
+        if self._projectUsesLocalInfoOnly():
             # Browse tasks from the local Open snapshot; Assign stays hidden.
             people = list(getattr(self, "_local_project_people", None) or [])
         elif can_assign:
@@ -7946,10 +8055,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             and (getattr(self, "_local_project_path", None) or "")
             and getattr(self, "_server_pulled", False)
         )
-        behind = bool(project_open and self._projectVersionsBehind())
-        if project_open and behind:
+        # (not shared) / offline snapshot: no "aligned with shared" — there is no remote.
+        sync_eligible = bool(project_open and not self._projectUsesLocalInfoOnly())
+        behind = bool(sync_eligible and self._projectVersionsBehind())
+        if sync_eligible and behind:
             sync_status = "⚠  Local project is not aligned with the remote copy."
-        elif project_open:
+        elif sync_eligible:
             sync_status = "✅  Local project is aligned with the shared project."
         else:
             sync_status = ""
@@ -7958,9 +8069,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             items=items,
             empty_text=self._notificationsEmptyText(),
             unread_keys=self._unreadNotificationKeys(),
-            lagging_keys=self._laggingVersionNotificationKeys() if project_open else set(),
+            lagging_keys=self._laggingVersionNotificationKeys() if sync_eligible else set(),
             sync_status_text=sync_status,
-            show_sync_button=bool(project_open and behind),
+            show_sync_button=bool(sync_eligible and behind),
         )
         self._notifications_popup_open = True
         try:
@@ -7986,6 +8097,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         """Fetch for compare only — does not refresh the Version tree until Validate."""
         if not self._hasSelectedProject():
             self._appendFeed("Select a project first.", error=True)
+            return
+        if self._projectUsesLocalInfoOnly():
+            self._appendFeed(
+                "This project is not on GitHub (not shared) — "
+                "Compare with shared is unavailable.",
+                error=True,
+            )
             return
         local_path = getattr(self, "_local_project_path", None) or ""
         if not local_path or not getattr(self, "_server_pulled", False):
@@ -9453,13 +9571,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if badge is not None:
                 badge.hide()
             return
-        if getattr(self, "_local_mode", False) and not self._connected:
-            if self._hasSeniorProjectAccess():
-                button.setToolTip(
-                    "Tasks (local mode) — Assign needs Connect with GitHub."
+        if self._projectUsesLocalInfoOnly():
+            if self._isCurrentProjectLocalOnly():
+                tip = (
+                    "Tasks (not shared) — Assign unavailable for this project."
+                    if self._hasSeniorProjectAccess()
+                    else "Tasks (not shared) — view only."
                 )
+            elif self._hasSeniorProjectAccess():
+                tip = "Tasks (local mode) — Assign needs Connect with GitHub."
             else:
-                button.setToolTip("Tasks (local mode) — view only.")
+                tip = "Tasks (local mode) — view only."
+            button.setToolTip(tip)
             mine = self._activeTasksAsJunior()
             if badge is not None:
                 if mine:
@@ -9520,16 +9643,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 local_exists = os.path.isdir(os.path.join(dest, ".git"))
             except (GitHubAuthError, OSError, TypeError, ValueError):
                 local_exists = False
-            if getattr(self, "_local_mode", False) and not local_exists:
+            local_only = False
+            for repo in (getattr(self, "_github_session", None) or {}).get("repos") or []:
+                if (repo or {}).get("full_name") == full_name:
+                    local_only = bool((repo or {}).get("local_only"))
+                    break
+            if (getattr(self, "_local_mode", False) or local_only) and not local_exists:
                 self._closeProgress()
                 self._updateVersionActionButtons()
                 self._appendFeed(
                     "This project is not on this computer. "
-                    "Connect with GitHub first to download it.",
+                    "Connect with GitHub first to download it."
+                    if not local_only
+                    else "This project is marked not shared but the local folder is missing.",
                     error=True,
                 )
                 return
-            choice = "local" if local_exists else "update"
+            # (not shared) / offline local: open disk copy only — never clone/fetch.
+            choice = "local" if (local_exists or local_only) else "update"
+            if local_only:
+                choice = "local"
             progress_label = (
                 "Opening this computer's work…"
                 if choice == "local"
@@ -9564,10 +9697,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._clearChangeFlags()
             self._unshared_version = unshared
             self._syncAssetDataObservers()
-            if getattr(self, "_local_mode", False) and not self._connected:
-                self._applyLocalProjectInfoSnapshot(local_path, full_name)
-            else:
+            # Always seed from local project-info first (same path as local mode /
+            # not shared). Connected poll may refresh afterward if the network works.
+            self._applyLocalProjectInfoSnapshot(
+                local_path,
+                full_name,
+                disable_notifications=(
+                    getattr(self, "_local_mode", False) and not self._connected
+                ),
+            )
+            if self._connected and not local_only:
                 try:
+                    # Optional fresher role from GitHub; keep snapshot if offline.
                     self._rememberPeopleAccess(full_name)
                 except (GitHubAuthError, OSError, RuntimeError, ValueError):
                     pass
@@ -9575,8 +9716,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._suppress_asset_ui_updates -= 1
             self._suppress_dirty -= 1
         self._closeProgress()
-        # Online Open: first Messages poll may show behind — hint once in the feed.
-        if self._connected:
+        # Online Open of a real GitHub project: first Messages poll may show behind.
+        if self._connected and not local_only:
             self._pending_versions_behind_hint = True
         self._refreshUiState()
         self._clearChangeFlags()
@@ -9584,7 +9725,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateVersionActionButtons()
         self._armLoadSettle()
         # First clone fetched shared refs — mark versions sync current.
-        if choice != "local" and full_name and self._connected:
+        if choice != "local" and full_name and self._connected and not local_only:
             self._persistReadCursor(
                 full_name,
                 versions_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -9605,8 +9746,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if count:
             self._appendFeed("%d version(s) in history." % count)
 
-    def _applyLocalProjectInfoSnapshot(self, local_path: str, full_name: str) -> None:
-        """One-shot read of local project-info (messages, tasks, people, activity). No API."""
+    def _applyLocalProjectInfoSnapshot(
+        self,
+        local_path: str,
+        full_name: str,
+        *,
+        disable_notifications: bool = True,
+    ) -> None:
+        """One-shot read of local project-info (messages, tasks, people). No API.
+
+        Used for every Open. Sets ``_messages_project`` so a following Connected
+        poll sync does not wipe this seed when the network fails.
+        """
         login = str((self._github_session or {}).get("login") or self._githubLogin() or "").strip()
         try:
             info = read_local_project_info(local_path or "", full_name, login)
@@ -9627,6 +9778,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._rememberPeopleAccess(full_name, access)
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             pass
+        # Mark active before apply so _syncMessagesPolling won't reset this seed.
+        self._messages_project = str(full_name or "").strip()
         self._applyProjectMessages(
             list(info.get("messages") or []),
             tasks=list(info.get("tasks") or []),
@@ -9636,11 +9789,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             refresh_ui=True,
             announce_activity=False,
         )
-        # Local mode: notifications stay disabled (no bell / no invites).
-        self._notification_invites = []
-        self._notification_activity = []
-        self._clearNotificationsDisplay()
-        self._setNotificationsEnabled(False)
+        if disable_notifications:
+            # Full offline local mode: bell off.
+            self._notification_invites = []
+            self._notification_activity = []
+            self._clearNotificationsDisplay()
+            self._setNotificationsEnabled(False)
+        elif self._projectUsesLocalInfoOnly():
+            # Connected (not shared): keep invite notifs; no project activity in bell.
+            self._notification_activity = []
+            self._rebuildNotificationsDisplay()
         if info.get("ref"):
             self._appendFeed(
                 "Loaded project info from this computer "
