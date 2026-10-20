@@ -68,6 +68,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     forget_people_access,
     has_delete_repo_scope,
     inspect_local_project,
+    local_project_dir,
     invite_project_colleague,
     list_accessible_repos,
     incoming_invitations_fetch_args,
@@ -2463,6 +2464,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._connected = False
         self._loaded_project_name = None
         self._local_project_path = None
+        # MRML node IDs loaded for the open CV project (scene only — not project files).
+        self._project_scene_node_ids = []
         self._ontology_server_combo_index = -1
         self._project_ontology_path = None
         self._project_ontology_document = None
@@ -3083,6 +3086,108 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._setOntologyComboNone()
         finally:
             self._blockProjectAssetSignals(False)
+
+    def _rememberProjectSceneNodes(self, volume_node=None, segmentation_node=None) -> None:
+        """Track which scene nodes belong to the open CV project (for later unload).
+
+        Order is segmentation then volume so unload can drop the seg first.
+        """
+        ids = []
+        seen = set()
+        for node in (segmentation_node, volume_node):
+            if node is None or not hasattr(node, "GetID"):
+                continue
+            try:
+                node_id = str(node.GetID() or "").strip()
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+            if not node_id or node_id in seen:
+                continue
+            seen.add(node_id)
+            ids.append(node_id)
+        self._project_scene_node_ids = ids
+
+    def _projectSceneNodesToUnload(self) -> list:
+        """MRML nodes from the open project only — never unrelated Slicer data.
+
+        Segmentation is listed before volume.
+        """
+        scene = slicer.mrmlScene
+        nodes = []
+        seen = set()
+
+        def _append(node) -> None:
+            if node is None:
+                return
+            try:
+                current_id = str(node.GetID() or "")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                return
+            if current_id and current_id not in seen:
+                seen.add(current_id)
+                nodes.append(node)
+
+        for node_id in list(getattr(self, "_project_scene_node_ids", None) or []):
+            try:
+                node = scene.GetNodeByID(node_id) if node_id else None
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                node = None
+            _append(node)
+        # Fallback if IDs were not tracked (e.g. session started before this feature).
+        if not nodes and (
+            getattr(self, "_loaded_project_name", None)
+            or getattr(self, "_local_project_path", None)
+        ):
+            for selector_name in ("segmentationSelector", "volumeSelector"):
+                _append(self._selectorCurrentNode(selector_name))
+        # Prefer segmentation before volume even if stored order was wrong.
+        def _unload_rank(node) -> int:
+            try:
+                class_name = str(node.GetClassName() or "")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                class_name = ""
+            if "Segmentation" in class_name:
+                return 0
+            if "LabelMap" in class_name:
+                return 1
+            return 2
+
+        nodes.sort(key=_unload_rank)
+        return nodes
+
+    def _unloadProjectSceneNodes(self) -> int:
+        """Remove open-project data from the Slicer scene only (segmentation, then volume).
+
+        Local/remote project files on disk or GitHub are left untouched.
+        Returns how many nodes were removed.
+        """
+        nodes = self._projectSceneNodesToUnload()
+        self._suppress_dirty += 1
+        self._suppress_asset_ui_updates += 1
+        self._blockProjectAssetSignals(True)
+        removed = 0
+        try:
+            if _qt_widget_is_valid(getattr(self, "segmentationSelector", None)):
+                self.segmentationSelector.setCurrentNode(None)
+            if _qt_widget_is_valid(getattr(self, "volumeSelector", None)):
+                self.volumeSelector.setCurrentNode(None)
+            scene = slicer.mrmlScene
+            for node in nodes:
+                try:
+                    scene.RemoveNode(node)
+                    removed += 1
+                    slicer.app.processEvents()
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    logging.exception("Could not unload a project scene node")
+            self._project_scene_node_ids = []
+            self._clearOntologyDocument()
+            self._removeServerOntologyComboEntry()
+            self._setOntologyComboNone()
+        finally:
+            self._blockProjectAssetSignals(False)
+            self._suppress_asset_ui_updates -= 1
+            self._suppress_dirty -= 1
+        return removed
 
     def _setProjectAssetFieldsEnabled(self, enabled: bool) -> None:
         self.volumeSelector.setEnabled(enabled)
@@ -4673,6 +4778,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         login = (self._github_session or {}).get("login") or ""
         self._openProgress("GitHub", "Signing out of GitHub…")
         try:
+            # Scene only — project files stay on disk / GitHub.
+            self._updateProgress("Unloading data from 3D Slicer…")
+            self._unloadProjectSceneNodes()
             self._updateProgress("Signing out of GitHub…")
             logout_github_cli(login or None)
         except GitHubAuthError as error:
@@ -4689,6 +4797,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._populateProjectCombo()
         self._loaded_project_name = None
         self._local_project_path = None
+        self._project_scene_node_ids = []
         self._server_pulled = False
         self._people_access_cache = {}
         self._clearChangeFlags()
@@ -4793,6 +4902,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         try:
             # Match Open-project naming in the scene; original files outside the project stay untouched.
             self._alignProjectAssetNodeNames(volume_node, segmentation_node, config["name"])
+            self._rememberProjectSceneNodes(volume_node, segmentation_node)
             if ontology_path:
                 self._setOntologyComboLoadedFilename(filename=ontology_path)
             self._clearChangeFlags()
@@ -8288,6 +8398,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             delete_local_unshared_version(local_path, sha, lane)
             self._updateProgress("Reloading project files…")
             self._loadOpenedProjectAssets(local_path, volume_folder=local_path)
+            self._rememberProjectSceneNodes(
+                self._selectorCurrentNode("volumeSelector"),
+                self._selectorCurrentNode("segmentationSelector"),
+            )
             self._syncAssetDataObservers()
             self._clearDirtyAssets()
             self._updateProgress("Updating version history…")
@@ -8552,13 +8666,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed(reason, error=True)
             return
         full_name = self._currentProjectName()
-        confirmed = slicer.util.confirmYesNoDisplay(
-            "Delete project %s?\n\n"
-            "This cannot be undone. The GitHub repository and the local folder "
-            "will be removed." % full_name,
-            windowTitle="Delete project",
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Delete project")
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setText("Delete project %s?" % full_name)
+        box.setInformativeText(
+            "This cannot be undone.\n\n"
+            "The GitHub repository and the local folder will be removed.\n"
+            "Project data loaded in 3D Slicer will also be unloaded from the scene."
         )
-        if not confirmed:
+        box.setStandardButtons(qt.QMessageBox.Yes | qt.QMessageBox.No)
+        box.setDefaultButton(qt.QMessageBox.No)
+        if box.exec_() != qt.QMessageBox.Yes:
             return
         if has_delete_repo_scope() is False:
             if not self._authorizeDeletePermission():
@@ -8595,8 +8714,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             ]
         self._currentVersionId = None
         self._server_pulled = False
+        self._updateProgress("Unloading data from 3D Slicer…")
+        self._unloadProjectSceneNodes()
         self._loaded_project_name = None
         self._local_project_path = None
+        self._project_scene_node_ids = []
         self._clearChangeFlags()
         try:
             self.removeObservers(self._onAssetDataModified)
@@ -8605,7 +8727,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._closeProgress()
         self._populateProjectCombo()
         self._clearProjectSelection()
-        self._clearProjectAssetFields()
         self._refreshUiState()
         self._appendFeed("Project deleted: %s" % full_name)
 
@@ -9069,21 +9190,30 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed(reason, error=True)
             return
         full_name = self._currentProjectName()
-        # Already cloned → open local only (no silent fetch). Remote updates go via
-        # notifications → Compare with shared. First time → clone.
-        try:
-            local_exists = bool(inspect_local_project(full_name).get("exists"))
-        except GitHubAuthError:
-            local_exists = False
-        choice = "local" if local_exists else "update"
         self.openButton.setEnabled(False)
         self._appendFeed("Opening project %s…" % full_name)
-        if choice == "local":
-            progress_label = "Opening this computer's work…"
-        else:
-            progress_label = "Opening %s…" % full_name
-        self._openProgress("Open project", progress_label)
+        # Show progress immediately — path/login checks below must not delay the box.
+        self._openProgress("Open project", "Opening %s…" % full_name)
         try:
+            # Already cloned → open local only (no silent fetch). Remote updates go via
+            # notifications → Compare with shared. First time → clone.
+            # Use session login (no network) + cheap .git check (no unpushed scan).
+            login = str((self._github_session or {}).get("login") or "").strip()
+            try:
+                dest = local_project_dir(full_name, login or None)
+                local_exists = os.path.isdir(os.path.join(dest, ".git"))
+            except (GitHubAuthError, OSError, TypeError, ValueError):
+                local_exists = False
+            choice = "local" if local_exists else "update"
+            progress_label = (
+                "Opening this computer's work…"
+                if choice == "local"
+                else "Opening %s…" % full_name
+            )
+            self._updateProgress(progress_label)
+            # Drop previous project's scene nodes only (files stay on disk / GitHub).
+            self._updateProgress("Unloading previous data from 3D Slicer…")
+            self._unloadProjectSceneNodes()
             self._updateProgress(progress_label)
             local_path = open_or_update_local_project(full_name, mode=choice)
             loaded = self._loadOpenedProjectAssets(local_path)
@@ -9102,6 +9232,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._local_project_path = local_path
             self._server_pulled = True
             self._applyProjectHistoryBundle(history)
+            self._rememberProjectSceneNodes(
+                self._selectorCurrentNode("volumeSelector"),
+                self._selectorCurrentNode("segmentationSelector"),
+            )
             self._clearChangeFlags()
             self._unshared_version = unshared
             self._syncAssetDataObservers()
@@ -9371,6 +9505,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 # volume_folder=local_path keeps soft reload: reuse volume + inject seg, no temp copy.
                 # Ontology combo is set inside _loadOpenedProjectAssets — no second discover.
                 self._loadOpenedProjectAssets(local_path, volume_folder=local_path)
+                self._rememberProjectSceneNodes(
+                    self._selectorCurrentNode("volumeSelector"),
+                    self._selectorCurrentNode("segmentationSelector"),
+                )
                 self._syncAssetDataObservers()
                 self._clearDirtyAssets()
             except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
@@ -9380,6 +9518,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     self._selectHistoryRowForVersion(previous_id)
                 try:
                     self._loadOpenedProjectAssets(local_path)
+                    self._rememberProjectSceneNodes(
+                        self._selectorCurrentNode("volumeSelector"),
+                        self._selectorCurrentNode("segmentationSelector"),
+                    )
                     self._syncAssetDataObservers()
                     self._clearDirtyAssets()
                 except Exception:
