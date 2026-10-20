@@ -92,6 +92,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     open_login_window,
     open_or_update_local_project,
     fetch_remote_updates,
+    fetch_local_project_info,
     adopt_shared_lanes,
     integrate_shared_lanes,
     capture_remote_sync_caps,
@@ -188,7 +189,8 @@ from CollaborativeVersioningLib.UiStyles import (
 ONTOLOGY_COMBO_NONE_LABEL = "None"
 ONTOLOGY_COMBO_NONE_INDEX = 0
 PROJECT_NONE_LABEL = "None"
-PROJECT_NOT_SHARED_SUFFIX = " (not shared)"
+# Local clone with no matching GitHub repo (deleted or never published).
+PROJECT_NOT_ON_GITHUB_SUFFIX = " (not on GitHub)"
 _NOTIFICATIONS_POLL_MS = 15000
 _MESSAGES_POLL_MS = 1000
 _MESSAGE_MONTHS = (
@@ -1862,6 +1864,7 @@ class TaskDialog(qt.QDialog):
         tasks=None,
         me="",
         can_assign=False,
+        is_senior=False,
         draft=None,
     ) -> None:
         qt.QDialog.__init__(self, parent)
@@ -1876,6 +1879,8 @@ class TaskDialog(qt.QDialog):
         self._tasks = list(self._all_tasks)
         self._me = str(me or "").strip()
         self._can_assign = bool(can_assign)
+        # Owner/senior viewing without assign (e.g. local mode): empty hint differs.
+        self._is_senior = bool(is_senior) or bool(can_assign)
         self._assign_handler = None
         self._cancel_handler = None
         self._pick_start_handler = None
@@ -2283,6 +2288,8 @@ class TaskDialog(qt.QDialog):
     def _emptyTasksMessage(self) -> str:
         if self._can_assign:
             return "No task yet."
+        if self._is_senior:
+            return "No task yet. Assign needs Connect with GitHub."
         return "No task yet. Wait for a senior to assign one."
 
     def _fillTasks(self) -> None:
@@ -3560,7 +3567,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     continue
                 # Suffix only when online-connected and project exists only locally.
                 if self._connected and bool((repo or {}).get("local_only")):
-                    label = "%s%s" % (full_name, PROJECT_NOT_SHARED_SUFFIX)
+                    label = "%s%s" % (full_name, PROJECT_NOT_ON_GITHUB_SUFFIX)
                 else:
                     label = full_name
                 self.projectCombo.addItem(label)
@@ -3595,8 +3602,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         name = _qt_combo_text(combo)
         if name == PROJECT_NONE_LABEL:
             return ""
-        if name.endswith(PROJECT_NOT_SHARED_SUFFIX):
-            return name[: -len(PROJECT_NOT_SHARED_SUFFIX)].strip()
+        if name.endswith(PROJECT_NOT_ON_GITHUB_SUFFIX):
+            return name[: -len(PROJECT_NOT_ON_GITHUB_SUFFIX)].strip()
+        # Legacy label from older builds.
+        if name.endswith(" (not shared)"):
+            return name[: -len(" (not shared)")].strip()
         return name
 
     def _refreshUiState(self) -> None:
@@ -4078,7 +4088,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not self._projectDataIsLoaded():
             return "Open the project first."
         if self._isCurrentProjectLocalOnly():
-            return "This project is not on GitHub (not shared)."
+            return "This project is not on GitHub."
         if self._isCurrentVersionWriteLocked():
             return self._writeLockBlockedReason("Share")
         repo = self._currentRemoteRepo()
@@ -4227,14 +4237,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return access == PEOPLE_ACCESS_JUNIOR
 
     def _canOpenPeople(self) -> bool:
+        # Same gate as Share / Delete: live GitHub session (not local mode).
         return bool(
-            self._hasWorkspaceSession()
+            self._connected
             and self._hasSelectedProject()
             and self._projectDataIsLoaded()
         )
 
     def _peopleDisabledReason(self) -> str:
-        if not self._hasWorkspaceSession():
+        if not self._connected:
             return "Connect with GitHub first."
         if not self._hasSelectedProject():
             return "Select a project first."
@@ -5065,7 +5076,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if local_only:
             self._appendFeed(
                 "Connected as %s — %d project(s) "
-                "(%d only on this computer, marked not shared)."
+                "(%d only on this computer, not on GitHub)."
                 % (login, repo_count, local_only)
             )
         else:
@@ -5646,9 +5657,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     and not can_add
                     and getattr(dialog, "colleagueHint", None) is not None
                 ):
-                    if self._isCurrentProjectLocalOnly():
+                    # Prefer local-mode wording: enterLocalMode tags every repo
+                    # local_only, so "not on GitHub" must not win that case.
+                    if getattr(self, "_local_mode", False):
                         dialog.colleagueHint.setText(
-                            "This project is not on GitHub (not shared) — "
+                            "Local mode — viewing colleagues from this computer. "
+                            "Add or remove requires Connect with GitHub."
+                        )
+                    elif self._isCurrentProjectLocalOnly():
+                        dialog.colleagueHint.setText(
+                            "This project is not on GitHub — "
                             "viewing colleagues from this computer. "
                             "Add or remove is unavailable."
                         )
@@ -6082,6 +6100,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._notificationKey(item)
             for item in getattr(self, "_notification_activity", []) or []
         }
+        saw_new_assign = False
         if announce:
             for item in items:
                 key = self._notificationKey(item)
@@ -6092,8 +6111,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 text = str(item.get("text") or "").strip()
                 if text:
                     self._appendFeed(text)
+                if str(item.get("activity_kind") or "").strip().lower() == "assign":
+                    saw_new_assign = True
         self._notification_activity = items
         self._rebuildNotificationsDisplay()
+        # Rare offline cache: refresh origin/project-info when a new Assign lands.
+        if saw_new_assign:
+            self._scheduleLocalProjectInfoFetch()
         if getattr(self, "_pending_versions_behind_hint", False):
             self._pending_versions_behind_hint = False
             if self._projectVersionsBehind():
@@ -7497,7 +7521,34 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 getattr(self, "_messageSendReads", None),
                 presence,
             )
+        # Assigner side: same rare fetch so local mode Tasks stay current.
+        if str((message or {}).get("task_op") or "").strip() == "assign":
+            self._scheduleLocalProjectInfoFetch()
         self._startNextQueuedSend()
+
+    def _scheduleLocalProjectInfoFetch(self) -> None:
+        """Best-effort ``git fetch origin project-info`` (not on the 1s poll)."""
+        if not self._connected or getattr(self, "_local_mode", False):
+            return
+        if self._isCurrentProjectLocalOnly():
+            return
+        path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if not path or not os.path.isdir(os.path.join(path, ".git")):
+            return
+        if getattr(self, "_project_info_fetch_pending", False):
+            return
+        self._project_info_fetch_pending = True
+        qt.QTimer.singleShot(
+            0, lambda p=path: self._runLocalProjectInfoFetch(p)
+        )
+
+    def _runLocalProjectInfoFetch(self, repo_dir: str) -> None:
+        try:
+            fetch_local_project_info(repo_dir)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError, TypeError):
+            pass
+        finally:
+            self._project_info_fetch_pending = False
 
     def _failPendingMessage(self, message: dict, error_text: str) -> None:
         kind = str((message or {}).get("kind") or "")
@@ -7716,6 +7767,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 tasks=getattr(self, "_project_tasks", []) or [],
                 me=self._githubLogin(),
                 can_assign=can_assign,
+                is_senior=self._hasSeniorProjectAccess(),
                 draft=draft if can_assign else None,
             )
         except Exception as error:
@@ -8099,7 +8151,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         if self._projectUsesLocalInfoOnly():
             self._appendFeed(
-                "This project is not on GitHub (not shared) — "
+                "This project is not on GitHub — "
                 "Compare with shared is unavailable.",
                 error=True,
             )
@@ -9571,11 +9623,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 badge.hide()
             return
         if self._projectUsesLocalInfoOnly():
-            if self._isCurrentProjectLocalOnly():
+            # Same as People: local_mode overrides local_only tagging.
+            if getattr(self, "_local_mode", False):
                 tip = (
-                    "Tasks (not shared) — Assign unavailable for this project."
+                    "Tasks (local mode) — Assign needs Connect with GitHub."
                     if self._hasSeniorProjectAccess()
-                    else "Tasks (not shared) — view only."
+                    else "Tasks (local mode) — view only."
+                )
+            elif self._isCurrentProjectLocalOnly():
+                tip = (
+                    "Tasks (not on GitHub) — Assign unavailable for this project."
+                    if self._hasSeniorProjectAccess()
+                    else "Tasks (not on GitHub) — view only."
                 )
             elif self._hasSeniorProjectAccess():
                 tip = "Tasks (local mode) — Assign needs Connect with GitHub."
@@ -9654,7 +9713,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     "This project is not on this computer. "
                     "Connect with GitHub first to download it."
                     if not local_only
-                    else "This project is marked not shared but the local folder is missing.",
+                    else "This project is not on GitHub and the local folder is missing.",
                     error=True,
                 )
                 return

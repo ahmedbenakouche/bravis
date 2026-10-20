@@ -3742,6 +3742,28 @@ def ensure_project_info_branch(full_name: str) -> None:
     _ensure_people_rights_branch(owner, repo)
 
 
+def fetch_local_project_info(repo_dir: str) -> None:
+    """Fetch only ``origin/project-info`` into the local clone (no worktree checkout).
+
+    Used as a rare offline cache refresh after a task assign — not on the 1s poll.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    branch = _PROJECT_INFO_BRANCH
+    fetch = _run_git(
+        [
+            "fetch",
+            "origin",
+            "+refs/heads/%s:refs/remotes/origin/%s" % (branch, branch),
+        ],
+        cwd=repo_dir,
+        timeout=60,
+    )
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout or "").strip()
+        raise_github_cli_error(detail, "Could not refresh local project-info.")
+
+
 def _resolve_local_project_info_ref(repo_dir: str) -> str:
     """Best local ref for project-info (no network). Empty if never fetched/cloned."""
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
