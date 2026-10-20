@@ -74,7 +74,9 @@ from CollaborativeVersioningLib.GitHubAuth import (
     local_project_dir,
     invite_project_colleague,
     list_accessible_repos,
+    list_local_project_full_names,
     local_cli_login,
+    merge_remote_and_local_repos,
     incoming_invitations_fetch_args,
     parse_incoming_invitations_output,
     list_project_people,
@@ -186,6 +188,7 @@ from CollaborativeVersioningLib.UiStyles import (
 ONTOLOGY_COMBO_NONE_LABEL = "None"
 ONTOLOGY_COMBO_NONE_INDEX = 0
 PROJECT_NONE_LABEL = "None"
+PROJECT_NOT_SHARED_SUFFIX = " (not shared)"
 _NOTIFICATIONS_POLL_MS = 15000
 _MESSAGES_POLL_MS = 1000
 _MESSAGE_MONTHS = (
@@ -2466,6 +2469,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._ontology_document = None
         self._ontology_preset_ids = [preset_id for preset_id, _label in preset_choices()]
         self._connected = False
+        self._local_mode = False
         self._loaded_project_name = None
         self._local_project_path = None
         # MRML node IDs loaded for the open CV project (scene only — not project files).
@@ -2561,6 +2565,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._buildLeftPanel()
         self._buildRightDock()
         self._connected = False
+        self._local_mode = False
         self.connectionStatusLabel.text = "Not connected"
         self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
         self._applyDisconnectedUi()
@@ -3071,7 +3076,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             setattr(self, name, None)
 
     def _refreshProjectAssetUi(self) -> None:
-        if not self._connected or self._suppress_asset_ui_updates > 0:
+        if not self._hasWorkspaceSession() or self._suppress_asset_ui_updates > 0:
             return
         if not _qt_widget_is_valid(getattr(self, "openButton", None)):
             return
@@ -3517,25 +3522,35 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 return repo
         return None
 
+    def _hasWorkspaceSession(self) -> bool:
+        """Online Connected or offline local mode (identity known)."""
+        return bool(self._connected or getattr(self, "_local_mode", False))
+
     def _populateProjectCombo(self) -> None:
         blocked = self.projectCombo.signalsBlocked()
         self.projectCombo.blockSignals(True)
-        previous = _qt_combo_text(self.projectCombo)
+        previous = self._currentProjectName()
         self.projectCombo.clear()
         self.projectCombo.addItem(PROJECT_NONE_LABEL)
+        self.projectCombo.setItemData(0, "")
         session = getattr(self, "_github_session", None) or {}
-        remote_names = []
-        if self._connected:
+        restore_index = 0
+        if self._hasWorkspaceSession():
             for repo in session.get("repos") or []:
-                full_name = repo.get("full_name")
-                if full_name:
-                    self.projectCombo.addItem(full_name)
-                    remote_names.append(full_name)
-        if previous and previous != PROJECT_NONE_LABEL and previous in remote_names:
-            restore_index = self.projectCombo.findText(previous)
-            self.projectCombo.setCurrentIndex(restore_index)
-        else:
-            self.projectCombo.setCurrentIndex(0)
+                full_name = str((repo or {}).get("full_name") or "").strip()
+                if not full_name:
+                    continue
+                # Suffix only when online-connected and project exists only locally.
+                if self._connected and bool((repo or {}).get("local_only")):
+                    label = "%s%s" % (full_name, PROJECT_NOT_SHARED_SUFFIX)
+                else:
+                    label = full_name
+                self.projectCombo.addItem(label)
+                index = _qt_combo_count(self.projectCombo) - 1
+                self.projectCombo.setItemData(index, full_name)
+                if previous and full_name == previous:
+                    restore_index = index
+        self.projectCombo.setCurrentIndex(restore_index)
         self.projectCombo.blockSignals(blocked)
 
     def _hasSelectedProject(self) -> bool:
@@ -3543,21 +3558,58 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return bool(name) and name != PROJECT_NONE_LABEL
 
     def _currentProjectName(self) -> str:
-        name = _qt_combo_text(self.projectCombo)
+        combo = getattr(self, "projectCombo", None)
+        if not _qt_widget_is_valid(combo):
+            return ""
+        try:
+            index = int(combo.currentIndex())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            index = -1
+        if index >= 0:
+            try:
+                data = combo.itemData(index)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                data = None
+            if data is not None:
+                name = str(data).strip()
+                if name:
+                    return name
+        name = _qt_combo_text(combo)
         if name == PROJECT_NONE_LABEL:
             return ""
+        if name.endswith(PROJECT_NOT_SHARED_SUFFIX):
+            return name[: -len(PROJECT_NOT_SHARED_SUFFIX)].strip()
         return name
 
     def _refreshUiState(self) -> None:
-        if not self._connected:
-            self._applyDisconnectedUi()
+        if self._connected:
+            self._setNotificationsEnabled(True)
+            self._setRightDockLocked(False)
+            self._setActiveProjectSectionEnabled(True)
+            self._setMessagesSectionEnabled(True)
+            self._syncMessagesPolling()
+            self._updateCommitHistoryPanel()
+            self._updateVersionActionButtons()
             return
-        self._setNotificationsEnabled(True)
+        if getattr(self, "_local_mode", False):
+            self._applyLocalModeUi()
+            return
+        self._applyDisconnectedUi()
+
+    def _applyLocalModeUi(self) -> None:
+        """Unlock workspace UI without claiming a live GitHub online session."""
+        self._stopNotificationsPolling()
+        self._clearNotificationsDisplay()
+        self._setNotificationsEnabled(False)
+        self._stopMessagesPolling()
         self._setRightDockLocked(False)
         self._setActiveProjectSectionEnabled(True)
+        # Messages / Tasks need GitHub — keep section visible but offline-safe.
         self._setMessagesSectionEnabled(True)
-        self._syncMessagesPolling()
+        self._setMessagesComposerEnabled(False)
         self._updateCommitHistoryPanel()
+        self._updateVersionActionButtons()
+        self._updateRightDockAvailability()
 
     def _applyDisconnectedUi(self) -> None:
         self._stopNotificationsPolling()
@@ -3662,7 +3714,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateTaskButtonUi()
 
     def _canOpenDependencyGraph(self) -> bool:
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             return False
         if not self._ontology_document:
             return False
@@ -3671,14 +3723,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return True
 
     def _canOpenVersionTree(self) -> bool:
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             return False
         if not self._hasSelectedProject():
             return False
         return self._server_pulled
 
     def _updateRightDockAvailability(self) -> None:
-        if not self._connected or self._suppress_asset_ui_updates > 0:
+        if not self._hasWorkspaceSession() or self._suppress_asset_ui_updates > 0:
             return
         if not self._rightDockUiAlive():
             return
@@ -3760,7 +3812,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._onProjectAssetSelectorChanged("segmentation")
 
     def _onProjectAssetSelectorChanged(self, kind: str) -> None:
-        if not self._connected or self._suppress_asset_ui_updates > 0:
+        if not self._hasWorkspaceSession() or self._suppress_asset_ui_updates > 0:
             return
         if not _qt_widget_is_valid(getattr(self, "openButton", None)):
             return
@@ -3781,7 +3833,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _projectDataIsLoaded(self) -> bool:
         return bool(
-            self._connected
+            self._hasWorkspaceSession()
             and self._hasSelectedProject()
             and self._server_pulled
             and getattr(self, "_loaded_project_name", None) == self._currentProjectName()
@@ -3964,10 +4016,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._scheduleAnatomyTreeCoverageRefresh()
 
     def _canOpenProject(self) -> bool:
-        return bool(self._connected and self._hasSelectedProject() and not self._projectDataIsLoaded())
+        return bool(
+            self._hasWorkspaceSession()
+            and self._hasSelectedProject()
+            and not self._projectDataIsLoaded()
+        )
 
     def _openDisabledReason(self) -> str:
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             return "Connect with GitHub first."
         if not self._hasSelectedProject():
             return "Select a project first."
@@ -3976,6 +4032,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return ""
 
     def _canShare(self) -> bool:
+        if not self._connected:
+            return False
         if not self._projectDataIsLoaded():
             return False
         if self._isCurrentVersionWriteLocked():
@@ -4013,7 +4071,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return self._hasVolume() and self._ontologyReadyForCreate()
 
     def _saveVersionDisabledReason(self) -> str:
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             return "Connect with GitHub first."
         if not self._hasSelectedProject():
             return "Create or open a project first."
@@ -4052,7 +4110,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return ""
 
     def _updateVersionActionButtons(self) -> None:
-        if not self._connected or self._suppress_asset_ui_updates > 0:
+        if not self._hasWorkspaceSession() or self._suppress_asset_ui_updates > 0:
             return
         if not _qt_widget_is_valid(getattr(self, "shareButton", None)):
             return
@@ -4194,7 +4252,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.historyTableWidget.setRowCount(0)
         if getattr(self, "checkedOutLabel", None):
             self.checkedOutLabel.setVisible(False)
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             self.historyPlaceholder.setText("Connect with GitHub to begin.")
         elif self._hasSelectedProject():
             self.historyPlaceholder.setText("Open a project to load version history.")
@@ -4248,7 +4306,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateRightDockAvailability()
 
     def getOntologyGraphPayload(self):
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             return {
                 "specs": [],
                 "title": "Ontology",
@@ -4274,7 +4332,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         }
 
     def onProjectChanged(self, _index: int) -> None:
-        if self._hasSelectedProject() and not self._connected:
+        if self._hasSelectedProject() and not self._hasWorkspaceSession():
             self._appendFeed("Connect with GitHub to open a remote project.", error=True)
             self.projectCombo.blockSignals(True)
             self._clearProjectSelection()
@@ -4302,7 +4360,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return str(tags.get(version_id, version_id))
 
     def getVersionTreePayload(self):
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             return {
                 "specs": [],
                 "title": "Version tree",
@@ -4591,6 +4649,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.connectionStatusLabel.text = "Connecting…"
         self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
         self._appendFeed("Connecting…")
+
+        # Already in local mode: skip Continue/Switch — go straight to online check.
+        if getattr(self, "_local_mode", False):
+            login = str((self._github_session or {}).get("login") or "").strip()
+            if not login:
+                login = local_cli_login() or ""
+            session = self._connectOnlineWithOfflineFallback(login)
+            if session is None:
+                return
+            self.connectButton.setEnabled(True)
+            self._applyGitHubSession(session)
+            return
+
         # 1) Tools + local gh auth status only (works offline).
         # 2) If a CLI account exists → Continue / Switch / Cancel.
         # 3) Continue → gh api user + repo list (needs Internet).
@@ -4620,22 +4691,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self.connectButton.setEnabled(True)
                 self._applyGitHubSession(session)
                 return
-            # Continue: verify account online and load repositories.
-            self._openProgress("GitHub", "Connecting…")
-            try:
-                self._updateProgress("Checking GitHub account online…")
-                session = connect_session()
-                self._updateProgress("Connected")
-            except GitHubNotSignedInError:
-                self._closeProgress()
-                session = self._signInThenConnect()
-                if session is None:
-                    return
-            except GitHubAuthError as error:
-                self._closeProgress()
-                self._connectFailed(error)
+            session = self._connectOnlineWithOfflineFallback(existing_login)
+            if session is None:
                 return
-            self._closeProgress()
             self.connectButton.setEnabled(True)
             self._applyGitHubSession(session)
             return
@@ -4666,6 +4724,121 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "switch"
         return "cancel"
 
+    def _promptOfflineLocalMode(self, login: str) -> str:
+        """Cannot reach GitHub after Continue — Try again / Local mode / Cancel."""
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Cannot reach GitHub")
+        box.setText(offline_message())
+        if login:
+            box.setInformativeText(
+                "Or work offline in local mode as %s "
+                "(open and save projects already on this computer)."
+                % login
+            )
+        else:
+            box.setInformativeText(
+                "Or work offline in local mode "
+                "(open and save projects already on this computer)."
+            )
+        try_btn = box.addButton("Try again", qt.QMessageBox.AcceptRole)
+        local_btn = box.addButton("Local mode", qt.QMessageBox.ActionRole)
+        box.addButton("Cancel", qt.QMessageBox.RejectRole)
+        box.setDefaultButton(try_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == try_btn:
+            return "try_again"
+        if clicked == local_btn:
+            return "local"
+        return "cancel"
+
+    def _connectOnlineWithOfflineFallback(
+        self, login: str, *, allow_signin: bool = True
+    ) -> dict | None:
+        """Online connect_session; on offline → Try again / Local mode / Cancel."""
+        while True:
+            self._openProgress("GitHub", "Connecting…")
+            try:
+                self._updateProgress("Checking GitHub account online…")
+                session = connect_session()
+                self._updateProgress("Connected")
+            except GitHubNotSignedInError:
+                self._closeProgress()
+                if not allow_signin:
+                    self._connectFailed(
+                        "GitHub sign-in was not completed. "
+                        "Click Connect with GitHub to try again."
+                    )
+                    return None
+                session = self._signInThenConnect()
+                if session is None:
+                    return None
+                return session
+            except GitHubAuthError as error:
+                self._closeProgress()
+                if is_offline_error(error) or isinstance(error, GitHubOfflineError):
+                    choice = self._promptOfflineLocalMode(login)
+                    if choice == "try_again":
+                        self._appendFeed("Trying GitHub again…")
+                        continue
+                    if choice == "local":
+                        if not login:
+                            self._connectFailed(
+                                "Connect with GitHub first — no local account found."
+                            )
+                            return None
+                        self._enterLocalMode(login)
+                        return None
+                    # Cancel: restore previous local-mode UI or plain Not connected.
+                    self.connectButton.setEnabled(True)
+                    if getattr(self, "_local_mode", False) and login:
+                        self.connectionStatusLabel.text = (
+                            "Not connected — %s (local mode)" % login
+                        )
+                        self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
+                        self._appendFeed("Still in local mode as %s." % login)
+                    else:
+                        self.connectionStatusLabel.text = "Not connected"
+                        self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
+                        self._appendFeed("Connection cancelled.")
+                    return None
+                self._connectFailed(error)
+                return None
+            self._closeProgress()
+            return session
+
+    def _enterLocalMode(self, login: str) -> None:
+        """Offline workspace: identity known, button stays Connect, local clones only."""
+        user = str(login or "").strip()
+        if not user:
+            self._connectFailed("Connect with GitHub first — no local account found.")
+            return
+        self._closeProgress()
+        self._local_mode = True
+        self._connected = False
+        repos = []
+        for full_name in list_local_project_full_names(user):
+            repos.append(
+                {
+                    "full_name": full_name,
+                    "private": True,
+                    "can_push": True,
+                    "role": "local",
+                    "local_only": True,
+                }
+            )
+        self._github_session = {"login": user, "repos": repos}
+        self.connectButton.setEnabled(True)
+        self.connectButton.setText("Connect with GitHub")
+        self.connectionStatusLabel.text = "Not connected — %s (local mode)" % user
+        self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
+        self._populateProjectCombo()
+        self._refreshUiState()
+        self._appendFeed(
+            "Local mode as %s — %d project(s) on this computer."
+            % (user, len(repos))
+        )
+
     def _switchGitHubAccount(self, login: str) -> dict | None:
         self._openProgress("GitHub", "Signing out of %s…" % login)
         try:
@@ -4681,6 +4854,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _connectFailed(self, error) -> None:
         self._closeProgress()
         self.connectButton.setEnabled(True)
+        if getattr(self, "_local_mode", False):
+            login = str((self._github_session or {}).get("login") or "").strip()
+            if login:
+                self.connectionStatusLabel.text = (
+                    "Not connected — %s (local mode)" % login
+                )
+                self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
+                self._showGithubError(error, box=True)
+                return
         self.connectionStatusLabel.text = "Not connected"
         self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
         self._showGithubError(error, box=True)
@@ -4741,39 +4923,41 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("GitHub sign-in cancelled.")
             return None
         slicer.app.processEvents()
-        self._openProgress("GitHub", "Finishing sign-in…")
+        login_hint = ""
         try:
-            self._updateProgress("Reading GitHub account…")
-            session = connect_session()
-            self._updateProgress("Connected")
-        except GitHubNotSignedInError:
-            self._closeProgress()
-            self._connectFailed(
-                "GitHub sign-in was not completed. Click Connect with GitHub to try again."
-            )
-            return None
-        except GitHubAuthError as error:
-            self._closeProgress()
-            self._connectFailed(error)
-            return None
-        self._closeProgress()
-        return session
+            login_hint = local_cli_login() or ""
+        except GitHubAuthError:
+            login_hint = ""
+        # Same online path + offline Try again / Local mode / Cancel.
+        # allow_signin=False avoids looping back into this dialog.
+        return self._connectOnlineWithOfflineFallback(login_hint, allow_signin=False)
 
     def _applyGitHubSession(self, session: dict) -> None:
         self._closeProgress()
-        self._github_session = session
-        self._connected = True
         login = session.get("login") or "unknown"
-        repo_count = len(session.get("repos") or [])
+        # Merge GitHub-accessible repos with local clones; local-only → (not shared).
+        merged = merge_remote_and_local_repos(login, session.get("repos") or [])
+        self._github_session = {"login": login, "repos": merged}
+        self._connected = True
+        self._local_mode = False
+        repo_count = len(merged)
+        local_only = sum(1 for repo in merged if (repo or {}).get("local_only"))
         self.connectionStatusLabel.text = "Connected — %s" % login
         self.connectionStatusLabel.setStyleSheet(STATUS_OK)
         self.connectButton.setText("Disconnect")
         self._populateProjectCombo()
         self._refreshUiState()
-        self._appendFeed(
-            "Connected as %s — %d repository(ies) (owner or collaborator)."
-            % (login, repo_count)
-        )
+        if local_only:
+            self._appendFeed(
+                "Connected as %s — %d project(s) "
+                "(%d only on this computer, marked not shared)."
+                % (login, repo_count, local_only)
+            )
+        else:
+            self._appendFeed(
+                "Connected as %s — %d repository(ies) (owner or collaborator)."
+                % (login, repo_count)
+            )
         self._startNotificationsPolling()
 
     def _promptDisconnect(self) -> None:
@@ -4805,6 +4989,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self._closeProgress()
         self._connected = False
+        self._local_mode = False
         self._github_session = None
         self.connectButton.setText("Connect with GitHub")
         self.connectionStatusLabel.text = "Not connected"
@@ -8784,7 +8969,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return True
 
     def onSaveVersion(self) -> None:
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             self._appendFeed("Connect with GitHub first.", error=True)
             return
         if self._warnIfWriteLocked("Save"):
@@ -9220,6 +9405,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 local_exists = os.path.isdir(os.path.join(dest, ".git"))
             except (GitHubAuthError, OSError, TypeError, ValueError):
                 local_exists = False
+            if getattr(self, "_local_mode", False) and not local_exists:
+                self._closeProgress()
+                self._updateVersionActionButtons()
+                self._appendFeed(
+                    "This project is not on this computer. "
+                    "Connect with GitHub first to download it.",
+                    error=True,
+                )
+                return
             choice = "local" if local_exists else "update"
             progress_label = (
                 "Opening this computer's work…"

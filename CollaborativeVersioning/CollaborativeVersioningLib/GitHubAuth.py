@@ -39,6 +39,10 @@ def default_workspace_dir() -> str:
     return os.path.join(os.path.expanduser("~"), "Documents", WORKSPACE_FOLDER_NAME)
 
 
+def _safe_login_folder(login: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", (login or "").strip()).strip(".-") or "user"
+
+
 def local_project_dir(full_name: str, login: str | None = None) -> str:
     """Local clone path for the signed-in GitHub user (isolated per account on a shared PC)."""
     owner, _, repo = full_name.partition("/")
@@ -47,9 +51,65 @@ def local_project_dir(full_name: str, login: str | None = None) -> str:
     user = str(login or current_login() or "").strip()
     if not user:
         raise GitHubNotSignedInError(not_signed_in_message())
-    # GitHub logins are path-safe; keep a thin guard for odd values.
-    safe_user = re.sub(r"[^A-Za-z0-9._-]+", "-", user).strip(".-") or "user"
-    return os.path.join(default_workspace_dir(), safe_user, owner, repo)
+    return os.path.join(default_workspace_dir(), _safe_login_folder(user), owner, repo)
+
+
+def list_local_project_full_names(login: str) -> list[str]:
+    """Return owner/repo names cloned under this user's local workspace folder."""
+    user = _safe_login_folder(login)
+    root = os.path.join(default_workspace_dir(), user)
+    if not user or not os.path.isdir(root):
+        return []
+    names: list[str] = []
+    try:
+        owners = sorted(os.listdir(root))
+    except OSError:
+        return []
+    for owner in owners:
+        owner_path = os.path.join(root, owner)
+        if not os.path.isdir(owner_path) or owner.startswith("."):
+            continue
+        try:
+            repos = sorted(os.listdir(owner_path))
+        except OSError:
+            continue
+        for repo in repos:
+            dest = os.path.join(owner_path, repo)
+            if os.path.isdir(os.path.join(dest, ".git")):
+                names.append("%s/%s" % (owner, repo))
+    return names
+
+
+def merge_remote_and_local_repos(login: str, remote_repos: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Union of GitHub repos and local clones; local-only entries get ``local_only=True``."""
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in remote_repos or []:
+        if not isinstance(item, dict):
+            continue
+        full_name = str(item.get("full_name") or "").strip()
+        if not full_name or full_name.lower() in seen:
+            continue
+        seen.add(full_name.lower())
+        entry = dict(item)
+        entry["local_only"] = False
+        merged.append(entry)
+    for full_name in list_local_project_full_names(login):
+        key = full_name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(
+            {
+                "full_name": full_name,
+                "private": True,
+                "can_push": False,
+                "role": "local",
+                "local_only": True,
+            }
+        )
+    merged.sort(key=lambda item: str(item.get("full_name") or "").lower())
+    return merged
 
 
 def sanitize_repo_name(name: str) -> str:
