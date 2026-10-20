@@ -74,6 +74,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     local_project_dir,
     invite_project_colleague,
     list_accessible_repos,
+    local_cli_login,
     incoming_invitations_fetch_args,
     parse_incoming_invitations_output,
     list_project_people,
@@ -4590,11 +4591,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.connectionStatusLabel.text = "Connecting…"
         self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
         self._appendFeed("Connecting…")
+        # 1) Tools + local gh auth status only (works offline).
+        # 2) If a CLI account exists → Continue / Switch / Cancel.
+        # 3) Continue → gh api user + repo list (needs Internet).
         self._openProgress("GitHub", "Checking GitHub CLI…")
         try:
             self._updateProgress("Checking GitHub CLI…")
             ensure_tools()
-            existing_login = current_login()
+            self._updateProgress("Reading local GitHub account…")
+            existing_login = local_cli_login()
         except GitHubAuthError as error:
             self._connectFailed(error)
             return
@@ -4615,30 +4620,30 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self.connectButton.setEnabled(True)
                 self._applyGitHubSession(session)
                 return
-
-        if not existing_login:
-            session = self._signInThenConnect()
-            if session is None:
+            # Continue: verify account online and load repositories.
+            self._openProgress("GitHub", "Connecting…")
+            try:
+                self._updateProgress("Checking GitHub account online…")
+                session = connect_session()
+                self._updateProgress("Connected")
+            except GitHubNotSignedInError:
+                self._closeProgress()
+                session = self._signInThenConnect()
+                if session is None:
+                    return
+            except GitHubAuthError as error:
+                self._closeProgress()
+                self._connectFailed(error)
                 return
+            self._closeProgress()
             self.connectButton.setEnabled(True)
             self._applyGitHubSession(session)
             return
 
-        self._openProgress("GitHub", "Connecting…")
-        try:
-            self._updateProgress("Reading GitHub account…")
-            session = connect_session()
-            self._updateProgress("Connected")
-        except GitHubNotSignedInError:
-            self._closeProgress()
-            session = self._signInThenConnect()
-            if session is None:
-                return
-        except GitHubAuthError as error:
-            self._closeProgress()
-            self._connectFailed(error)
+        # No local CLI account → full web sign-in (needs Internet).
+        session = self._signInThenConnect()
+        if session is None:
             return
-        self._closeProgress()
         self.connectButton.setEnabled(True)
         self._applyGitHubSession(session)
 

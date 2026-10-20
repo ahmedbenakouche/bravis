@@ -471,10 +471,55 @@ def open_delete_permission_window() -> None:
     subprocess.Popen(args, start_new_session=True)
 
 
+def local_cli_login() -> str | None:
+    """Active GitHub CLI account from local ``gh auth status`` (no network)."""
+    return _login_from_auth_status()
+
+
 def _login_from_auth_status() -> str | None:
-    """Read the active GitHub CLI account from local auth status (works offline)."""
-    result = _run_gh(["auth", "status", "--hostname", GITHUB_HOST], timeout=20)
+    """Read the active GitHub CLI account from local credentials.
+
+    Prefer ``gh auth status --json``: plain ``gh auth status`` *tests* tokens
+    against the network and can exit 1 / hide logins when offline.
+    ``--json`` still lists stored accounts locally (exit 0 even if token check fails).
+    """
+    # JSON path first (offline-friendly).
+    result = _run_gh(
+        ["auth", "status", "--hostname", GITHUB_HOST, "--json", "hosts"],
+        timeout=20,
+    )
+    raw = (result.stdout or "").strip()
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            hosts = payload.get("hosts") or {}
+            accounts = hosts.get(GITHUB_HOST) if isinstance(hosts, dict) else None
+            if isinstance(accounts, list) and accounts:
+                active = None
+                first = None
+                for item in accounts:
+                    if not isinstance(item, dict):
+                        continue
+                    login = str(item.get("login") or "").strip()
+                    if not login:
+                        continue
+                    if first is None:
+                        first = login
+                    if item.get("active"):
+                        active = login
+                        break
+                if active or first:
+                    return active or first
+
+    # Text fallback (older gh / odd output). Merge stdout+stderr: status often uses stderr.
+    result = _run_gh(["auth", "status", "--hostname", GITHUB_HOST, "--active"], timeout=20)
     text = "%s\n%s" % (result.stdout or "", result.stderr or "")
+    if not text.strip():
+        result = _run_gh(["auth", "status", "--hostname", GITHUB_HOST], timeout=20)
+        text = "%s\n%s" % (result.stdout or "", result.stderr or "")
     fallback = None
     current = None
     for line in text.splitlines():
