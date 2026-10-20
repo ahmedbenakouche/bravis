@@ -72,6 +72,10 @@ class GitHubOfflineError(GitHubAuthError):
     """GitHub/Git could not be reached (no internet, DNS, etc.)."""
 
 
+class GitHubMissingProjectError(GitHubAuthError):
+    """Remote project looks gone (deleted) or this account can no longer access it."""
+
+
 class GitHubMissingDeletePermissionError(GitHubAuthError):
     pass
 
@@ -83,10 +87,53 @@ def offline_message() -> str:
     )
 
 
+def missing_project_message() -> str:
+    return (
+        "This project may no longer exist on GitHub "
+        "(or you may no longer have access).\n\n"
+        "Ask the project owner."
+    )
+
+
+def looks_like_missing_project_error(text: str) -> bool:
+    """True for deleted / inaccessible GitHub repositories (often the same 404)."""
+    lower = (text or "").lower()
+    if not lower.strip():
+        return False
+    # Do not steal username-lookup failures.
+    if "github user not found" in lower or "user not found:" in lower:
+        return False
+    markers = (
+        "may no longer exist on github",
+        "could not resolve to a repository",
+        "repository not found",
+        "not found (http 404)",
+        "http 404",
+        '"status": "404"',
+        '"status":"404"',
+        "returned error: 404",
+        "error: 404",
+    )
+    if any(marker in lower for marker in markers):
+        return True
+    # git: fatal: repository 'https://github.com/owner/repo.git/' not found
+    if "repository '" in lower and "github.com" in lower and "not found" in lower:
+        return True
+    if "not found" in lower and ("repos/" in lower or "github.com" in lower):
+        # Avoid generic "file not found" / path noise without GitHub context.
+        if "no such file" in lower or "cannot find the path" in lower:
+            return False
+        return True
+    return False
+
+
 def looks_like_offline_error(text: str) -> bool:
     """True when CLI/Git stderr (or our own message) points to no network / unreachable GitHub."""
     lower = (text or "").lower()
     if not lower.strip():
+        return False
+    # Missing/deleted repo is not "offline" (GitHub answered with 404).
+    if looks_like_missing_project_error(lower):
         return False
     markers = (
         "cannot reach github",
@@ -144,17 +191,27 @@ def is_offline_error(error) -> bool:
     return looks_like_offline_error(str(error or ""))
 
 
+def is_missing_project_error(error) -> bool:
+    if isinstance(error, GitHubMissingProjectError):
+        return True
+    return looks_like_missing_project_error(str(error or ""))
+
+
 def user_facing_github_error(error) -> str:
-    """Map any GitHub/Git failure to a clinician-facing string (unified offline text)."""
+    """Map any GitHub/Git failure to a clinician-facing string."""
     if is_offline_error(error):
         return offline_message()
+    if is_missing_project_error(error):
+        return missing_project_message()
     return str(error or "").strip() or "Something went wrong talking to GitHub."
 
 
 def raise_github_cli_error(detail: str, fallback: str) -> None:
-    """Raise Offline or a normal GitHubAuthError from CLI/Git stderr."""
+    """Raise Offline, missing-project, or a normal GitHubAuthError from CLI/Git stderr."""
     if looks_like_offline_error(detail) or looks_like_offline_error(fallback):
         raise GitHubOfflineError(offline_message())
+    if looks_like_missing_project_error(detail) or looks_like_missing_project_error(fallback):
+        raise GitHubMissingProjectError(missing_project_message())
     detail = (detail or "").strip()
     if detail:
         raise GitHubAuthError("%s\n%s" % (fallback, detail[:400]))
@@ -1015,6 +1072,8 @@ def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
 def _share_failure_message(detail: str) -> str:
     if looks_like_offline_error(detail):
         return offline_message()
+    if looks_like_missing_project_error(detail):
+        return missing_project_message()
     lower = (detail or "").lower()
     if (
         "non-fast-forward" in lower
@@ -1035,6 +1094,8 @@ def _raise_share_failure(detail: str) -> None:
     message = _share_failure_message(detail)
     if looks_like_offline_error(message) or looks_like_offline_error(detail):
         raise GitHubOfflineError(offline_message())
+    if looks_like_missing_project_error(message) or looks_like_missing_project_error(detail):
+        raise GitHubMissingProjectError(missing_project_message())
     raise GitHubAuthError(message)
 
 
@@ -1796,7 +1857,7 @@ def open_or_update_local_project(full_name: str, mode: str = "update") -> str:
     result = _run_gh(["repo", "clone", full_name, dest], timeout=300)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise GitHubAuthError("Could not open the project.\n%s" % detail[:500])
+        raise_github_cli_error(detail, "Could not open the project.")
     if not os.path.isdir(dest):
         raise GitHubAuthError("The project was not copied to:\n%s" % dest)
     _configure_repo_identity(dest, login)

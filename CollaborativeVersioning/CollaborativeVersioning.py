@@ -48,9 +48,12 @@ from CollaborativeVersioningLib.GitHubAuth import (
     GitHubAuthError,
     GitHubMissingDeletePermissionError,
     GitHubNotSignedInError,
+    GitHubMissingProjectError,
     GitHubOfflineError,
+    is_missing_project_error,
     is_offline_error,
     looks_like_offline_error,
+    missing_project_message,
     offline_message,
     user_facing_github_error,
     accept_project_invitation,
@@ -4678,7 +4681,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._showGithubError(error, box=True)
 
     def _showGithubError(self, error, *, box: bool = True) -> None:
-        """Show a clinician-facing GitHub/Git error; unify offline into one clear box/feed line.
+        """Show a clinician-facing GitHub/Git error; unify offline / missing-project messages.
 
         User-triggered actions (Connect / Open / Share / …) always get feedback again on
         each click — no throttle. Background paths use ``box=False`` and may throttle feed.
@@ -4692,6 +4695,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     windowTitle="Cannot reach GitHub",
                 )
             # force=True so a second Connect/Open/Share while offline still logs in the feed.
+            self._appendFeed(feed_line, error=True, force=True)
+            return
+        if is_missing_project_error(error) or isinstance(error, GitHubMissingProjectError):
+            if box:
+                slicer.util.warningDisplay(
+                    missing_project_message(),
+                    windowTitle="Project unavailable",
+                )
             self._appendFeed(feed_line, error=True, force=True)
             return
         if box:
