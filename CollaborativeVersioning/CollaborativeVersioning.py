@@ -8353,10 +8353,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._updateActiveVersionIndicators()
             self._updateTaskButtonUi()
 
+    def _showShareBranchBeforeReviewHint(self) -> None:
+        """Junior tried Request review before Share — box + feed."""
+        text = (
+            "Share your branch first.\n\n"
+            "Request review is only available after this version has been shared."
+        )
+        slicer.util.warningDisplay(text, windowTitle="Request review")
+        self._appendFeed("Share your branch first.", error=True)
+
     def _submitOwnReviewLine(self, lane: str = "") -> None:
         slug = normalize_branch_slug(lane) or self._currentNamedBranchSlug()
         if not slug:
-            self._appendFeed("Share a branch first.", error=True)
+            self._showShareBranchBeforeReviewHint()
             return
         role = self._taskRoleForLane(slug)
         if not role or role[0] != "submit":
@@ -8377,7 +8386,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             outcome = submit_review_line(full_name, slug)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            detail = str(error).split("\n")[0].strip().lower()
+            if "share" in detail and "branch" in detail:
+                self._showShareBranchBeforeReviewHint()
+            else:
+                self._showGithubError(error, box=True)
             return
         self._closeProgress()
         if outcome == "updated":
