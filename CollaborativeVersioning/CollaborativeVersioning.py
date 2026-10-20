@@ -4402,7 +4402,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def onProjectChanged(self, _index: int) -> None:
         if self._hasSelectedProject() and not self._hasWorkspaceSession():
-            self._appendFeed("Connect with GitHub to open a remote project.", error=True)
+            self._showConnectRequired("Connect with GitHub to open a remote project.")
             self.projectCombo.blockSignals(True)
             self._clearProjectSelection()
             self.projectCombo.blockSignals(False)
@@ -4980,6 +4980,25 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             slicer.util.warningDisplay(text, windowTitle="GitHub")
         self._appendFeed(feed_line, error=True, force=True)
 
+    def _showConnectRequired(self, message: str = "") -> None:
+        """Button gated on live GitHub — box instead of feed (esp. local mode)."""
+        text = str(message or "").strip() or "Connect with GitHub first."
+        title = "Local mode" if getattr(self, "_local_mode", False) else "GitHub"
+        try:
+            slicer.util.warningDisplay(text, windowTitle=title)
+        except TypeError:
+            slicer.util.warningDisplay(text)
+
+    def _showActionUnavailable(self, reason: str) -> None:
+        """Disabled-button click: Connect → box; other reasons → feed."""
+        text = str(reason or "").strip()
+        if not text:
+            return
+        if text.startswith("Connect with GitHub"):
+            self._showConnectRequired(text)
+            return
+        self._appendFeed(text, error=True)
+
     def _signInThenConnect(self) -> dict | None:
         try:
             open_login_window()
@@ -5149,7 +5168,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def onCreateProject(self) -> None:
         try:
             if not self._connected:
-                self._appendFeed("Connect with GitHub first.", error=True)
+                self._showConnectRequired()
                 return
             missing = self._createMissingAssets()
             if missing:
@@ -5597,7 +5616,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not self._canOpenPeople():
             reason = self._peopleDisabledReason()
             if reason:
-                self._appendFeed(reason, error=True)
+                self._showActionUnavailable(reason)
             return
         full_name = self._currentProjectName()
         self.peopleButton.setEnabled(False)
@@ -7731,7 +7750,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def onOpenTask(self, draft=None) -> None:
         if not self._hasWorkspaceSession():
-            self._appendFeed("Connect with GitHub first.", error=True)
+            self._showConnectRequired()
             return
         if not self._hasSelectedProject():
             self._appendFeed("Select a project first.", error=True)
@@ -8150,11 +8169,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Select a project first.", error=True)
             return
         if self._projectUsesLocalInfoOnly():
-            self._appendFeed(
-                "This project is not on GitHub — "
-                "Compare with shared is unavailable.",
-                error=True,
-            )
+            if getattr(self, "_local_mode", False):
+                self._showConnectRequired()
+            else:
+                self._showActionUnavailable(
+                    "This project is not on GitHub — "
+                    "Compare with shared is unavailable."
+                )
             return
         local_path = getattr(self, "_local_project_path", None) or ""
         if not local_path or not getattr(self, "_server_pulled", False):
@@ -9125,7 +9146,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not self._canDeleteProject():
             reason = self._deleteDisabledReason()
             if reason:
-                self._appendFeed(reason, error=True)
+                self._showActionUnavailable(reason)
             return
         full_name = self._currentProjectName()
         box = qt.QMessageBox(slicer.util.mainWindow())
@@ -9231,14 +9252,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def onSaveVersion(self) -> None:
         if not self._hasWorkspaceSession():
-            self._appendFeed("Connect with GitHub first.", error=True)
+            self._showConnectRequired()
             return
         if self._warnIfWriteLocked("Save"):
             return
         if not self._canSaveVersion():
             reason = self._saveVersionDisabledReason()
             if reason:
-                self._appendFeed(reason, error=True)
+                self._showActionUnavailable(reason)
             return
         local_path = getattr(self, "_local_project_path", None) or ""
         if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
@@ -9359,14 +9380,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def onShare(self) -> None:
         if not self._connected:
-            self._appendFeed("Connect with GitHub first.", error=True)
+            self._showConnectRequired()
             return
         if self._warnIfWriteLocked("Share"):
             return
         if not self._canShare():
             reason = self._shareDisabledReason()
             if reason:
-                self._appendFeed(reason, error=True)
+                self._showActionUnavailable(reason)
             return
         local_path = getattr(self, "_local_project_path", None) or ""
         if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
@@ -9684,7 +9705,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not self._canOpenProject():
             reason = self._openDisabledReason()
             if reason:
-                self._appendFeed(reason, error=True)
+                self._showActionUnavailable(reason)
             return
         full_name = self._currentProjectName()
         self.openButton.setEnabled(False)
