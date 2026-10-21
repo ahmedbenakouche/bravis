@@ -5905,13 +5905,27 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             access = people_access_for(full_name, me)
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             access = PEOPLE_ACCESS_JUNIOR
+        # Always refresh session cache (Senior→Junior re-invite must not keep old role).
+        self._rememberPeopleAccess(full_name, access)
         role_label = "Senior" if access == PEOPLE_ACCESS_SENIOR else "Junior"
         self._recordActivity(
             full_name,
             "join",
             "%s joined the project as %s." % (me, role_label),
         )
-        self._appendFeed("Joined %s. Open it when you are ready." % full_name)
+        loaded = str(getattr(self, "_loaded_project_name", None) or "").strip()
+        if full_name and loaded and full_name.lower() == loaded.lower():
+            # Project already open: padlocks / Save / Share / Tasks follow the new role.
+            self._refreshUiState()
+            self._updateCommitHistoryPanel()
+            self._updateVersionActionButtons()
+            self._updateTaskButtonUi()
+            self._appendFeed(
+                "Joined %s as %s — role updated for the open project."
+                % (full_name, role_label)
+            )
+        else:
+            self._appendFeed("Joined %s. Open it when you are ready." % full_name)
 
     def _declineIncomingInvitation(self, invitation: dict) -> None:
         full_name = invitation.get("full_name") or "the project"
