@@ -2554,6 +2554,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._messageSendAttempt = 0
         self._messageSendExisting = []
         self._messageSendTasks = []
+        # Parked chat while combo is not on the open project (None / other).
+        self._open_project_chat_stash = None
 
     def setup(self) -> None:
         try:
@@ -3105,6 +3107,174 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         finally:
             self._blockProjectAssetSignals(False)
 
+    def _hideLoadedProjectAssetFields(self) -> None:
+        """Clear asset selectors only — keep scene nodes + ontology stash for restore."""
+        self._suppress_dirty += 1
+        self._suppress_asset_ui_updates += 1
+        self._blockProjectAssetSignals(True)
+        try:
+            if _qt_widget_is_valid(getattr(self, "volumeSelector", None)):
+                self.volumeSelector.setCurrentNode(None)
+            if _qt_widget_is_valid(getattr(self, "segmentationSelector", None)):
+                self.segmentationSelector.setCurrentNode(None)
+            # Working ontology for UI only; keep _project_ontology_* for the open project.
+            self._ontology_document = None
+            if self.logic and getattr(self.logic, "_dependencyCanvas", None):
+                self.logic._dependencyCanvas.set_specs(
+                    [],
+                    graph_title="Ontology",
+                    graph_description="Open the selected project to load assets.",
+                    painted_ids=[],
+                )
+            # Drop the open-project ontology row from the combo so it cannot be
+            # re-selected while browsing another project — stash path/doc stays.
+            combo = getattr(self, "ontologyPresetCombo", None)
+            idx = int(getattr(self, "_ontology_server_combo_index", -1) or -1)
+            if _qt_widget_is_valid(combo) and idx >= 0:
+                combo.blockSignals(True)
+                try:
+                    if idx < _qt_combo_count(combo):
+                        combo.removeItem(idx)
+                    self._ontology_server_combo_index = -1
+                finally:
+                    combo.blockSignals(False)
+            self._setOntologyComboNone()
+        finally:
+            self._blockProjectAssetSignals(False)
+            self._suppress_asset_ui_updates -= 1
+            self._suppress_dirty -= 1
+
+    def _restoreLoadedProjectAssetFields(self) -> None:
+        """Put back volume / segmentation / ontology for the project still in the scene."""
+        self._suppress_dirty += 1
+        self._suppress_asset_ui_updates += 1
+        self._blockProjectAssetSignals(True)
+        try:
+            scene = slicer.mrmlScene
+            volume_node = None
+            segmentation_node = None
+            for node_id in list(getattr(self, "_project_scene_node_ids", None) or []):
+                try:
+                    node = scene.GetNodeByID(node_id) if node_id else None
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    node = None
+                if node is None:
+                    continue
+                try:
+                    class_name = str(node.GetClassName() or "")
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    class_name = ""
+                if "Segmentation" in class_name or "LabelMap" in class_name:
+                    segmentation_node = node
+                else:
+                    volume_node = node
+            if _qt_widget_is_valid(getattr(self, "volumeSelector", None)):
+                self.volumeSelector.setCurrentNode(volume_node)
+            if _qt_widget_is_valid(getattr(self, "segmentationSelector", None)):
+                self.segmentationSelector.setCurrentNode(segmentation_node)
+            document = getattr(self, "_project_ontology_document", None)
+            path = getattr(self, "_project_ontology_path", None)
+            if document is None and path and os.path.isfile(path):
+                try:
+                    document = load_ontology_file(path)
+                    self._project_ontology_document = document
+                except (OSError, ValueError):
+                    document = None
+            if path and getattr(self, "_ontology_server_combo_index", -1) < 0:
+                self._setOntologyComboLoadedFilename(
+                    document=document, filename=path
+                )
+            elif getattr(self, "_ontology_server_combo_index", -1) >= 0:
+                combo = getattr(self, "ontologyPresetCombo", None)
+                if _qt_widget_is_valid(combo):
+                    combo.blockSignals(True)
+                    try:
+                        combo.setCurrentIndex(self._ontology_server_combo_index)
+                    finally:
+                        combo.blockSignals(False)
+            if document is not None:
+                self._ontology_document = document
+                self._applyOntologyGraph(document)
+                self._updateRightDockAvailability()
+            else:
+                self._ontology_document = None
+        finally:
+            self._blockProjectAssetSignals(False)
+            self._suppress_asset_ui_updates -= 1
+            self._suppress_dirty -= 1
+
+    def _parkOpenProjectChatUi(self) -> None:
+        """Hide messages + project activity notifs so they are not mistaken for the selection."""
+        open_name = str(getattr(self, "_loaded_project_name", None) or "").strip()
+        if not open_name:
+            return
+        stash = getattr(self, "_open_project_chat_stash", None)
+        if not isinstance(stash, dict) or str(stash.get("project") or "").lower() != open_name.lower():
+            self._open_project_chat_stash = {
+                "project": open_name,
+                "messages": list(getattr(self, "_messages", None) or []),
+                "tasks": list(getattr(self, "_project_tasks", None) or []),
+                "activity": list(getattr(self, "_project_activity", None) or []),
+                "reads": dict(getattr(self, "_project_reads", None) or {}),
+                "presence": dict(getattr(self, "_project_presence", None) or {}),
+                "messages_unread": int(getattr(self, "_messages_unread", 0) or 0),
+                "messages_project": str(getattr(self, "_messages_project", "") or ""),
+                "notification_activity": list(
+                    getattr(self, "_notification_activity", None) or []
+                ),
+            }
+        self._stopMessagesPolling()
+        self._messages = []
+        self._project_tasks = []
+        self._project_activity = []
+        self._project_reads = {}
+        self._project_presence = {}
+        self._messages_unread = 0
+        self._messages_project = ""
+        self._notification_activity = []
+        self._rebuildNotificationsDisplay()
+        self._renderMessagesView()
+        self._updateMessagesPresenceBanner()
+        self._updateMessagesBadge()
+        self._updateTaskButtonUi()
+        self._setMessagesComposerEnabled(False)
+
+    def _restoreParkedOpenProjectChatUi(self) -> None:
+        """Put back parked messages / project activity when the open project is selected again."""
+        open_name = str(getattr(self, "_loaded_project_name", None) or "").strip()
+        stash = getattr(self, "_open_project_chat_stash", None)
+        if not open_name or not isinstance(stash, dict):
+            return
+        if str(stash.get("project") or "").lower() != open_name.lower():
+            return
+        self._messages = list(stash.get("messages") or [])
+        self._project_tasks = list(stash.get("tasks") or [])
+        self._project_activity = list(stash.get("activity") or [])
+        self._project_reads = dict(stash.get("reads") or {})
+        self._project_presence = dict(stash.get("presence") or {})
+        self._messages_unread = int(stash.get("messages_unread") or 0)
+        self._messages_project = str(stash.get("messages_project") or open_name)
+        self._notification_activity = list(stash.get("notification_activity") or [])
+        self._open_project_chat_stash = None
+        self._rebuildNotificationsDisplay()
+        self._renderMessagesView()
+        self._updateMessagesPresenceBanner()
+        self._updateMessagesBadge()
+        self._updateTaskButtonUi()
+
+    def _syncAssetFieldsToProjectSelection(self) -> None:
+        """Selectors + chat follow the combo; restored only for the open project."""
+        loaded = str(getattr(self, "_loaded_project_name", None) or "").strip()
+        if not loaded:
+            return
+        selected = self._currentProjectName() if self._hasSelectedProject() else ""
+        if selected and selected.lower() == loaded.lower():
+            self._restoreLoadedProjectAssetFields()
+            self._restoreParkedOpenProjectChatUi()
+        else:
+            self._hideLoadedProjectAssetFields()
+            self._parkOpenProjectChatUi()
+
     def _rememberProjectSceneNodes(self, volume_node=None, segmentation_node=None) -> None:
         """Track which scene nodes belong to the open CV project (for later unload).
 
@@ -3619,6 +3789,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._syncMessagesPolling()
             self._updateCommitHistoryPanel()
             self._updateVersionActionButtons()
+            # Keep Version tree / Anatomy buttons in sync when selection leaves the open project.
+            self._updateRightDockAvailability()
             return
         if getattr(self, "_local_mode", False):
             self._applyLocalModeUi()
@@ -4429,27 +4601,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if self._hasSelectedProject():
             name = self._currentProjectName()
             if name == getattr(self, "_loaded_project_name", None):
+                # Same as returning from None: keep history/version bundle in memory.
                 self._server_pulled = True
             else:
+                # Hide history UI only — do not wipe the open project's bundle,
+                # or returning here would show an empty Version tree / table.
                 self._server_pulled = False
-                self._project_history_bundle = None
-                if getattr(self, "_local_mode", False) and not self._connected:
-                    self._local_project_people = []
-                    self._resetMessagesState("")
-                    self._notification_invites = []
-                    self._notification_activity = []
-                    self._rebuildNotificationsDisplay()
+            # Assets + messages/project notifs follow selection (park while away).
+            self._syncAssetFieldsToProjectSelection()
             self._refreshUiState()
             self._appendFeed("Project selected: %s" % name)
             return
 
-        self._currentVersionId = None
-        if getattr(self, "_local_mode", False) and not self._connected:
-            self._local_project_people = []
-            self._resetMessagesState("")
-            self._notification_invites = []
-            self._notification_activity = []
-            self._rebuildNotificationsDisplay()
+        # None selected: same as another project — park chat/notifs activity.
+        self._server_pulled = False
+        self._syncAssetFieldsToProjectSelection()
         self._refreshUiState()
         self._appendFeed("No project selected — Create a new project or wait for an invitation.")
 
@@ -6546,6 +6712,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _resetMessagesState(self, project: str) -> None:
         self._stopMessageSend()
+        self._open_project_chat_stash = None
         self._messages = []
         self._project_tasks = []
         self._project_activity = []
@@ -6580,6 +6747,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         )
         # Local mode / (not shared): keep Open snapshot in memory; no poll.
         if not name and loaded and self._projectUsesLocalInfoOnly():
+            self._stopMessagesPolling()
+            self._setMessagesComposerEnabled(False)
+            self._renderMessagesView()
+            self._updateMessagesBadge()
+            self._updateTaskButtonUi()
+            return
+        # Chat already parked by _parkOpenProjectChatUi while browsing away.
+        if not name and getattr(self, "_open_project_chat_stash", None):
             self._stopMessagesPolling()
             self._setMessagesComposerEnabled(False)
             self._renderMessagesView()
