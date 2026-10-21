@@ -3599,6 +3599,7 @@ _ACTIVITY_KINDS = frozenset(
     (
         "join",
         "assign",
+        "update",
         "cancel",
         "submit",
         "accept",

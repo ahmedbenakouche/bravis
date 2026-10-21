@@ -388,6 +388,7 @@ def _notification_detail_title(item: dict) -> str:
         "accept": "New accept",
         "submit": "Review requested",
         "assign": "New task",
+        "update": "Task updated",
         "cancel": "Task cancelled",
         "decline": "Review declined",
         "join": "New join",
@@ -1883,10 +1884,12 @@ class TaskDialog(qt.QDialog):
         # Owner/senior viewing without assign (e.g. local mode): empty hint differs.
         self._is_senior = bool(is_senior) or bool(can_assign)
         self._assign_handler = None
+        self._update_handler = None
         self._cancel_handler = None
         self._pick_start_handler = None
         self._anchor_sha = ""
         self._anchor_label = ""
+        self._editing_task_id = ""
 
         layout = qt.QVBoxLayout(self)
         layout.setSpacing(10)
@@ -2039,20 +2042,30 @@ class TaskDialog(qt.QDialog):
         buttons = qt.QHBoxLayout()
         buttons.addStretch(1)
         closeButton = qt.QPushButton("Close")
+        self.newTaskButton = qt.QPushButton("New task")
         self.cancelTaskButton = qt.QPushButton("Cancel task")
+        self.updateTaskButton = qt.QPushButton("Update task")
         self.assignButton = qt.QPushButton("Assign")
         closeButton.setStyleSheet(BTN_SECONDARY)
+        self.newTaskButton.setStyleSheet(BTN_SECONDARY)
         self.cancelTaskButton.setStyleSheet(BTN_DELETE)
+        self.updateTaskButton.setStyleSheet(BTN_SAVE_VERSION)
         self.assignButton.setStyleSheet(BTN_CREATE)
         closeButton.connect("clicked()", self.reject)
+        self.newTaskButton.connect("clicked()", self._onNewTaskClicked)
         self.cancelTaskButton.connect("clicked()", self._onCancelTaskClicked)
+        self.updateTaskButton.connect("clicked()", self._onUpdateTaskClicked)
         self.assignButton.connect("clicked()", self._onAssignClicked)
         buttons.addWidget(closeButton)
+        buttons.addWidget(self.newTaskButton)
         buttons.addWidget(self.cancelTaskButton)
+        buttons.addWidget(self.updateTaskButton)
         buttons.addWidget(self.assignButton)
         layout.addLayout(buttons)
         self.assignButton.setVisible(self._can_assign)
         self.assignButton.setDefault(self._can_assign)
+        self.updateTaskButton.setVisible(self._can_assign)
+        self.newTaskButton.setVisible(self._can_assign)
         self.cancelTaskButton.setVisible(True)
 
         self.taskList.connect("currentRowChanged(int)", self._onTaskRowChanged)
@@ -2067,11 +2080,30 @@ class TaskDialog(qt.QDialog):
     def set_assign_handler(self, handler) -> None:
         self._assign_handler = handler
 
+    def set_update_handler(self, handler) -> None:
+        self._update_handler = handler
+
     def set_cancel_handler(self, handler) -> None:
         self._cancel_handler = handler
 
     def set_pick_start_handler(self, handler) -> None:
         self._pick_start_handler = handler
+
+    def refresh_tasks(self, tasks=None) -> None:
+        """Reload the task list after Assign / Update / Cancel (dialog stays open)."""
+        self._all_tasks = [
+            task for task in (tasks or []) if self._is_assigned_task(task)
+        ]
+        self._tasks = list(self._all_tasks)
+        selected_id = str(getattr(self, "_editing_task_id", "") or "").strip()
+        self._fillTasks()
+        if selected_id:
+            for index, task in enumerate(self._tasks):
+                if str((task or {}).get("id") or "") == selected_id:
+                    self.taskList.setCurrentRow(index)
+                    break
+        self._updateDetail()
+        self._updateActionButtons()
 
     def apply_draft(self, draft) -> None:
         data = draft if isinstance(draft, dict) else {}
@@ -2330,15 +2362,116 @@ class TaskDialog(qt.QDialog):
         senior = str(task.get("senior") or "").strip().lower()
         return bool(senior) and me == senior
 
+    def _canUpdateSelected(self) -> bool:
+        """Same gate as Cancel: senior who owns the open (not closed) task."""
+        return self._canCancelSelected()
+
+    def _setJuniorChecks(self, logins) -> None:
+        chosen = {
+            str(name or "").strip().lower()
+            for name in (logins or [])
+            if str(name or "").strip()
+        }
+        try:
+            count = self.juniorList.count
+            if callable(count):
+                count = count()
+            count = int(count)
+        except (TypeError, AttributeError, RuntimeError, ValueError):
+            count = 0
+        for index in range(count):
+            item = self.juniorList.item(index)
+            if item is None:
+                continue
+            try:
+                login = str(item.data(qt.Qt.UserRole) or "").strip().lower()
+            except (AttributeError, TypeError, RuntimeError):
+                login = ""
+            try:
+                item.setCheckState(
+                    qt.Qt.Checked if login and login in chosen else qt.Qt.Unchecked
+                )
+            except (AttributeError, TypeError, RuntimeError):
+                pass
+
+    def _loadTaskIntoForm(self, task: dict) -> None:
+        if not self._can_assign:
+            return
+        self._editing_task_id = str((task or {}).get("id") or "").strip()
+        try:
+            self.descriptionEdit.setPlainText(
+                str((task or {}).get("description") or "")
+            )
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+        self._setJuniorChecks(_task_junior_logins(task))
+        self.set_start_version(
+            (task or {}).get("anchor_sha") or "",
+            (task or {}).get("anchor_label") or "",
+        )
+        try:
+            self.pickStartButton.setEnabled(False)
+            self.pickStartButton.setToolTip(
+                "Start version is fixed for an existing task."
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+    def _clearFormForNewAssign(self) -> None:
+        if not self._can_assign:
+            return
+        self._editing_task_id = ""
+        try:
+            self.descriptionEdit.setPlainText("")
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+        self._setJuniorChecks([])
+        self.set_start_version("", "")
+        try:
+            self.pickStartButton.setEnabled(True)
+            self.pickStartButton.setToolTip("")
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
     def _onTaskRowChanged(self, _row) -> None:
+        if self._can_assign:
+            task = self.selected_task()
+            if task and self._canUpdateSelected():
+                self._loadTaskIntoForm(task)
+            else:
+                # Other senior's / closed / no row: do not keep a half-loaded edit form.
+                self._clearFormForNewAssign()
         self._updateDetail()
         self._updateActionButtons()
 
+    def _onNewTaskClicked(self) -> None:
+        """Leave Update mode — empty form + Assign for a brand-new task."""
+        try:
+            self.taskList.clearSelection()
+            self.taskList.setCurrentRow(-1)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        self._clearFormForNewAssign()
+        self._updateDetail()
+        self._updateActionButtons()
+        self.set_status("New task — choose juniors, description, and start version.")
+
     def _updateDetail(self) -> None:
+        if self._can_assign and self._canUpdateSelected():
+            self.detailLabel.setText(
+                "Selected task — edit juniors / description, then Update task. "
+                "Start version stays fixed. New task clears the form. "
+                "Double-click to read the full text."
+            )
+            self.detailLabel.setVisible(True)
+            return
         double_click = "Double-click a task to read the full description."
         if self._can_assign:
-            self.detailLabel.setText(double_click)
-            self.detailLabel.setVisible(bool(self._tasks))
+            self.detailLabel.setText(
+                "Select one of your tasks to update it, or Assign a new one. "
+                + double_click
+            )
+            self.detailLabel.setVisible(True)
             return
         if self._tasks:
             self.detailLabel.setText(double_click)
@@ -2412,9 +2545,25 @@ class TaskDialog(qt.QDialog):
         dialog.exec_()
 
     def _updateActionButtons(self) -> None:
+        can_update = self._canUpdateSelected()
         self.cancelTaskButton.setEnabled(self._canCancelSelected())
+        self.updateTaskButton.setEnabled(can_update)
+        self.updateTaskButton.setVisible(self._can_assign)
+        if getattr(self, "newTaskButton", None) is not None:
+            self.newTaskButton.setVisible(self._can_assign)
+            # Useful mainly while editing an existing task.
+            self.newTaskButton.setEnabled(self._can_assign and can_update)
+        # Assign = new task only (when not editing a selected one).
+        if self._can_assign:
+            self.assignButton.setVisible(not can_update)
+            self.assignButton.setEnabled(not can_update)
+            self.assignButton.setDefault(not can_update)
+            self.updateTaskButton.setDefault(can_update)
 
     def _onAssignClicked(self) -> None:
+        if self._canUpdateSelected():
+            self.set_status("This task is selected — use Update task.", error=True)
+            return
         juniors = self.selected_juniors()
         if not juniors:
             self.set_status("Select at least one junior.", error=True)
@@ -2430,6 +2579,23 @@ class TaskDialog(qt.QDialog):
         handler = self._assign_handler
         if handler is not None:
             handler(self, juniors, description, anchor_sha, anchor_label)
+
+    def _onUpdateTaskClicked(self) -> None:
+        task = self.selected_task()
+        if not task or not self._canUpdateSelected():
+            self.set_status("Select one of your open tasks first.", error=True)
+            return
+        juniors = self.selected_juniors()
+        if not juniors:
+            self.set_status("Keep at least one junior on the task.", error=True)
+            return
+        description = self.task_description()
+        if not description:
+            self.set_status("Write a short description first.", error=True)
+            return
+        handler = self._update_handler
+        if handler is not None:
+            handler(self, task, juniors, description)
 
     def _onCancelTaskClicked(self) -> None:
         task = self.selected_task()
@@ -7701,7 +7867,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 event["at"] = str(message.get("at"))
             return event
         op = str(message.get("task_op") or "").strip()
-        if op not in ("assign", "cancel", "submit", "accept"):
+        if op not in ("assign", "update", "cancel", "submit", "accept"):
             return None
         author = str(message.get("author") or self._githubLogin() or "Someone")
         juniors = _task_juniors_label(message)
@@ -7726,6 +7892,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 text = "%s assigned %s to a task." % (author, juniors)
             if branch:
                 text = "%s Branch %s." % (text.rstrip("."), branch)
+        elif op == "update":
+            excerpt = _task_excerpt(message.get("description") or "")
+            text = (
+                "%s updated the task for %s: %s" % (author, juniors, excerpt)
+                if excerpt
+                else "%s updated the task for %s." % (author, juniors)
+            )
         elif op == "cancel":
             text = "%s cancelled the task for %s." % (author, juniors)
         elif op == "submit":
@@ -7773,7 +7946,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 presence,
             )
         # Assigner side: same rare fetch so local mode Tasks stay current.
-        if str((message or {}).get("task_op") or "").strip() == "assign":
+        if str((message or {}).get("task_op") or "").strip() in ("assign", "update"):
             self._scheduleLocalProjectInfoFetch()
         self._startNextQueuedSend()
 
@@ -7898,6 +8071,29 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 entry["branch_slug"] = branch_slug
             current.append(entry)
             return current
+        if op == "update":
+            if not juniors or not senior:
+                raise GitHubAuthError("Keep at least one junior on the task.")
+            if not description:
+                raise GitHubAuthError("Write a short description first.")
+            tid = str((message or {}).get("task_id") or "").strip()
+            updated = []
+            matched = False
+            for task in current:
+                if str(task.get("status") or "") == "accepted":
+                    updated.append(task)
+                    continue
+                matches = bool(tid) and str(task.get("id") or "") == tid
+                if matches and not matched:
+                    task = dict(task)
+                    task["juniors"] = list(juniors)
+                    task["junior"] = juniors[0]
+                    task["description"] = description
+                    matched = True
+                updated.append(task)
+            if not matched:
+                raise GitHubAuthError("That task is no longer active.")
+            return updated
         if op in ("propose", "claim"):
             # Voluntary tasks removed — ignore legacy ops if they still appear.
             return current
@@ -8030,6 +8226,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         dialog.set_cancel_handler(self._onCancelTaskChosen)
         if can_assign:
             dialog.set_assign_handler(self._onAssignTaskChosen)
+            dialog.set_update_handler(self._onUpdateTaskChosen)
             dialog.set_pick_start_handler(self._onPickStartFromTaskDialog)
         self._task_dialog_open = True
         self._open_task_dialog = dialog
@@ -8287,6 +8484,61 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         )
         # Show the new lane start on the Version tree (e.g. my-task/start).
         qt.QTimer.singleShot(0, lambda: self.onOpenHistoryGraph(pick_mode=False))
+
+    def _onUpdateTaskChosen(self, dialog, task: dict, juniors, description: str) -> None:
+        names = [str(name or "").strip() for name in (juniors or []) if str(name or "").strip()]
+        if not names:
+            dialog.set_status("Keep at least one junior on the task.", error=True)
+            return
+        title = normalize_task_title(description)
+        if not title:
+            dialog.set_status("Write a short description first.", error=True)
+            return
+        if not self._connected:
+            dialog.set_status("Connect with GitHub first.", error=True)
+            return
+        tid = str((task or {}).get("id") or "").strip()
+        if not tid:
+            dialog.set_status("Could not update this task.", error=True)
+            return
+        old_juniors = _task_junior_logins(task)
+        old_desc = normalize_task_title((task or {}).get("description") or "")
+        if (
+            {n.lower() for n in names} == {n.lower() for n in old_juniors}
+            and title == old_desc
+        ):
+            dialog.set_status("No changes to save.")
+            return
+        senior = str((task or {}).get("senior") or self._githubLogin() or "").strip()
+        label = _task_juniors_label({"juniors": names})
+        try:
+            message = build_project_message(
+                self._githubLogin(),
+                "updated the task for %s: %s" % (label, _task_excerpt(title)),
+                kind="task",
+            )
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            dialog.set_status(str(error).split("\n")[0], error=True)
+            return
+        message["task_op"] = "update"
+        message["task_id"] = tid
+        message["juniors"] = names
+        message["junior"] = names[0]
+        message["senior"] = senior
+        message["description"] = title
+        # Keep start / branch on the stored task; update only juniors + description.
+        for key in ("anchor_sha", "anchor_label", "branch_slug", "status"):
+            if (task or {}).get(key):
+                message[key] = task.get(key)
+        self._enqueueTaskMessage(message)
+        try:
+            dialog.refresh_tasks(getattr(self, "_project_tasks", []) or [])
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        dialog.set_status("Task updated for %s." % label)
+        self._appendFeed("Updated the task for %s." % label)
+        self._updateTaskButtonUi()
+        self._updateVersionActionButtons()
 
     def _onCancelTaskChosen(self, dialog, task: dict) -> None:
         juniors = _task_junior_logins(task)
