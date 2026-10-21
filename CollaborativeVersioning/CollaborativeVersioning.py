@@ -63,7 +63,8 @@ from CollaborativeVersioningLib.GitHubAuth import (
     connect_session,
     create_private_repository,
     decline_project_invitation,
-    delete_owned_repository,
+    delete_remote_owned_repository,
+    remove_local_project_dir,
     ensure_tools,
     ensure_project_info_branch,
     find_gh,
@@ -4181,7 +4182,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         can_delete = self._canDeleteProject()
         self.deleteButton.setStyleSheet(BTN_DELETE)
         self.deleteButton.setEnabled(True)
-        self.deleteButton.setToolTip("" if can_delete else self._deleteDisabledReason())
+        if not can_delete:
+            self.deleteButton.setToolTip(self._deleteDisabledReason())
+        elif self._canDeleteRemoteProject():
+            self.deleteButton.setToolTip(
+                "Remove this project on this computer and/or on GitHub"
+            )
+        elif self._isCurrentProjectLocalOnly():
+            self.deleteButton.setToolTip("Remove this project folder on this computer")
+        else:
+            self.deleteButton.setToolTip(
+                "Remove the local copy on this computer (GitHub stays)"
+            )
 
     def _isCurrentProjectOwner(self) -> bool:
         """Online owner (Delete / People Add). Local mode never counts as owner here."""
@@ -4254,17 +4266,23 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return ""
 
     def _canDeleteProject(self) -> bool:
-        return self._isCurrentProjectOwner()
+        """Local folder can always be removed on this machine; remote needs owner."""
+        return bool(self._hasWorkspaceSession() and self._hasSelectedProject())
+
+    def _canDeleteRemoteProject(self) -> bool:
+        """GitHub delete: Connected owner of a project that is on GitHub."""
+        if not self._connected or not self._isCurrentProjectOwner():
+            return False
+        if self._isCurrentProjectLocalOnly():
+            return False
+        return True
 
     def _deleteDisabledReason(self) -> str:
-        if not self._connected:
+        if not self._hasWorkspaceSession():
             return "Connect with GitHub first."
         if not self._hasSelectedProject():
             return "Select a project first."
-        repo = self._currentRemoteRepo()
-        if repo and repo.get("role") != "owner":
-            return "Only the owner can delete this project."
-        return "Select a project first."
+        return ""
 
     def _clearProjectSelection(self) -> None:
         self.projectCombo.blockSignals(True)
@@ -9142,6 +9160,158 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._refreshUiState()
         self._runNotificationChecks(announce=False)
 
+    def _promptDeleteProjectChoice(self, full_name: str) -> str:
+        """Return ``local``, ``remote_and_local``, or ``cancel``."""
+        can_remote = self._canDeleteRemoteProject()
+        local_only = self._isCurrentProjectLocalOnly()
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Delete project")
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setText("Delete project %s?" % full_name)
+        if can_remote:
+            box.setInformativeText(
+                "Choose what to remove. This cannot be undone.\n\n"
+                "• This computer only — keeps the GitHub project.\n"
+                "• GitHub and this computer — removes it for everyone.\n\n"
+                "Project data loaded in 3D Slicer will be unloaded."
+            )
+            local_btn = box.addButton(
+                "This computer only", qt.QMessageBox.AcceptRole
+            )
+            remote_btn = box.addButton(
+                "GitHub and this computer", qt.QMessageBox.DestructiveRole
+            )
+            cancel_btn = box.addButton("Cancel", qt.QMessageBox.RejectRole)
+            box.setDefaultButton(cancel_btn)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == local_btn:
+                return "local"
+            if clicked == remote_btn:
+                return "remote_and_local"
+            return "cancel"
+        if getattr(self, "_local_mode", False):
+            box.setInformativeText(
+                "Local mode — this removes the folder on this computer only.\n"
+                "Connect with GitHub to delete a project on GitHub.\n\n"
+                "Project data loaded in 3D Slicer will be unloaded."
+            )
+        elif local_only:
+            box.setInformativeText(
+                "This project is not on GitHub.\n\n"
+                "The folder on this computer will be removed.\n"
+                "Project data loaded in 3D Slicer will be unloaded."
+            )
+        else:
+            box.setInformativeText(
+                "Only the owner can delete this project on GitHub.\n\n"
+                "This removes the folder on this computer only.\n"
+                "The GitHub project is not deleted.\n\n"
+                "Project data loaded in 3D Slicer will be unloaded."
+            )
+        box.setStandardButtons(qt.QMessageBox.Yes | qt.QMessageBox.No)
+        box.setDefaultButton(qt.QMessageBox.No)
+        if box.exec_() != qt.QMessageBox.Yes:
+            return "cancel"
+        return "local"
+
+    def _resolveDeleteLocalPath(self, full_name: str) -> str:
+        """Folder for the *selected* project name — not whatever is currently open."""
+        name = str(full_name or "").strip()
+        if not name:
+            return ""
+        loaded = str(getattr(self, "_loaded_project_name", None) or "").strip()
+        path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if (
+            loaded
+            and loaded.lower() == name.lower()
+            and path
+            and os.path.isdir(path)
+        ):
+            return path
+        try:
+            login = self._githubLogin() or None
+            dest = local_project_dir(name, login)
+        except (GitHubAuthError, OSError, TypeError, ValueError):
+            return ""
+        return dest if dest and os.path.isdir(dest) else ""
+
+    def _deleteRemoteProjectWithPermission(self, full_name: str) -> bool:
+        """Delete GitHub repo only. Returns False if cancelled or failed."""
+        if has_delete_repo_scope() is False:
+            if not self._authorizeDeletePermission():
+                return False
+        try:
+            self._updateProgress("Deleting the GitHub project…")
+            delete_remote_owned_repository(full_name)
+            return True
+        except GitHubMissingDeletePermissionError:
+            self._closeProgress()
+            if not self._authorizeDeletePermission():
+                self._updateVersionActionButtons()
+                return False
+            self._openProgress("Delete project", "Deleting %s…" % full_name)
+            try:
+                self._updateProgress("Deleting the GitHub project…")
+                delete_remote_owned_repository(full_name)
+                return True
+            except GitHubAuthError as error:
+                self._closeProgress()
+                self._updateVersionActionButtons()
+                self._showGithubError(error, box=True)
+                return False
+        except GitHubAuthError as error:
+            self._closeProgress()
+            self._updateVersionActionButtons()
+            self._showGithubError(error, box=True)
+            return False
+
+    def _clearUiAfterProjectRemoved(self, full_name: str, *, drop_list_entry: bool) -> None:
+        name = str(full_name or "").strip()
+        if drop_list_entry and self._github_session is not None and name:
+            repos = list((self._github_session or {}).get("repos") or [])
+            self._github_session["repos"] = [
+                item for item in repos if item.get("full_name") != name
+            ]
+        loaded = str(getattr(self, "_loaded_project_name", None) or "").strip()
+        deleting_open = bool(
+            name and loaded and name.lower() == loaded.lower()
+        )
+        if deleting_open:
+            self._currentVersionId = None
+            self._server_pulled = False
+            self._updateProgress("Unloading data from 3D Slicer…")
+            self._unloadProjectSceneNodes()
+            self._loaded_project_name = None
+            self._local_project_path = None
+            self._project_scene_node_ids = []
+            self._clearChangeFlags()
+            try:
+                self.removeObservers(self._onAssetDataModified)
+            except Exception:
+                pass
+        self._closeProgress()
+        if not deleting_open and loaded:
+            # Combo still shows the deleted name — point it at the open project
+            # so _populateProjectCombo restores that selection.
+            self.projectCombo.blockSignals(True)
+            try:
+                for index in range(_qt_combo_count(self.projectCombo)):
+                    try:
+                        data = str(self.projectCombo.itemData(index) or "").strip()
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        data = ""
+                    if data.lower() == loaded.lower():
+                        self.projectCombo.setCurrentIndex(index)
+                        break
+            finally:
+                self.projectCombo.blockSignals(False)
+            self._populateProjectCombo()
+        else:
+            self._populateProjectCombo()
+            self._clearProjectSelection()
+        self._refreshUiState()
+
     def onDeleteProject(self) -> None:
         if not self._canDeleteProject():
             reason = self._deleteDisabledReason()
@@ -9149,69 +9319,55 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._showActionUnavailable(reason)
             return
         full_name = self._currentProjectName()
-        box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Delete project")
-        box.setIcon(qt.QMessageBox.Warning)
-        box.setText("Delete project %s?" % full_name)
-        box.setInformativeText(
-            "This cannot be undone.\n\n"
-            "The GitHub repository and the local folder will be removed.\n"
-            "Project data loaded in 3D Slicer will also be unloaded from the scene."
-        )
-        box.setStandardButtons(qt.QMessageBox.Yes | qt.QMessageBox.No)
-        box.setDefaultButton(qt.QMessageBox.No)
-        if box.exec_() != qt.QMessageBox.Yes:
+        choice = self._promptDeleteProjectChoice(full_name)
+        if choice == "cancel":
             return
-        if has_delete_repo_scope() is False:
-            if not self._authorizeDeletePermission():
-                return
-        self.deleteButton.setEnabled(False)
-        self._appendFeed("Deleting project %s…" % full_name)
-        self._openProgress("Delete project", "Deleting %s…" % full_name)
-        try:
-            self._updateProgress("Deleting the GitHub project…")
-            delete_owned_repository(full_name)
-        except GitHubMissingDeletePermissionError:
-            self._closeProgress()
-            if not self._authorizeDeletePermission():
-                self._updateVersionActionButtons()
-                return
-            self._openProgress("Delete project", "Deleting %s…" % full_name)
+        delete_remote = choice == "remote_and_local"
+        drop_list_entry = delete_remote or self._isCurrentProjectLocalOnly()
+        local_path = self._resolveDeleteLocalPath(full_name)
+        if not delete_remote and not local_path:
             try:
-                self._updateProgress("Deleting the GitHub project…")
-                delete_owned_repository(full_name)
-            except GitHubAuthError as error:
-                self._closeProgress()
-                self._updateVersionActionButtons()
-                self._showGithubError(error, box=True)
+                slicer.util.warningDisplay(
+                    "No local folder found for this project on this computer.",
+                    windowTitle="Delete project",
+                )
+            except TypeError:
+                slicer.util.warningDisplay(
+                    "No local folder found for this project on this computer."
+                )
+            return
+        self.deleteButton.setEnabled(False)
+        if delete_remote:
+            self._appendFeed("Deleting project %s on GitHub and this computer…" % full_name)
+        else:
+            self._appendFeed("Removing local copy of %s…" % full_name)
+        self._openProgress("Delete project", "Deleting %s…" % full_name)
+        if delete_remote:
+            if not self._deleteRemoteProjectWithPermission(full_name):
                 return
-        except GitHubAuthError as error:
+        try:
+            if local_path:
+                self._updateProgress("Removing the local folder…")
+                remove_local_project_dir(local_path)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._updateVersionActionButtons()
             self._showGithubError(error, box=True)
+            if delete_remote:
+                # Remote already gone — still clear UI so the list matches GitHub.
+                self._clearUiAfterProjectRemoved(
+                    full_name, drop_list_entry=True
+                )
+                self._appendFeed(
+                    "GitHub project deleted, but the local folder could not be removed.",
+                    error=True,
+                )
             return
-        repos = list((self._github_session or {}).get("repos") or [])
-        if self._github_session is not None:
-            self._github_session["repos"] = [
-                item for item in repos if item.get("full_name") != full_name
-            ]
-        self._currentVersionId = None
-        self._server_pulled = False
-        self._updateProgress("Unloading data from 3D Slicer…")
-        self._unloadProjectSceneNodes()
-        self._loaded_project_name = None
-        self._local_project_path = None
-        self._project_scene_node_ids = []
-        self._clearChangeFlags()
-        try:
-            self.removeObservers(self._onAssetDataModified)
-        except Exception:
-            pass
-        self._closeProgress()
-        self._populateProjectCombo()
-        self._clearProjectSelection()
-        self._refreshUiState()
-        self._appendFeed("Project deleted: %s" % full_name)
+        self._clearUiAfterProjectRemoved(full_name, drop_list_entry=drop_list_entry)
+        if delete_remote:
+            self._appendFeed("Project deleted on GitHub and this computer: %s" % full_name)
+        else:
+            self._appendFeed("Local copy removed: %s" % full_name)
 
     def _authorizeDeletePermission(self) -> bool:
         try:

@@ -3485,8 +3485,8 @@ def integrate_shared_lanes(repo_dir: str, lanes=None) -> None:
         )
 
 
-def delete_owned_repository(full_name: str) -> None:
-    """Delete a GitHub repository the signed-in user owns, and the local clone."""
+def delete_remote_owned_repository(full_name: str) -> None:
+    """Delete the GitHub repository (owner only). Does not touch the local folder."""
     ensure_tools()
     login = current_login()
     if not login:
@@ -3502,6 +3502,12 @@ def delete_owned_repository(full_name: str) -> None:
                 "GitHub needs an extra permission to delete a project."
             )
         raise_github_cli_error(detail, "Could not delete the project.")
+
+
+def delete_owned_repository(full_name: str) -> None:
+    """Delete a GitHub repository the signed-in user owns, and the local clone."""
+    delete_remote_owned_repository(full_name)
+    login = current_login()
     remove_local_project_dir(local_project_dir(full_name, login))
 
 
