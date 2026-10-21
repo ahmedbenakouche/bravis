@@ -3504,13 +3504,6 @@ def delete_remote_owned_repository(full_name: str) -> None:
         raise_github_cli_error(detail, "Could not delete the project.")
 
 
-def delete_owned_repository(full_name: str) -> None:
-    """Delete a GitHub repository the signed-in user owns, and the local clone."""
-    delete_remote_owned_repository(full_name)
-    login = current_login()
-    remove_local_project_dir(local_project_dir(full_name, login))
-
-
 def _split_project_name(full_name: str) -> tuple[str, str]:
     owner, _, repo = (full_name or "").partition("/")
     if not owner or not repo:
