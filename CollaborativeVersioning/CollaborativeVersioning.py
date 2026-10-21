@@ -2714,9 +2714,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         assetsForm.addRow("Segmentation:", self.segmentationSelector)
 
         ontologyPanel = qt.QWidget()
-        ontologyPanelLayout = qt.QVBoxLayout(ontologyPanel)
-        ontologyPanelLayout.setContentsMargins(0, 0, 0, 0)
-        ontologyPanelLayout.setSpacing(4)
+        ontologyRow = qt.QHBoxLayout(ontologyPanel)
+        ontologyRow.setContentsMargins(0, 0, 0, 0)
+        ontologyRow.setSpacing(4)
 
         self.ontologyPresetCombo = qt.QComboBox()
         self.ontologyPresetCombo.addItem(ONTOLOGY_COMBO_NONE_LABEL)
@@ -2725,20 +2725,27 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.ontologyPresetCombo.setStyleSheet(FIELD_STYLE)
         self._makeComboShrinkable(self.ontologyPresetCombo)
         self.ontologyPresetCombo.setCurrentIndex(ONTOLOGY_COMBO_NONE_INDEX)
-        ontologyPanelLayout.addWidget(self.ontologyPresetCombo)
-        ontologyLocalActions = qt.QHBoxLayout()
-        ontologyLocalActions.setContentsMargins(0, 0, 0, 0)
-        ontologyLocalActions.setSpacing(3)
-        self.ontologyHelpButton = qt.QPushButton("Help")
-        self.loadOntologyButton = qt.QPushButton("Load")
-        self.editOntologyButton = qt.QPushButton("Edit")
-        self.exportOntologyButton = qt.QPushButton("Export")
-        self.loadOntologyButton.setToolTip("Load ontology JSON")
-        for btn in (self.ontologyHelpButton, self.loadOntologyButton, self.editOntologyButton, self.exportOntologyButton):
-            btn.setStyleSheet(BTN_SECONDARY + " font-size: 9px; padding: 2px 4px;")
-            btn.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
-            ontologyLocalActions.addWidget(btn)
-        ontologyPanelLayout.addLayout(ontologyLocalActions)
+        ontologyRow.addWidget(self.ontologyPresetCombo, 1)
+
+        # One gear menu instead of four separate Help / Load / Edit / Export buttons.
+        self.ontologyMenuButton = qt.QToolButton()
+        self.ontologyMenuButton.setText("⚙")
+        self.ontologyMenuButton.setToolTip("Ontology options")
+        self.ontologyMenuButton.setPopupMode(qt.QToolButton.InstantPopup)
+        self.ontologyMenuButton.setAutoRaise(True)
+        self.ontologyMenuButton.setStyleSheet(
+            "QToolButton { font-size: 14px; padding: 2px 6px; border: 1px solid palette(mid); "
+            "border-radius: 4px; }"
+            "QToolButton::menu-indicator { image: none; width: 0; }"
+            "QToolButton:hover { border-color: %s; }" % (ACCENT_ICE or "#5b9fd4")
+        )
+        ontologyMenu = qt.QMenu(self.ontologyMenuButton)
+        self.ontologyHelpAction = ontologyMenu.addAction("Help…")
+        self.ontologyLoadAction = ontologyMenu.addAction("Load JSON…")
+        self.ontologyEditAction = ontologyMenu.addAction("Edit…")
+        self.ontologyExportAction = ontologyMenu.addAction("Export JSON…")
+        self.ontologyMenuButton.setMenu(ontologyMenu)
+        ontologyRow.addWidget(self.ontologyMenuButton, 0)
 
         assetsForm.addRow("Ontology map (JSON):", ontologyPanel)
         projectLayout.addLayout(assetsForm)
@@ -2794,10 +2801,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.notificationsBell.connect("clicked()", self._onNotificationsBellClicked)
         self.projectCombo.connect("currentIndexChanged(int)", self.onProjectChanged)
         self.ontologyPresetCombo.connect("currentIndexChanged(int)", self.onOntologyPresetChanged)
-        self.ontologyHelpButton.connect("clicked()", self.onOntologyJsonHelp)
-        self.loadOntologyButton.connect("clicked()", self.onLoadOntologyJson)
-        self.editOntologyButton.connect("clicked()", self.onEditOntology)
-        self.exportOntologyButton.connect("clicked()", self.onExportOntologyJson)
+        self.ontologyHelpAction.connect("triggered()", self.onOntologyJsonHelp)
+        self.ontologyLoadAction.connect("triggered()", self.onLoadOntologyJson)
+        self.ontologyEditAction.connect("triggered()", self.onEditOntology)
+        self.ontologyExportAction.connect("triggered()", self.onExportOntologyJson)
         self.createButton.connect("clicked()", self.onCreateProject)
         self.openButton.connect("clicked()", self.onOpenProject)
         self.saveVersionButton.connect("clicked()", self.onSaveVersion)
@@ -3381,10 +3388,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.volumeSelector.setEnabled(enabled)
         self.segmentationSelector.setEnabled(enabled)
         self.ontologyPresetCombo.setEnabled(enabled)
-        self.loadOntologyButton.setEnabled(enabled)
-        self.editOntologyButton.setEnabled(enabled)
-        self.exportOntologyButton.setEnabled(enabled)
-        self.ontologyHelpButton.setEnabled(True)
+        menu_btn = getattr(self, "ontologyMenuButton", None)
+        if menu_btn is not None:
+            menu_btn.setEnabled(True)
+        # Help stays available; Load / Edit / Export follow the project section.
+        help_action = getattr(self, "ontologyHelpAction", None)
+        if help_action is not None:
+            help_action.setEnabled(True)
+        for name in ("ontologyLoadAction", "ontologyEditAction", "ontologyExportAction"):
+            action = getattr(self, name, None)
+            if action is not None:
+                action.setEnabled(bool(enabled))
 
     def _buildRightDock(self) -> None:
         mainWin = slicer.util.mainWindow()
@@ -3876,9 +3890,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             "volumeSelector",
             "segmentationSelector",
             "ontologyPresetCombo",
-            "loadOntologyButton",
-            "editOntologyButton",
-            "exportOntologyButton",
+            "ontologyMenuButton",
             "createButton",
             "openButton",
             "saveVersionButton",
@@ -3890,6 +3902,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if widget is not None:
                 widget.setEnabled(enabled)
         if not enabled:
+            # Gear stays clickable for Help; other ontology actions stay off.
+            menu_btn = getattr(self, "ontologyMenuButton", None)
+            if menu_btn is not None:
+                menu_btn.setEnabled(True)
+            self._setProjectAssetFieldsEnabled(False)
             return
         self._setProjectAssetFieldsEnabled(True)
         self._updateVersionActionButtons()
