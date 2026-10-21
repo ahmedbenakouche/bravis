@@ -934,6 +934,42 @@ def _commit_tree_with_parent(
     return new_sha
 
 
+def _drop_empty_local_only_review_branch(repo_dir: str, branch: str, tip_sha: str) -> str:
+    """If a DIY local review branch has no unique commits and no origin tip, remove it.
+
+    Returns the SHA to treat as current (main tip when the branch was dropped).
+    Assigned/shared task branches (origin/cv-review/*) are left alone so …/start stays.
+    """
+    if not branch.startswith("cv-review/"):
+        return tip_sha
+    if _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch):
+        return tip_sha
+    main_tip = (
+        _git_rev_parse(repo_dir, "refs/heads/main")
+        or _git_rev_parse(repo_dir, "main")
+        or ""
+    )
+    tip = _git_rev_parse(repo_dir, tip_sha) or str(tip_sha or "").strip()
+    if not tip or not main_tip:
+        return tip_sha
+    # Still ahead of main with its own commits → keep the branch.
+    if tip.lower() != main_tip.lower() and _is_ancestor(repo_dir, main_tip, tip):
+        return tip_sha
+    # Diverged from main → do not auto-delete.
+    if tip.lower() != main_tip.lower() and not _is_ancestor(repo_dir, tip, main_tip):
+        return tip_sha
+    # tip == main or tip is on main's history → empty DIY lane after deleting
+    # the only local version; drop the branch and return to main.
+    login = current_login()
+    if login:
+        _configure_repo_identity(repo_dir, login)
+    checkout = _run_git(["checkout", "main"], cwd=repo_dir, timeout=30)
+    if checkout.returncode != 0:
+        return tip_sha
+    _run_git(["branch", "-D", branch], cwd=repo_dir, timeout=20)
+    return main_tip
+
+
 def delete_local_unshared_version(repo_dir: str, sha: str, lane: str = "main") -> str:
     """Drop a local commit that was never shared. Returns the SHA to check out after.
 
@@ -943,6 +979,9 @@ def delete_local_unshared_version(repo_dir: str, sha: str, lane: str = "main") -
     Tip → move branch to parent.
     Middle → rebuild newer commits with the same file trees onto the parent
     (no patch rebase — avoids conflicts on full project snapshots).
+
+    If that leaves a local-only review branch with no unique commits (DIY branch,
+    not an assigned task on origin), the empty branch is removed and main is checked out.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -984,7 +1023,7 @@ def delete_local_unshared_version(repo_dir: str, sha: str, lane: str = "main") -
         _configure_repo_identity(repo_dir, login)
     if target.lower() == branch_tip.lower():
         _checkout_branch_at(repo_dir, branch, parent)
-        return parent
+        return _drop_empty_local_only_review_branch(repo_dir, branch, parent)
     # Newer commits on the line (tip → … → child of target), tip first.
     newer = []
     for sha_on_line in chain:
@@ -1005,7 +1044,7 @@ def delete_local_unshared_version(repo_dir: str, sha: str, lane: str = "main") -
         message = str((commit_by_sha.get(old_sha) or {}).get("message") or "New version")
         new_parent = _commit_tree_with_parent(repo_dir, tree_sha, new_parent, message)
     _checkout_branch_at(repo_dir, branch, new_parent)
-    return new_parent
+    return _drop_empty_local_only_review_branch(repo_dir, branch, new_parent)
 
 
 def create_and_publish_task_branch(repo_dir: str, sha: str, branch_name: str) -> str:
@@ -2137,8 +2176,14 @@ def build_project_history_model(
     review_tips: dict[str, list[str]],
     unpushed: set[str] | None = None,
     shared_shas: set[str] | None = None,
+    start_stub_slugs: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Turn Git commits + review tips into version specs (DAG)."""
+    """Turn Git commits + review tips into version specs (DAG).
+
+    ``start_stub_slugs``: branch slugs allowed to show an empty ``…/start`` node
+    (assigned/shared task lanes). Local DIY branches must not get a start stub
+    when their only local commit is deleted.
+    """
     empty = {
         "commit_history": [],
         "version_specs": [],
@@ -2222,8 +2267,17 @@ def build_project_history_model(
             parent_id = id_by_sha.get(first)
             add_spec("%s/%d" % (slug, index), sha, parent_id, slug)
 
-    # Empty shared lanes (tip still on main): show a visible start node on the tree.
+    # Empty *task* lanes (tip still on main): show …/start. Only for slugs in
+    # start_stub_slugs (typically origin/cv-review/* after Assign), never for a
+    # local-only branch the user created themselves.
+    stub_ok = {
+        str(name or "").strip().lower()
+        for name in (start_stub_slugs or ())
+        if str(name or "").strip()
+    }
     for slug, tip in sorted(lane_tips.items()):
+        if str(slug).strip().lower() not in stub_ok:
+            continue
         prefix = "%s/" % slug
         if any(str(vid).startswith(prefix) for vid in specs_by_id):
             continue
@@ -2586,6 +2640,12 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
 
     unpushed = _unpushed_commit_shas(repo_dir)
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
+    # …/start only for shared task lanes (origin), not local DIY branches.
+    stub_slugs = {
+        str(name).strip().lower()
+        for name in remote_tips.keys()
+        if str(name).strip()
+    }
     model = build_project_history_model(
         commit_by_sha,
         main_tip,
@@ -2593,6 +2653,7 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
         review_tips,
         unpushed,
         shared_shas=shared_shas,
+        start_stub_slugs=stub_slugs,
     )
     if not model.get("version_specs"):
         return empty
@@ -2650,6 +2711,11 @@ def read_compare_project_histories(
     )
 
     # Shared = what GitHub has now (after fetch).
+    remote_stub_slugs = {
+        str(name).strip().lower()
+        for name in remote_review_tips.keys()
+        if str(name).strip()
+    }
     remote_model = empty
     if (origin or remote_review_tips) and commit_by_sha:
         remote_model = build_project_history_model(
@@ -2659,6 +2725,7 @@ def read_compare_project_histories(
             remote_review_tips,
             set(),
             shared_shas=shared_shas,
+            start_stub_slugs=remote_stub_slugs,
         )
 
     # Local = Version-tree freeze when it still covers this computer's tips.
@@ -2727,6 +2794,7 @@ def read_compare_project_histories(
             review_for_local,
             unpushed,
             shared_shas=shared_shas,
+            start_stub_slugs=remote_stub_slugs,
         )
     elif freeze_ok:
         local_model = dict(local_history)
@@ -2851,6 +2919,7 @@ def read_compare_project_histories(
             merged_tips,
             unpushed,
             shared_shas=shared_shas,
+            start_stub_slugs=remote_stub_slugs,
         )
 
     linear_model = _build_linear_integrate_preview(

@@ -9941,6 +9941,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             on_branch = False
             from_older_main = False
+        # Junior on …/start (task lane already exists): UI can show test/start while
+        # Git is still on main (same SHA). Attach to that branch — do not ask to
+        # "Create a branch".
+        if (
+            not on_branch
+            and self._shareNeedsApproval()
+            and self._attachGitToCurrentTaskStart(local_path)
+        ):
+            try:
+                on_branch = work_is_on_review_branch(local_path)
+            except (GitHubAuthError, OSError, RuntimeError, ValueError):
+                on_branch = False
         new_branch_slug = ""
         if not on_branch:
             # Junior: Create a branch only (cannot Share from main).
@@ -10150,6 +10162,39 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if slug:
                 slugs.add(slug.lower())
         return slugs
+
+    def _attachGitToCurrentTaskStart(self, local_path: str) -> bool:
+        """True when Git was attached to the junior's existing task …/start lane.
+
+        Used when the Version tree shows ``test/start`` (same SHA as main) but HEAD
+        is still on main — Save must continue on ``cv-review/test``, not offer
+        Create a branch.
+        """
+        version_id = str(getattr(self, "_currentVersionId", None) or "").strip()
+        if not version_id or not local_path:
+            return False
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        spec = None
+        for item in bundle.get("version_specs") or []:
+            if str((item or {}).get("id") or "").strip() == version_id:
+                spec = item
+                break
+        if not spec or not spec.get("lane_start"):
+            return False
+        lane = normalize_branch_slug(str(spec.get("branch") or "").strip())
+        if not lane:
+            return False
+        allowed = self._writableTaskLaneSlugs()
+        if allowed is None or lane.lower() not in allowed:
+            return False
+        sha = str((bundle.get("sha_by_id") or {}).get(version_id) or "").strip()
+        if not sha:
+            return False
+        try:
+            checkout_local_version(local_path, sha, lane)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            return False
+        return True
 
     def _isVersionWriteLocked(self, version_id: str) -> bool:
         allowed = self._writableTaskLaneSlugs()
