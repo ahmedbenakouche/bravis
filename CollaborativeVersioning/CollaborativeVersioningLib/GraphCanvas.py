@@ -1068,51 +1068,274 @@ def _annotation_collision_score(rects, obstacles):
     return score
 
 
-def _diff_annotation_layout(box, text_w, text_h, side):
-    """Return (pointer_poly_points, pointer_bounds, label_pos, label_bounds) for left/right."""
-    mid_y = box.center().y()
+def _diff_pointer_at_box(box, side):
+    """Triangle glued to the dashed box; attach point is where a leader line starts."""
+    mid_x = float(box.center().x())
+    mid_y = float(box.center().y())
     if side == "right":
-        tip_x = box.right() + 4
-        outer_x = tip_x + 12
+        tip_x = float(box.right()) + 4.0
+        outer_x = tip_x + 12.0
         points = [
             qt.QPointF(tip_x, mid_y),
-            qt.QPointF(outer_x, mid_y - 8),
-            qt.QPointF(outer_x, mid_y + 8),
+            qt.QPointF(outer_x, mid_y - 8.0),
+            qt.QPointF(outer_x, mid_y + 8.0),
         ]
-        pointer_bounds = qt.QRectF(tip_x, mid_y - 8, outer_x - tip_x, 16)
-        label_x = outer_x + 8
-        label_y = mid_y - text_h / 2.0
-    else:
-        tip_x = box.left() - 4
-        outer_x = tip_x - 12
+        pointer_bounds = qt.QRectF(tip_x, mid_y - 8.0, outer_x - tip_x, 16.0)
+        attach = (outer_x, mid_y)
+    elif side == "left":
+        tip_x = float(box.left()) - 4.0
+        outer_x = tip_x - 12.0
         points = [
             qt.QPointF(tip_x, mid_y),
-            qt.QPointF(outer_x, mid_y - 8),
-            qt.QPointF(outer_x, mid_y + 8),
+            qt.QPointF(outer_x, mid_y - 8.0),
+            qt.QPointF(outer_x, mid_y + 8.0),
         ]
-        pointer_bounds = qt.QRectF(outer_x, mid_y - 8, tip_x - outer_x, 16)
-        label_x = outer_x - text_w - 8
+        pointer_bounds = qt.QRectF(outer_x, mid_y - 8.0, tip_x - outer_x, 16.0)
+        attach = (outer_x, mid_y)
+    elif side == "above":
+        tip_y = float(box.top()) - 4.0
+        outer_y = tip_y - 12.0
+        points = [
+            qt.QPointF(mid_x, tip_y),
+            qt.QPointF(mid_x - 8.0, outer_y),
+            qt.QPointF(mid_x + 8.0, outer_y),
+        ]
+        pointer_bounds = qt.QRectF(mid_x - 8.0, outer_y, 16.0, tip_y - outer_y)
+        attach = (mid_x, outer_y)
+    else:  # below
+        tip_y = float(box.bottom()) + 4.0
+        outer_y = tip_y + 12.0
+        points = [
+            qt.QPointF(mid_x, tip_y),
+            qt.QPointF(mid_x - 8.0, outer_y),
+            qt.QPointF(mid_x + 8.0, outer_y),
+        ]
+        pointer_bounds = qt.QRectF(mid_x - 8.0, tip_y, 16.0, outer_y - tip_y)
+        attach = (mid_x, outer_y)
+    return points, pointer_bounds, attach
+
+
+def _diff_label_placement(box, text_w, text_h, side, gap):
+    """Caption rect on ``side`` of ``box``, with ``gap`` from the box edge to the text."""
+    mid_x = float(box.center().x())
+    mid_y = float(box.center().y())
+    text_w = float(text_w)
+    text_h = float(text_h)
+    gap = float(gap)
+    if side == "right":
+        label_x = float(box.right()) + gap
         label_y = mid_y - text_h / 2.0
+    elif side == "left":
+        label_x = float(box.left()) - gap - text_w
+        label_y = mid_y - text_h / 2.0
+    elif side == "above":
+        label_x = mid_x - text_w / 2.0
+        label_y = float(box.top()) - gap - text_h
+    else:  # below
+        label_x = mid_x - text_w / 2.0
+        label_y = float(box.bottom()) + gap
     label_bounds = qt.QRectF(label_x, label_y, text_w, text_h)
-    return points, pointer_bounds, (label_x, label_y), label_bounds
+    return (label_x, label_y), label_bounds
 
 
-def _pick_diff_annotation_side(box, text_w, text_h, obstacles):
-    """Prefer the side where pointer + caption do not cover other nodes."""
+def _label_edge_anchor(label_bounds, from_x, from_y, gap=3.0):
+    """Outside point on the caption rectangle edge closest to the pointer.
+
+    The leader stops here so it meets the text box without entering the glyphs.
+    """
+    left = float(label_bounds.left())
+    right = float(label_bounds.right())
+    top = float(label_bounds.top())
+    bottom = float(label_bounds.bottom())
+    fx, fy = float(from_x), float(from_y)
+    gap = float(gap)
+    if fx < left:
+        return (left - gap, min(max(fy, top), bottom))
+    if fx > right:
+        return (right + gap, min(max(fy, top), bottom))
+    if fy < top:
+        return (min(max(fx, left), right), top - gap)
+    if fy > bottom:
+        return (min(max(fx, left), right), bottom + gap)
+    to_left = fx - left
+    to_right = right - fx
+    to_top = fy - top
+    to_bottom = bottom - fy
+    nearest = min(to_left, to_right, to_top, to_bottom)
+    if nearest == to_left:
+        return (left - gap, fy)
+    if nearest == to_right:
+        return (right + gap, fy)
+    if nearest == to_top:
+        return (fx, top - gap)
+    return (fx, bottom + gap)
+
+
+def _diff_annotation_needs_leader(attach, leader_end, min_gap=10.0):
+    dx = float(leader_end[0]) - float(attach[0])
+    dy = float(leader_end[1]) - float(attach[1])
+    return (dx * dx + dy * dy) ** 0.5 >= float(min_gap)
+
+
+def _segment_as_rect(x1, y1, x2, y2, thickness=3.0):
+    """Axis-aligned band covering a leader segment (diagonal → bounding box)."""
+    x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+    t = float(thickness)
+    if abs(x1 - x2) < 0.5:
+        return qt.QRectF(min(x1, x2) - t / 2.0, min(y1, y2), t, abs(y2 - y1))
+    if abs(y1 - y2) < 0.5:
+        return qt.QRectF(min(x1, x2), min(y1, y2) - t / 2.0, abs(x2 - x1), t)
+    return qt.QRectF(
+        min(x1, x2) - t / 2.0,
+        min(y1, y2) - t / 2.0,
+        abs(x2 - x1) + t,
+        abs(y2 - y1) + t,
+    )
+
+
+def _polyline_collision_score(points, obstacles):
+    score = 0.0
+    for index in range(len(points) - 1):
+        x1, y1 = points[index]
+        x2, y2 = points[index + 1]
+        band = _segment_as_rect(x1, y1, x2, y2, thickness=4.0)
+        score += _annotation_collision_score((band,), obstacles)
+    return score
+
+
+def _leader_route_obstacle_rects(route):
+    """Fat bands for a placed leader so later captions/lines avoid it."""
+    rects = []
+    if not route or len(route) < 2:
+        return rects
+    for index in range(len(route) - 1):
+        x1, y1 = route[index]
+        x2, y2 = route[index + 1]
+        rects.append(_segment_as_rect(x1, y1, x2, y2, thickness=8.0))
+    return rects
+
+
+def _diff_leader_route_candidates(attach, leader_end, box):
+    """Straight + orthogonal L/U routes; gutters dodge nodes on the trunk."""
+    ax, ay = float(attach[0]), float(attach[1])
+    ex, ey = float(leader_end[0]), float(leader_end[1])
+    routes = [
+        [(ax, ay), (ex, ey)],
+        [(ax, ay), (ax, ey), (ex, ey)],
+        [(ax, ay), (ex, ay), (ex, ey)],
+    ]
+    gutter = 22.0
+    for gx in (
+        float(box.left()) - gutter,
+        float(box.right()) + gutter,
+        float(box.left()) - gutter - 36.0,
+        float(box.right()) + gutter + 36.0,
+    ):
+        routes.append([(ax, ay), (gx, ay), (gx, ey), (ex, ey)])
+    return routes
+
+
+def _best_diff_leader_route(attach, leader_end, box, obstacles):
+    """Leader polyline with the least crossings of nodes / other captions / lines."""
+    if not _diff_annotation_needs_leader(attach, leader_end):
+        return [], 0.0
+    best_route = None
+    best_score = None
+    for route in _diff_leader_route_candidates(attach, leader_end, box):
+        score = _polyline_collision_score(route, obstacles)
+        bends = max(0, len(route) - 2)
+        length = 0.0
+        for index in range(len(route) - 1):
+            dx = route[index + 1][0] - route[index][0]
+            dy = route[index + 1][1] - route[index][1]
+            length += (dx * dx + dy * dy) ** 0.5
+        rank = (score, bends, length)
+        if best_score is None or rank < best_score:
+            best_score = rank
+            best_route = route
+    return best_route or [(attach[0], attach[1]), (leader_end[0], leader_end[1])], (
+        best_score[0] if best_score else 0.0
+    )
+
+
+def _pick_diff_annotation_placement(box, text_w, text_h, obstacles):
+    """Pick side + distance: triangle on the node, leader to the caption edge.
+
+    Avoids overlapping other nodes, other captions, and other leader lines.
+    The leader meets the nearest outside edge of the text rectangle (not its
+    center), so the line does not cut through the glyphs.
+    """
+    base_gap = 28.0
+    step_gap = 18.0
+    max_steps = 14
+    side_tie = {"left": 0.0, "right": 0.02, "above": 0.04, "below": 0.06}
     best = None
-    for side in ("left", "right"):
-        points, pointer_bounds, label_pos, label_bounds = _diff_annotation_layout(
-            box, text_w, text_h, side
+    for side in ("left", "right", "above", "below"):
+        points, pointer_bounds, attach = _diff_pointer_at_box(box, side)
+        for step in range(max_steps):
+            gap = base_gap + step * step_gap
+            label_pos, label_bounds = _diff_label_placement(
+                box, text_w, text_h, side, gap
+            )
+            leader_end = _label_edge_anchor(
+                label_bounds, attach[0], attach[1], gap=3.0
+            )
+            label_score = _annotation_collision_score(
+                (pointer_bounds, label_bounds), obstacles
+            )
+            leader_route, leader_score = _best_diff_leader_route(
+                attach, leader_end, box, obstacles
+            )
+            score = label_score + leader_score
+            rank = (
+                score,
+                step,
+                side_tie.get(side, 0.1),
+                side,
+                points,
+                pointer_bounds,
+                label_pos,
+                label_bounds,
+                leader_route,
+            )
+            if best is None or rank[:3] < best[:3]:
+                best = rank
+            if score <= 0.0:
+                break
+    if best is None:
+        points, pointer_bounds, attach = _diff_pointer_at_box(box, "left")
+        label_pos, label_bounds = _diff_label_placement(
+            box, text_w, text_h, "left", base_gap
         )
-        score = _annotation_collision_score(
-            (pointer_bounds, label_bounds), obstacles
+        leader_end = _label_edge_anchor(label_bounds, attach[0], attach[1], gap=3.0)
+        leader_route, _leader_score = _best_diff_leader_route(
+            attach, leader_end, box, obstacles
         )
-        # Slight preference for left when both are clear (stable reading).
-        tie = 0.0 if side == "left" else 0.01
-        candidate = (score + tie, side, points, pointer_bounds, label_pos, label_bounds)
-        if best is None or candidate[0] < best[0]:
-            best = candidate
-    return best[1:]
+        return (
+            "left",
+            points,
+            pointer_bounds,
+            label_pos,
+            label_bounds,
+            leader_route,
+        )
+    return best[3:]
+
+
+def _draw_diff_leader(scene, route, color):
+    """Dotted polyline from node triangle to the caption rectangle edge."""
+    if not route or len(route) < 2:
+        return None
+    pen = qt.QPen(qt.QColor(color), 1, qt.Qt.DotLine)
+    fit = None
+    for index in range(len(route) - 1):
+        x1, y1 = route[index]
+        x2, y2 = route[index + 1]
+        item = scene.addLine(float(x1), float(y1), float(x2), float(y2), pen)
+        if item is not None and hasattr(item, "boundingRect"):
+            bounds = item.boundingRect()
+            fit = bounds if fit is None else fit.united(bounds)
+    return fit
 
 
 def _draw_diff_region(
@@ -1127,8 +1350,9 @@ def _draw_diff_region(
 ):
     """Dashed box + pointer + caption per marked node (red diff or green result).
 
-    One box per node. Each has its own arrow and text, placed on the
-    left or right so they avoid overlapping other version nodes (and each other).
+    Triangle stays on the marked node. Caption is placed clear of other nodes /
+    captions / leaders; the dotted leader meets the nearest edge of the text
+    rectangle and avoids crossing other annotation lines.
 
     Returns a QRectF covering boxes + pointers + captions (for fitInView), or None.
     """
@@ -1181,15 +1405,26 @@ def _draw_diff_region(
             rect for nid, rect in node_obstacles.items() if nid != node_id
         ]
         blockers.extend(placed_annotations)
-        _side, points, pointer_bounds, label_pos, label_bounds = (
-            _pick_diff_annotation_side(box, text_w, text_h, blockers)
-        )
+        (
+            _side,
+            points,
+            pointer_bounds,
+            label_pos,
+            label_bounds,
+            leader_route,
+        ) = _pick_diff_annotation_placement(box, text_w, text_h, blockers)
         scene.addPolygon(
             qt.QPolygonF(points),
             qt.QPen(qt.QColor(mark), 1),
             qt.QBrush(qt.QColor(mark)),
         )
         fit = fit.united(pointer_bounds)
+        if text and leader_route and len(leader_route) >= 2:
+            leader_bounds = _draw_diff_leader(scene, leader_route, mark)
+            if leader_bounds is not None:
+                fit = fit.united(leader_bounds)
+            for band in _leader_route_obstacle_rects(leader_route):
+                placed_annotations.append(band)
         if text:
             label = scene.addText(text)
             label.setFont(qt.QFont("Arial", 8))
@@ -1197,7 +1432,7 @@ def _draw_diff_region(
             label.setPos(label_pos[0], label_pos[1])
             fit = fit.united(label_bounds)
             placed_annotations.append(pointer_bounds)
-            placed_annotations.append(label_bounds.adjusted(-4, -2, 4, 2))
+            placed_annotations.append(label_bounds.adjusted(-6, -4, 6, 4))
     return fit
 
 
