@@ -5367,22 +5367,43 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._appendFeed(text, error=True)
 
     def _signInThenConnect(self) -> dict | None:
+        # Same instructions before and after opening the console; only the
+        # primary button changes (Open sign-in window → I have signed in).
+        sign_in_steps = (
+            "A GitHub sign-in window will open. "
+            "Complete these steps there:\n\n"
+            "1. Choose Yes if asked to authenticate Git with your GitHub credentials.\n"
+            "2. A one-time code is shown in that window (it is also copied to the clipboard).\n"
+            "3. Press Enter to open the browser at github.com/login/device.\n"
+            "4. If needed, sign in to your GitHub account in the browser "
+            "(email and password, or your usual GitHub sign-in).\n"
+            "5. Paste the one-time code in the browser and authorize GitHub.\n\n"
+            "When that is done, click I have signed in."
+        )
+        # Show steps first so the sign-in console does not cover the instructions.
+        prep = qt.QMessageBox(slicer.util.mainWindow())
+        prep.setWindowTitle("GitHub sign-in")
+        prep.setText(sign_in_steps)
+        prep.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
+        prep.button(qt.QMessageBox.Ok).setText("Open sign-in window")
+        prep.setDefaultButton(qt.QMessageBox.Ok)
+        if prep.exec_() != qt.QMessageBox.Ok:
+            self.connectButton.setEnabled(True)
+            self.connectionStatusLabel.text = "Not connected"
+            self.connectionStatusLabel.setStyleSheet(STATUS_NEUTRAL)
+            self._appendFeed("GitHub sign-in cancelled.")
+            return None
+
         try:
             open_login_window()
         except GitHubAuthError as error:
             self._connectFailed(error)
             return None
         self._appendFeed("GitHub sign-in window opened.")
+
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("GitHub sign-in")
-        box.setText(
-            "A GitHub sign-in window opened. Complete these steps there:\n\n"
-            "1. Choose Yes if asked to authenticate Git with your GitHub credentials.\n"
-            "2. A one-time code is shown in that window (it is also copied to the clipboard).\n"
-            "3. Press Enter to open the browser at github.com/login/device.\n"
-            "4. Paste the one-time code in the browser and authorize GitHub.\n\n"
-            "When that is done, click I have signed in."
-        )
+        box.setText(sign_in_steps)
         box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
         box.button(qt.QMessageBox.Ok).setText("I have signed in")
         box.setDefaultButton(qt.QMessageBox.Ok)
