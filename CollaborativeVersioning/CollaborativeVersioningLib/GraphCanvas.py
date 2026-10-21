@@ -530,10 +530,23 @@ def branch_color(branch):
 
 
 def _ranges_overlap(first, second):
-    return not (first[1] < second[0] or second[1] < first[0])
+    """True when ranges share a row or merely touch.
+
+    Touching spans still conflict: a fork edge travels vertically through the
+    parent row into the child row, so an adjacent branch in the same column
+    would sit on that corridor (nodes/edges overlapping).
+    """
+    return not (first[1] + 1 < second[0] or second[1] + 1 < first[0])
 
 
 def _side_branch_spans(specs, rows):
+    """Row ranges each side branch occupies, including fork/merge corridors.
+
+    For every side node we reserve from its parent row through the node row so
+    another lane cannot reuse that column while our vertical edge is still
+    traveling (classic bug: empty task stub + later branch stacked in one
+    column with edges cutting through the stub).
+    """
     specs_by_id = {spec["id"]: spec for spec in specs or []}
     spans = {}
     for spec in specs or []:
@@ -541,11 +554,16 @@ def _side_branch_spans(specs, rows):
         if branch == "main":
             continue
         row = rows.get(spec["id"], 0)
+        lo = row
+        hi = row
+        parent_id = spec.get("parent")
+        if parent_id and parent_id in rows:
+            lo = min(lo, rows[parent_id])
         current = spans.get(branch)
         if current is None:
-            spans[branch] = (row, row)
+            spans[branch] = (lo, hi)
         else:
-            spans[branch] = (min(current[0], row), max(current[1], row))
+            spans[branch] = (min(current[0], lo), max(current[1], hi))
     for spec in specs or []:
         if not spec.get("merge"):
             continue
@@ -561,7 +579,11 @@ def _side_branch_spans(specs, rows):
 
 
 def _assign_side_lanes(specs, rows):
-    """Closest free column: right of main, then left, then further out. Reuse when ranges do not overlap."""
+    """Closest free column: right of main, then left, then further out.
+
+    Columns may be reused only when reserved row corridors do not overlap or
+    touch — so edges never run through another branch's nodes.
+    """
     assigned = {"main": 0}
     occupied = defaultdict(list)
     spans = _side_branch_spans(specs, rows)
