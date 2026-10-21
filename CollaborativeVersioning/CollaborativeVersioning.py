@@ -5258,6 +5258,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._replaceSessionReposMerged(remote_repos, login)
         full_name = created["full_name"]
         local_path = created.get("local_path") or ""
+        # Drop the previous project's Version tree — its clicks / timers must not
+        # fire a Switch-version prompt against the new project.
+        self._closeHistoryDialog()
         self.projectCombo.blockSignals(True)
         self._populateProjectCombo()
         restore = -1
@@ -5275,9 +5278,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._local_project_path = local_path
         self._server_pulled = True
         self.projectCombo.blockSignals(False)
-        self._applyProjectHistoryBundle(history)
+        # Clear stale version id (e.g. main/2 of the source project) so history
+        # table refresh does not try to checkout another tip with a Save prompt.
+        self._suppress_history_selection_signal = True
         self._suppress_dirty += 1
         try:
+            self._currentVersionId = None
+            self._applyProjectHistoryBundle(history, follow_head=True)
             # Match Open-project naming in the scene; original files outside the project stay untouched.
             self._alignProjectAssetNodeNames(volume_node, segmentation_node, config["name"])
             self._rememberProjectSceneNodes(volume_node, segmentation_node)
@@ -5290,6 +5297,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._refreshUiState()
         finally:
             self._suppress_dirty -= 1
+            self._suppress_history_selection_signal = False
         self._clearChangeFlags()
         self._updateVersionActionButtons()
         self._armLoadSettle()
