@@ -578,29 +578,167 @@ def _side_branch_spans(specs, rows):
     return spans
 
 
-def _assign_side_lanes(specs, rows):
-    """Closest free column: right of main, then left, then further out.
+def _branch_fork_parent(specs, rows):
+    """Map each side branch to the branch it forked from (often ``main``).
 
-    Columns may be reused only when reserved row corridors do not overlap or
-    touch — so edges never run through another branch's nodes.
+    Uses the earliest node of the branch whose parent lies on another branch.
+    """
+    specs_by_id = {spec["id"]: spec for spec in specs or []}
+    best = {}
+    for spec in specs or []:
+        branch = spec.get("branch") or "main"
+        if branch == "main":
+            continue
+        parent_id = spec.get("parent")
+        if not parent_id:
+            continue
+        parent_spec = specs_by_id.get(parent_id) or {}
+        parent_branch = parent_spec.get("branch") or "main"
+        if parent_branch == branch:
+            continue
+        row = rows.get(spec["id"], 0)
+        previous = best.get(branch)
+        if previous is None or row < previous[0]:
+            best[branch] = (row, parent_branch)
+    return {name: parent for name, (_row, parent) in best.items()}
+
+
+def _lane_free_for_span(occupied, lane, span):
+    if lane == 0:
+        return False
+    return all(not _ranges_overlap(span, other) for other in occupied[lane])
+
+
+def _rebuild_lane_occupation(assigned, spans):
+    occupied = defaultdict(list)
+    for branch, lane in assigned.items():
+        if branch == "main" or branch not in spans:
+            continue
+        occupied[lane].append(spans[branch])
+    return occupied
+
+
+def _shift_same_side_outward(assigned, spans, sign, min_abs_lane):
+    """Move every branch on this side of main with |lane| >= min_abs one step out.
+
+    Opens a column between ``main`` and a parent so a sub-branch can sit on the
+    inner side of that parent (bilateral placement around a side branch).
+    """
+    for branch, lane in list(assigned.items()):
+        if branch == "main" or lane * sign <= 0:
+            continue
+        if abs(lane) >= min_abs_lane:
+            assigned[branch] = lane + sign
+    return _rebuild_lane_occupation(assigned, spans)
+
+
+def _assign_side_lanes(specs, rows):
+    """Assign columns: main-rooted like before; sub-branches nest around their parent.
+
+    - Forks from ``main``: closest free column (+1, -1, +2, -2, …).
+    - Forks from a side branch A: treat A as a local main — same ±1, ±2 pattern
+      relative to A (outer then inner), always on A's side of ``main``. When the
+      inner slot is blocked (by main or by a cousin like F already between main
+      and A), shift A (and everything further out) by one so the child sits
+      inward: ``main|B2|A|B1`` or ``main|F|B2|A|B1``.
+    Columns may be reused only when reserved row corridors do not overlap/touch.
     """
     assigned = {"main": 0}
-    occupied = defaultdict(list)
     spans = _side_branch_spans(specs, rows)
-    for branch in sorted(spans, key=lambda name: (spans[name][0], name)):
+    occupied = defaultdict(list)
+    fork_parent = _branch_fork_parent(specs, rows)
+
+    def branch_depth(name):
+        seen = set()
+        depth = 0
+        current = name
+        while current in fork_parent and current not in seen:
+            seen.add(current)
+            parent = fork_parent[current]
+            if parent == "main" or parent not in spans:
+                return depth + 1
+            depth += 1
+            current = parent
+            if depth > 64:
+                break
+        return depth
+
+    ordered = sorted(
+        spans.keys(),
+        key=lambda name: (branch_depth(name), spans[name][0], name),
+    )
+
+    for branch in ordered:
         span = spans[branch]
+        parent = fork_parent.get(branch, "main")
+        if parent == "main" or parent not in assigned:
+            parent_lane = 0
+        else:
+            parent_lane = assigned[parent]
+
         chosen = None
-        for offset in range(1, 24):
-            for lane in (offset, -offset):
-                if all(not _ranges_overlap(span, other) for other in occupied[lane]):
+
+        if parent_lane == 0:
+            # Same as before: around main.
+            for offset in range(1, 48):
+                for lane in (offset, -offset):
+                    if _lane_free_for_span(occupied, lane, span):
+                        chosen = lane
+                        break
+                if chosen is not None:
+                    break
+        else:
+            sign = 1 if parent_lane > 0 else -1
+            for offset in range(1, 48):
+                # Local mini-main order: +offset then -offset relative to parent.
+                for relative in (offset, -offset):
+                    lane = parent_lane + sign * relative
+                    if relative < 0:
+                        # Inner side of parent: open a column when blocked by main
+                        # OR by a cousin already between main and parent (e.g. F),
+                        # same as inserting B2 in main|B2|A|B1 — also yields
+                        # main|F|B2|A|B1 when F is already there.
+                        need_shift = lane * sign <= 0 or not _lane_free_for_span(
+                            occupied, lane, span
+                        )
+                        while need_shift:
+                            occupied = _shift_same_side_outward(
+                                assigned, spans, sign, abs(parent_lane)
+                            )
+                            parent_lane = assigned[parent]
+                            lane = parent_lane - sign * abs(relative)
+                            if lane * sign <= 0:
+                                need_shift = True
+                                continue
+                            need_shift = not _lane_free_for_span(
+                                occupied, lane, span
+                            )
+                            # Avoid infinite push if something odd remains.
+                            if abs(parent_lane) > 64:
+                                break
+                    if lane * sign <= 0:
+                        continue
+                    if _lane_free_for_span(occupied, lane, span):
+                        chosen = lane
+                        break
+                if chosen is not None:
+                    break
+
+        if chosen is None:
+            side = 1 if parent_lane >= 0 else -1
+            for offset in range(1, 48):
+                lane = side * offset
+                if _lane_free_for_span(occupied, lane, span):
                     chosen = lane
                     break
-            if chosen is not None:
-                break
-        if chosen is None:
-            chosen = max(assigned.values(), default=0) + 1
+            if chosen is None:
+                chosen = max((abs(v) for v in assigned.values()), default=0) + 1
+                if parent_lane < 0:
+                    chosen = -chosen
+
         assigned[branch] = chosen
-        occupied[chosen].append(span)
+        occupied = _rebuild_lane_occupation(assigned, spans)
+
     return assigned
 
 
