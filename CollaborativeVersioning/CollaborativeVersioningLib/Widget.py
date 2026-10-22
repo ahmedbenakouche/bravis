@@ -6416,12 +6416,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             ):
                 self._updateProgress("Snapshotting local versions…")
                 local_snapshot = read_project_history(local_path)
-            # Lock Version-tree remote tips to what is already displayed *before* peek-fetch,
-            # so a later Open does not absorb Compare-only origin updates.
-            peek_caps = derive_remote_sync_caps_from_history(local_path, local_snapshot)
-            save_remote_sync_caps(local_path, peek_caps)
+                if saved_bundle is None:
+                    saved_bundle = copy.deepcopy(local_snapshot)
+            # Isolate freeze from Compare internals (shallow copies must not mutate UI).
+            local_snapshot = copy.deepcopy(local_snapshot)
             self._updateProgress("Reading the shared project…")
             fetch_remote_updates(local_path)
+            # Caps from the freeze *after* fetch so tip walks see full commit graphs,
+            # but still only acknowledge SHAs already on the Version tree (no absorb).
+            peek_caps = derive_remote_sync_caps_from_history(local_path, local_snapshot)
+            save_remote_sync_caps(local_path, peek_caps)
             self._updateProgress("Building version graphs…")
             # Local = frozen Version tree; Remote = origin/* after fetch; diff = SHA Δ.
             compare = read_compare_project_histories(

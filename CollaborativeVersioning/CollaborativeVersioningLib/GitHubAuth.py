@@ -1961,13 +1961,114 @@ def _unpushed_commit_shas(repo_dir: str) -> set[str]:
 
 
 def fetch_remote_updates(repo_dir: str) -> None:
-    """Fetch remote refs into .git only. Does not change HEAD or the worktree."""
+    """Fetch remote refs into .git only. Does not change HEAD or the worktree.
+
+    Always refreshes ``origin/cv-review/*`` explicitly — a plain ``fetch`` can
+    leave stale tracking tips (e.g. still on …/start) when Compare reopens.
+    """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
     fetch = _run_git(["fetch", "origin"], cwd=repo_dir, timeout=180)
     if fetch.returncode != 0:
         detail = (fetch.stderr or fetch.stdout or "").strip()
         raise_github_cli_error(detail, "Could not get the latest shared versions.")
+    # Force task-lane tracking refs to match GitHub (Shared Compare truth).
+    _sync_origin_review_tips_from_ls_remote(repo_dir)
+
+
+def _sync_origin_review_tips_from_ls_remote(repo_dir: str) -> dict[str, list[str]]:
+    """Resolve ``cv-review/*`` tips from GitHub and fast-forward local origin/* refs.
+
+    Returns slug → [tip_sha] for Compare Shared. Never rewinds a tracking tip
+    that is already ahead of GitHub (should not happen after a normal fetch).
+    """
+    tips: dict[str, list[str]] = {}
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return tips
+    listed = _run_git(
+        ["ls-remote", "--refs", "origin", "refs/heads/cv-review/*"],
+        cwd=repo_dir,
+        timeout=120,
+    )
+    if listed.returncode != 0:
+        # Offline / auth — fall back to whatever origin/* already has.
+        return _review_tips(repo_dir, remote_only=True)
+    for line in (listed.stdout or "").splitlines():
+        text = line.strip()
+        if not text or "\t" not in text:
+            continue
+        sha, ref = text.split("\t", 1)
+        sha = str(sha or "").strip()
+        ref = str(ref or "").strip()
+        slug = _review_login_from_ref(ref)
+        if not sha or not slug:
+            continue
+        key = slug.lower()
+        tips[key] = [sha]
+        tracking = "refs/remotes/origin/cv-review/%s" % slug
+        current = _git_rev_parse(repo_dir, tracking)
+        if current == sha:
+            continue
+        # Fetch the commit object if this clone does not have it yet.
+        if not _git_rev_parse(repo_dir, sha):
+            got = _run_git(
+                ["fetch", "origin", "%s:refs/remotes/origin/cv-review/%s" % (ref, slug)],
+                cwd=repo_dir,
+                timeout=180,
+            )
+            if got.returncode != 0:
+                got = _run_git(["fetch", "origin", sha], cwd=repo_dir, timeout=180)
+                if got.returncode != 0:
+                    continue
+        _run_git(["update-ref", tracking, sha], cwd=repo_dir, timeout=20)
+    # Keep any origin tips ls-remote omitted (deleted remotely) from for-each-ref.
+    for login, bucket in _review_tips(repo_dir, remote_only=True).items():
+        key = str(login or "").strip().lower()
+        if key and key not in tips and bucket:
+            tips[key] = list(bucket)
+    return tips
+
+
+def _farthest_tip(commit_by_sha: dict[str, dict], tips) -> str:
+    """Prefer the tip that has the others as ancestors (newest on the lane)."""
+    candidates = []
+    if isinstance(tips, str):
+        text = tips.strip()
+        if text:
+            candidates.append(text)
+    elif isinstance(tips, (list, tuple)):
+        for tip in tips:
+            text = str(tip or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+    if not candidates:
+        return ""
+    if len(candidates) == 1:
+        return candidates[0]
+    best = candidates[0]
+    for cand in candidates[1:]:
+        best_reach = _all_reachable_shas(commit_by_sha, best) if commit_by_sha else set()
+        cand_reach = _all_reachable_shas(commit_by_sha, cand) if commit_by_sha else set()
+        if best in cand_reach and cand not in best_reach:
+            best = cand
+        elif cand not in best_reach and best not in cand_reach:
+            # Diverged — keep the one with the newer commit date when possible.
+            best_date = str((commit_by_sha.get(best) or {}).get("date") or "")
+            cand_date = str((commit_by_sha.get(cand) or {}).get("date") or "")
+            if cand_date > best_date:
+                best = cand
+    return best
+
+
+def _prefer_farthest_review_tips(
+    commit_by_sha: dict[str, dict], review_tips: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for login, tips in (review_tips or {}).items():
+        tip = _farthest_tip(commit_by_sha, tips)
+        if tip:
+            out[str(login).strip().lower()] = [tip]
+    return out
 
 
 def _update_local_from_origin(repo_dir: str) -> None:
@@ -2101,6 +2202,25 @@ def _unique_side_chain(commit_by_sha: dict[str, dict], tip: str, stop: set[str])
     return chain
 
 
+def _lane_start_anchor_sha(
+    commit_by_sha: dict[str, dict], tip: str, main_set: set[str]
+) -> str:
+    """SHA of the main commit where a task lane was anchored (…/start).
+
+    Empty lane: tip still on main → tip itself. After …/1+: walk first-parent
+    until main. Shared with main in Git; UI keeps a separate ``lane_start`` node.
+    """
+    tip_sha = str(tip or "").strip()
+    if not tip_sha:
+        return ""
+    if tip_sha in (main_set or set()):
+        return tip_sha
+    for sha in _first_parent_chain(commit_by_sha, tip_sha):
+        if sha in (main_set or set()):
+            return sha
+    return ""
+
+
 def _history_log_refs(repo_dir: str) -> list[str]:
     refs = []
     seen = set()
@@ -2180,9 +2300,9 @@ def build_project_history_model(
 ) -> dict[str, Any]:
     """Turn Git commits + review tips into version specs (DAG).
 
-    ``start_stub_slugs``: branch slugs allowed to show an empty ``…/start`` node
-    (assigned/shared task lanes). Local DIY branches must not get a start stub
-    when their only local commit is deleted.
+    ``start_stub_slugs``: branch slugs that keep a permanent ``…/start`` anchor
+    (assigned/shared task lanes). The stub stays even after ``…/1``, ``…/2``, …
+    Local DIY branches must not get a start stub.
     """
     empty = {
         "commit_history": [],
@@ -2251,25 +2371,8 @@ def build_project_history_model(
         for extra in parents[1:]:
             remember_side(_slug_from_merge(commit_by_sha, merge_sha, extra, review_tips), extra)
 
-    for slug, shas in sorted(lane_shas.items()):
-        unique = []
-        seen = set()
-        for sha in shas:
-            if not sha or sha in seen or sha in id_by_sha:
-                continue
-            seen.add(sha)
-            unique.append(sha)
-        unique.sort(key=lambda item: str((commit_by_sha.get(item) or {}).get("date") or ""))
-        for index, sha in enumerate(unique, start=1):
-            record = commit_by_sha.get(sha) or {}
-            parents = record.get("parents") or []
-            first = parents[0] if parents else ""
-            parent_id = id_by_sha.get(first)
-            add_spec("%s/%d" % (slug, index), sha, parent_id, slug)
-
-    # Empty *task* lanes (tip still on main): show …/start. Only for slugs in
-    # start_stub_slugs (typically origin/cv-review/* after Assign), never for a
-    # local-only branch the user created themselves.
+    # Permanent …/start anchors for shared task lanes (Assign), even after …/1+.
+    # DIY local-only branches are excluded (not in start_stub_slugs).
     stub_ok = {
         str(name or "").strip().lower()
         for name in (start_stub_slugs or ())
@@ -2278,11 +2381,9 @@ def build_project_history_model(
     for slug, tip in sorted(lane_tips.items()):
         if str(slug).strip().lower() not in stub_ok:
             continue
-        prefix = "%s/" % slug
-        if any(str(vid).startswith(prefix) for vid in specs_by_id):
-            continue
-        parent_id = id_by_sha.get(tip)
-        if not parent_id:
+        anchor = _lane_start_anchor_sha(commit_by_sha, tip, main_set)
+        parent_id = id_by_sha.get(anchor) if anchor else ""
+        if not anchor or not parent_id:
             continue
         stub_id = "%s/start" % slug
         if stub_id in specs_by_id:
@@ -2296,7 +2397,29 @@ def build_project_history_model(
             "lane_start": True,
         }
         tags[stub_id] = stub_id
-        sha_by_id[stub_id] = tip
+        # Same SHA as main anchor — not registered in id_by_sha (main keeps the id).
+        sha_by_id[stub_id] = anchor
+
+    for slug, shas in sorted(lane_shas.items()):
+        unique = []
+        seen = set()
+        for sha in shas:
+            if not sha or sha in seen or sha in id_by_sha:
+                continue
+            seen.add(sha)
+            unique.append(sha)
+        unique.sort(key=lambda item: str((commit_by_sha.get(item) or {}).get("date") or ""))
+        stub_id = "%s/start" % slug
+        stub_sha = sha_by_id.get(stub_id) or ""
+        for index, sha in enumerate(unique, start=1):
+            record = commit_by_sha.get(sha) or {}
+            parents = record.get("parents") or []
+            first = parents[0] if parents else ""
+            parent_id = id_by_sha.get(first)
+            # First real lane commit hangs off …/start, not directly off main.
+            if stub_id in specs_by_id and first and stub_sha and first == stub_sha:
+                parent_id = stub_id
+            add_spec("%s/%d" % (slug, index), sha, parent_id, slug)
 
     leftover = []
     if head_sha:
@@ -2640,7 +2763,7 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
 
     unpushed = _unpushed_commit_shas(repo_dir)
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
-    # …/start only for shared task lanes (origin), not local DIY branches.
+    # Permanent …/start for shared task lanes (origin), not local DIY branches.
     stub_slugs = {
         str(name).strip().lower()
         for name in remote_tips.keys()
@@ -2692,7 +2815,13 @@ def read_compare_project_histories(
     - ``conflict_lanes``: lane names that diverged (``main`` and/or branch slugs).
     """
     empty = _empty_history_model()
+    # Shared tips: prefer GitHub ls-remote (already synced in fetch_remote_updates).
+    # Re-sync here so callers that skip fetch still get true origin tips.
+    remote_review_tips = _sync_origin_review_tips_from_ls_remote(repo_dir)
+    if not remote_review_tips:
+        remote_review_tips = _review_tips(repo_dir, remote_only=True)
     commit_by_sha = _read_repo_commits(repo_dir)
+    remote_review_tips = _prefer_farthest_review_tips(commit_by_sha, remote_review_tips)
     origin = _git_rev_parse(repo_dir, "origin/main")
     local_main = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
         repo_dir, "main"
@@ -2700,8 +2829,9 @@ def read_compare_project_histories(
     head_sha = _git_rev_parse(repo_dir, "HEAD")
     unpushed = _unpushed_commit_shas(repo_dir)
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
-    local_review_tips = _review_tips(repo_dir, local_only=True)
-    remote_review_tips = _review_tips(repo_dir, remote_only=True)
+    local_review_tips = _prefer_farthest_review_tips(
+        commit_by_sha, _review_tips(repo_dir, local_only=True)
+    )
 
     remote_main_shas: set[str] = (
         set(_first_parent_chain(commit_by_sha, origin)) if origin else set()
@@ -2710,7 +2840,7 @@ def read_compare_project_histories(
         set(_first_parent_chain(commit_by_sha, local_main)) if local_main else set()
     )
 
-    # Shared = what GitHub has now (after fetch).
+    # Shared = what GitHub has now (after fetch / ls-remote sync).
     remote_stub_slugs = {
         str(name).strip().lower()
         for name in remote_review_tips.keys()
@@ -2803,6 +2933,18 @@ def read_compare_project_histories(
     remote_shas = _history_shas(remote_model)
     only_remote_shas = remote_shas - local_shas
     only_local_shas = _history_shas(local_model) - remote_shas
+    # …/start shares main's SHA and exists on both sides once the lane is known.
+    # SHA-set diff alone can miss commits after that anchor — always include
+    # remote unique-side commits not already in the local freeze / local refs.
+    main_stop = remote_main_shas or local_main_shas or set()
+    for _slug, tips in remote_review_tips.items():
+        remote_tip = _first_tip(tips)
+        if not remote_tip:
+            continue
+        for sha in _unique_side_chain(commit_by_sha, remote_tip, main_stop):
+            if sha and sha not in local_shas:
+                only_remote_shas.add(sha)
+                remote_shas.add(sha)
     only_remote_main = remote_main_shas - local_main_shas
     only_local_main = local_main_shas - remote_main_shas
     has_remote_extras = bool(only_remote_shas)

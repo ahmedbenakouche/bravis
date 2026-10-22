@@ -881,6 +881,26 @@ class CompareWithSharedDialog(qt.QDialog):
             self._selectChoice(self.ACTION_UPDATE, silent=True)
             return
 
+        # Local unshared only (e.g. DIY) — shared not ahead / no tip fork.
+        if self._has_local:
+            self._setConflictsMessage(
+                "No tip conflict — you have local versions not shared yet, "
+                "and the shared project is not ahead.\n"
+                "Preview: Keep mine. Click Validate to apply "
+                "(or Close to leave the Version tree unchanged)."
+            )
+            self._keep_btn.show()
+            self._selectChoice(self.ACTION_KEEP, silent=True)
+            return
+
+        if self._aligned:
+            self._setConflictsMessage(
+                "No conflicts — this computer matches the shared project."
+            )
+            self._result_panel.hide()
+            self._validate_btn.setEnabled(False)
+            return
+
         self._setConflictsMessage(
             "This case is not handled yet.\n"
             "Ask the developer to integrate it."
