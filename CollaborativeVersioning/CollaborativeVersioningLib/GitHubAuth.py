@@ -851,6 +851,55 @@ def work_is_on_review_branch(repo_dir: str) -> bool:
     return _current_branch_name(repo_dir).startswith("cv-review/")
 
 
+def head_is_side_review_commit(
+    repo_dir: str,
+    head_sha: str | None = None,
+    main_tip: str | None = None,
+    review_tips: dict | None = None,
+) -> bool:
+    """True when HEAD is on a cv-review lane beyond main (incl. detached older task node).
+
+    Switch to an older task tip leaves HEAD detached — ``work_is_on_review_branch``
+    is then false. Callers must not treat that HEAD as a main-line tip.
+    """
+    if work_is_on_review_branch(repo_dir):
+        return True
+    head = str(head_sha or "").strip() or _git_rev_parse(repo_dir, "HEAD")
+    if not head:
+        return False
+    main = str(main_tip or "").strip() or _git_rev_parse(
+        repo_dir, "refs/heads/main"
+    ) or _git_rev_parse(repo_dir, "origin/main")
+    tips = review_tips
+    if tips is None:
+        tips = {}
+        for src in (
+            _review_tips(repo_dir, local_only=True),
+            _review_tips(repo_dir, remote_only=True),
+        ):
+            for slug, bucket in (src or {}).items():
+                dest = tips.setdefault(slug, [])
+                for tip in bucket or []:
+                    if tip and tip not in dest:
+                        dest.append(tip)
+    for bucket in (tips or {}).values():
+        for tip in bucket or []:
+            tip_sha = str(tip or "").strip()
+            if not tip_sha:
+                continue
+            if tip_sha != head and not _is_ancestor(repo_dir, head, tip_sha):
+                continue
+            # Shared fork with main (e.g. …/start == main tip): still main-line.
+            if main and (head == main or _is_ancestor(repo_dir, head, main)):
+                continue
+            # Ahead of main on the review lane, or diverged from main.
+            if not main or _is_ancestor(repo_dir, main, head) or not _is_ancestor(
+                repo_dir, head, main
+            ):
+                return True
+    return False
+
+
 def commit_local_version(repo_dir: str, message: str) -> None:
     """Commit all files in the local project folder. Does not publish them."""
     _stage_and_commit(repo_dir, message, "Could not save the version.")
@@ -1146,10 +1195,17 @@ def ensure_can_share_with_shared(
         )
 
 
-def publish_current_line(repo_dir: str) -> str:
-    """Publish only the current branch (main or another branch). Returns 'main' or slug."""
+def publish_current_line(repo_dir: str, branch_name: str | None = None) -> str:
+    """Publish only the current branch (main or another branch). Returns 'main' or slug.
+
+    ``branch_name`` is the Version-tree lane (e.g. cdcxcx). Needed when Switch left
+    HEAD detached on an older task-lane commit — Git is not on cv-review/* then.
+    """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
+    slug = normalize_branch_slug(branch_name) if branch_name else ""
+    if slug:
+        return publish_review_branch(repo_dir, slug)
     if work_is_on_review_branch(repo_dir):
         return publish_review_branch(repo_dir, None)
     share_local_versions(repo_dir)
@@ -1421,12 +1477,13 @@ def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
     """Share current versions on a named branch beside main. Returns the slug used.
 
     Does not change local main — unshared main versions stay on this computer.
+
+    When HEAD is detached on an older lane commit (tip still ahead locally), Share
+    publishes only up to HEAD and does not move the local tip backward — same idea
+    as sharing an older main commit.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
-    origin = _run_git(["rev-parse", "--verify", "--quiet", "origin/main"], cwd=repo_dir, timeout=30)
-    if origin.returncode == 0 and not _unpushed_commit_shas(repo_dir):
-        raise GitHubAuthError("No new versions to share.")
     login = current_login()
     if not login:
         raise GitHubNotSignedInError(not_signed_in_message())
@@ -1438,31 +1495,29 @@ def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
     head = _git_rev_parse(repo_dir, "HEAD")
     if not head:
         raise GitHubAuthError("Could not share the project yet.")
-    remote_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch) or _git_rev_parse(
-        repo_dir, "refs/heads/%s" % branch
-    )
-    if _current_branch_name(repo_dir) != branch:
-        if (
-            remote_tip
-            and remote_tip != head
-            and not _is_ancestor(repo_dir, remote_tip, head)
-        ):
-            raise GitHubAuthError(
-                "Could not share on this branch.\n\n"
-                "Switch to a version on this branch first, then Save, then Share again."
-            )
-        _point_head_at(repo_dir, branch, head)
-    elif (
-        remote_tip
-        and remote_tip != head
-        and not _is_ancestor(repo_dir, remote_tip, head)
-    ):
+    remote_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch)
+    local_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
+    if remote_tip and remote_tip != head and not _is_ancestor(repo_dir, remote_tip, head):
         raise GitHubAuthError(
             "Could not share on this branch.\n\n"
             "Switch to a version on this branch first, then Save, then Share again."
         )
+    if remote_tip and (
+        remote_tip == head
+        or (_is_ancestor(repo_dir, head, remote_tip) and head != remote_tip)
+    ):
+        raise GitHubAuthError("No new versions to share.")
+    current = _current_branch_name(repo_dir)
+    tip_ahead = bool(
+        local_tip
+        and head != local_tip
+        and _is_ancestor(repo_dir, head, local_tip)
+    )
+    # Attach only when not already on the branch and attaching would not rewind the tip.
+    if current != branch and not tip_ahead:
+        _point_head_at(repo_dir, branch, head)
     push = _run_git(
-        ["push", "origin", "HEAD:refs/heads/%s" % branch],
+        ["push", "origin", "%s:refs/heads/%s" % (head, branch)],
         cwd=repo_dir,
         timeout=180,
     )
@@ -1980,14 +2035,17 @@ def _unpushed_commit_shas(repo_dir: str) -> set[str]:
 
     Matches Version-tree "local" vs "pushed": shared = origin/main +
     origin/cv-review/* (see ``_shared_remote_shas``). On main (or detached
-    viewing an older main commit), use the main tip; on a review branch, HEAD.
+    viewing an older main commit), use the main tip; on a review branch or
+    detached task-lane commit, use HEAD.
     """
-    if work_is_on_review_branch(repo_dir):
-        tip = _git_rev_parse(repo_dir, "HEAD")
+    head = _git_rev_parse(repo_dir, "HEAD")
+    main_tip = _git_rev_parse(repo_dir, "refs/heads/main")
+    if work_is_on_review_branch(repo_dir) or head_is_side_review_commit(
+        repo_dir, head, main_tip
+    ):
+        tip = head
     else:
-        tip = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
-            repo_dir, "HEAD"
-        )
+        tip = main_tip or head
     if not tip:
         return set()
     commit_by_sha = _read_repo_commits(repo_dir)
@@ -2790,17 +2848,19 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
 
     # Never hide tips this computer already has on main (Share/Accept before caps refresh).
     # Do NOT advance main from HEAD when HEAD is on a side branch — that would paint
-    # new branch commits as main/N (e.g. Save → Create a branch).
+    # new branch commits as main/N (e.g. Save → Create a branch). Same when Switch
+    # left HEAD detached on an older task-lane commit (not on cv-review/* by name).
     main_tip = _prefer_ahead_tip(repo_dir, main_tip or "", local_main or "")
-    if head_sha and not work_is_on_review_branch(repo_dir):
-        main_tip = _prefer_ahead_tip(repo_dir, main_tip or "", head_sha) or main_tip
-
     review_tips: dict[str, list[str]] = dict(remote_tips)
     for login, tips in local_tips.items():
         bucket = review_tips.setdefault(login, [])
         for tip in tips:
             if tip and tip not in bucket:
                 bucket.append(tip)
+    if head_sha and not head_is_side_review_commit(
+        repo_dir, head_sha, main_tip or local_main, review_tips
+    ):
+        main_tip = _prefer_ahead_tip(repo_dir, main_tip or "", head_sha) or main_tip
 
     unpushed = _unpushed_commit_shas(repo_dir)
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
@@ -2940,7 +3000,9 @@ def read_compare_project_histories(
                             break
                     if shown not in bucket:
                         bucket.append(shown)
-        if work_is_on_review_branch(repo_dir):
+        if head_is_side_review_commit(
+            repo_dir, head_sha, local_main or origin, review_for_local
+        ):
             main_for_local = local_main or ""
         else:
             main_for_local = _prefer_ahead_tip(

@@ -1358,21 +1358,24 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self,
         from_older_main: bool = False,
         junior: bool = False,
+        older_lane: str = "",
     ) -> str:
         """When saving from main: Put on main / Create a branch / cancel.
 
         Juniors never get Put on main (they can only Share a branch).
-        Older-main view: only Create a branch so later unshared main tips stay.
+        Older tip view (main or task lane): only Create a branch so later tips stay.
         """
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Save version")
+        lane_label = str(older_lane or "").strip() or "main"
         if junior or from_older_main:
             if junior and from_older_main:
-                box.setText("Save from this older main version?")
+                box.setText("Save from this older %s version?" % lane_label)
                 box.setInformativeText(
                     "As a junior you save on a branch (not on main).\n"
-                    "Main still has later versions on this computer — "
-                    "Create a branch from here; those later main versions stay."
+                    "%s still has later versions on this computer — "
+                    "Create a branch from here; those later versions stay."
+                    % lane_label
                 )
             elif junior:
                 box.setText("Save on a branch?")
@@ -1381,10 +1384,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     "Create a branch to save this version."
                 )
             else:
-                box.setText("Save from this older main version?")
+                box.setText("Save from this older %s version?" % lane_label)
                 box.setInformativeText(
-                    "Main still has later versions on this computer.\n"
-                    "Create a branch from here — those later main versions stay."
+                    "%s still has later versions on this computer.\n"
+                    "Create a branch from here — those later versions stay."
+                    % lane_label
                 )
             branch_btn = box.addButton("Create a branch", qt.QMessageBox.AcceptRole)
             box.addButton("Cancel", qt.QMessageBox.RejectRole)
@@ -1477,16 +1481,28 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.setStandardButtons(qt.QMessageBox.Ok)
         box.exec_()
 
+    def _effectiveShareBranchSlug(self, local_path: str) -> str:
+        """Lane to Share: Git cv-review/* if attached, else Version-tree checkout lane.
+
+        Switch to an older task node leaves HEAD detached (tip preserved). Share must
+        still use that lane (e.g. cdcxcx), not fall back to main.
+        """
+        try:
+            if work_is_on_review_branch(local_path):
+                slug = current_review_branch_slug(local_path) or ""
+                if slug:
+                    return slug
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            pass
+        version_id = str(getattr(self, "_currentVersionId", None) or "").strip()
+        lane = (self._historyLaneForVersion(version_id) or "main").strip()
+        if not lane or lane.lower() == "main":
+            return ""
+        return normalize_branch_slug(lane) or ""
+
     def _confirmShareCurrentLine(self, local_path: str) -> bool:
         """Explain exactly what Share will publish on the current branch."""
-        on_branch = False
-        slug = ""
-        try:
-            on_branch = work_is_on_review_branch(local_path)
-            slug = current_review_branch_slug(local_path) if on_branch else ""
-        except (GitHubAuthError, OSError, RuntimeError, ValueError):
-            on_branch = False
-            slug = ""
+        slug = self._effectiveShareBranchSlug(local_path)
         branch = slug or "main"
         tip = str(getattr(self, "_currentVersionId", None) or "").strip() or "the current tip"
         box = qt.QMessageBox(slicer.util.mainWindow())
@@ -7828,19 +7844,50 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed("Fill project data first: Ontology map.", error=True)
                 return
         on_branch = False
-        from_older_main = False
+        from_older_line = False
+        older_lane = ""
+        lane_slug = self._effectiveShareBranchSlug(local_path)
         try:
             on_branch = work_is_on_review_branch(local_path)
-            if not on_branch:
-                from_older_main = is_viewing_older_than_branch_tip(local_path, "main")
+            if on_branch:
+                tip_lane = current_review_branch_slug(local_path) or lane_slug or "main"
+                from_older_line = is_viewing_older_than_branch_tip(local_path, tip_lane)
+                if from_older_line:
+                    older_lane = tip_lane
+            elif lane_slug:
+                # Detached on a task lane (Switch kept the tip): same as older main —
+                # do not offer Put on main; Create a branch so the tip stays.
+                from_older_line = is_viewing_older_than_branch_tip(
+                    local_path, lane_slug
+                )
+                if from_older_line:
+                    older_lane = lane_slug
+                else:
+                    # At the lane tip but detached — reattach, then Save on that branch.
+                    bundle = getattr(self, "_project_history_bundle", None) or {}
+                    version_id = str(
+                        getattr(self, "_currentVersionId", None) or ""
+                    ).strip()
+                    sha = str(
+                        (bundle.get("sha_by_id") or {}).get(version_id) or ""
+                    ).strip()
+                    if sha:
+                        checkout_local_version(local_path, sha, lane_slug)
+                        on_branch = work_is_on_review_branch(local_path)
+            else:
+                from_older_line = is_viewing_older_than_branch_tip(local_path, "main")
+                if from_older_line:
+                    older_lane = "main"
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             on_branch = False
-            from_older_main = False
+            from_older_line = False
+            older_lane = ""
         # Junior on …/start (task lane already exists): UI can show test/start while
         # Git is still on main (same SHA). Attach to that branch — do not ask to
         # "Create a branch".
         if (
             not on_branch
+            and not from_older_line
             and self._shareNeedsApproval()
             and self._attachGitToCurrentTaskStart(local_path)
         ):
@@ -7849,11 +7896,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             except (GitHubAuthError, OSError, RuntimeError, ValueError):
                 on_branch = False
         new_branch_slug = ""
+        if on_branch and from_older_line:
+            # Attached name but viewing older tip should not happen often; still
+            # force Create a branch so we never rewind the tip on Save.
+            on_branch = False
         if not on_branch:
             # Junior: Create a branch only (cannot Share from main).
+            # Older tip (main or task): Create a branch only.
             destination = self._promptSaveDestination(
-                from_older_main=from_older_main,
+                from_older_main=from_older_line,
                 junior=self._shareNeedsApproval(),
+                older_lane=older_lane or lane_slug,
             )
             if destination == "cancel":
                 self._appendFeed("Save cancelled.")
@@ -7943,13 +7996,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
             self._appendFeed("Open the project first.", error=True)
             return
-        on_branch = False
-        try:
-            on_branch = work_is_on_review_branch(local_path)
-        except (GitHubAuthError, OSError, RuntimeError, ValueError):
-            on_branch = False
         # Juniors publish a branch only (main stays for seniors / Merge-Accept).
-        if self._shareNeedsApproval() and not on_branch:
+        # Use Version-tree lane when HEAD is detached on an older task node.
+        share_slug = self._effectiveShareBranchSlug(local_path)
+        if self._shareNeedsApproval() and not share_slug:
             self._appendFeed(
                 "Save on a branch first (Create a branch), then Share.",
                 error=True,
@@ -7965,12 +8015,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _publishCurrentLine(self, local_path: str) -> None:
         """Push only the current branch (main or another branch) to the shared project."""
-        try:
-            on_branch = work_is_on_review_branch(local_path)
-            slug = current_review_branch_slug(local_path) if on_branch else ""
-        except (GitHubAuthError, OSError, RuntimeError, ValueError):
-            on_branch = False
-            slug = ""
+        slug = self._effectiveShareBranchSlug(local_path)
         branch = slug or "main"
         self._appendFeed("Sharing %s…" % branch)
         self._openProgress("Share", "Publishing %s…" % branch)
@@ -7984,7 +8029,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._updateProgress("Checking the shared project…")
             ensure_can_share_with_shared(local_path, local_history=local_freeze)
             self._updateProgress("Publishing %s…" % branch)
-            published = publish_current_line(local_path)
+            published = publish_current_line(local_path, branch_name=slug or None)
             save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
