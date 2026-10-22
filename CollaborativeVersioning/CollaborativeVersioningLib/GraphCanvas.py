@@ -983,9 +983,9 @@ def _draw_write_lock_legend(scene, x, y):
 
 
 def _draw_review_pending_legend(scene, x, y):
-    """Legend for submitted task tips awaiting Accept/Decline."""
+    """Legend for the exact version awaiting Accept/Decline."""
     text = scene.addText(
-        "🔵 = awaiting senior review (double-click that node to Accept or Decline)"
+        "🔵 = this version awaits senior review (double-click that node to Accept or Decline)"
     )
     text.setFont(qt.QFont("Arial", 8))
     text.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT or _ui.GRAPH_TITLE or "#888888"))
@@ -1680,6 +1680,22 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.draw()
         self._pad_scene_rect()
 
+    def refresh_status_badges(
+        self,
+        review_pending_ids=None,
+        write_locked_ids=None,
+        active_version_id=None,
+    ):
+        """Force-redraw 🔵 / 🔒 (and checkout) without requiring an active-id change."""
+        if review_pending_ids is not None:
+            self.review_pending_ids = set(review_pending_ids or ())
+        if write_locked_ids is not None:
+            self.write_locked_ids = set(write_locked_ids or ())
+        if active_version_id is not None:
+            self.active_version_id = active_version_id
+        self.draw()
+        self._pad_scene_rect()
+
     def set_compare_content(
         self,
         version_specs=None,
@@ -2111,17 +2127,18 @@ class _VersionInfoDialog(qt.QDialog):
                 add_action("Delete", self._chooseDelete, _ui.BTN_DELETE)
             layout.addSpacing(14)
             layout.addLayout(actions_row)
-
-        layout.addSpacing(10)
-        close_row = qt.QHBoxLayout()
-        close_row.addStretch(1)
-        close_btn = qt.QPushButton("Close")
-        close_btn.setMinimumWidth(120)
-        close_btn.setMinimumHeight(32)
-        close_btn.setStyleSheet(_ui.BTN_SECONDARY)
-        close_btn.connect("clicked()", self.reject)
-        close_row.addWidget(close_btn)
-        layout.addLayout(close_row)
+        else:
+            # No action buttons — keep a Close control; otherwise the window X is enough.
+            layout.addSpacing(10)
+            close_row = qt.QHBoxLayout()
+            close_row.addStretch(1)
+            close_btn = qt.QPushButton("Close")
+            close_btn.setMinimumWidth(120)
+            close_btn.setMinimumHeight(32)
+            close_btn.setStyleSheet(_ui.BTN_SECONDARY)
+            close_btn.connect("clicked()", self.reject)
+            close_row.addWidget(close_btn)
+            layout.addLayout(close_row)
 
     def _chooseSubmit(self):
         self._choose("submit")

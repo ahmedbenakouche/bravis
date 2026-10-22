@@ -4082,6 +4082,9 @@ def _normalize_stored_tasks(document) -> list[dict]:
         submitted = normalize_task_title(item.get("submitted_description") or "")
         if submitted:
             entry["submitted_description"] = submitted
+        submitted_version_id = str(item.get("submitted_version_id") or "").strip()
+        if submitted_version_id and status == "submitted":
+            entry["submitted_version_id"] = submitted_version_id
         tasks.append(entry)
     return tasks
 

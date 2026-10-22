@@ -4668,7 +4668,37 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not self._currentVersionId:
                 specs = bundle.get("version_specs") or []
                 self._currentVersionId = specs[-1].get("id") if specs else None
+        # Junior default: same SHA as locked main → prefer writable …/start
+        # (Open / Delete after Save) so Save is not blocked by mistake.
+        self._currentVersionId = self._preferJuniorTaskStartVersion(
+            self._currentVersionId
+        )
         return self._currentVersionId
+
+    def _preferJuniorTaskStartVersion(self, version_id: str | None) -> str | None:
+        """Map locked main tip → junior's …/start when they share the same SHA."""
+        vid = str(version_id or "").strip()
+        if not vid or not self._isVersionWriteLocked(vid):
+            return version_id
+        allowed = self._writableTaskLaneSlugs()
+        if not allowed:
+            return version_id
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        sha_by_id = bundle.get("sha_by_id") or {}
+        current_sha = str(sha_by_id.get(vid) or "").strip().lower()
+        if not current_sha:
+            return version_id
+        for spec in bundle.get("version_specs") or []:
+            if not (spec or {}).get("lane_start"):
+                continue
+            lane = normalize_branch_slug(str((spec or {}).get("branch") or "").strip())
+            if not lane or lane.lower() not in allowed:
+                continue
+            start_id = str((spec or {}).get("id") or "").strip()
+            start_sha = str(sha_by_id.get(start_id) or "").strip().lower()
+            if start_id and start_sha == current_sha:
+                return start_id
+        return version_id
 
     def _historyHasUnsharedVersion(self, history: dict | None = None) -> bool:
         bundle = history if history is not None else getattr(self, "_project_history_bundle", None)
@@ -7159,8 +7189,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         refresh_ui: bool = True,
         announce_activity: bool = True,
     ) -> None:
+        remapped_to_start = False
         if tasks is not None:
             self._project_tasks = list(tasks or [])
+            # Open loads history before tasks — remap locked main → …/start now.
+            preferred = self._preferJuniorTaskStartVersion(self._currentVersionId)
+            if preferred and preferred != self._currentVersionId:
+                self._currentVersionId = preferred
+                remapped_to_start = True
         if activity is not None:
             self._project_activity = list(activity or [])
         if presence is not None:
@@ -7234,6 +7270,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateTaskButtonUi()
         # Task assign/cancel can change junior write-lock lanes (Save/Share).
         self._updateVersionActionButtons()
+        if remapped_to_start:
+            self._updateCommitHistoryPanel()
+        # Keep open Version tree 🔵 in sync when submit / decline arrives via poll.
+        if tasks is not None:
+            self._updateActiveVersionIndicators()
         self._syncNotificationActivityFromProject(announce=bool(announce_activity))
 
     def _onlinePresenceLogins(self, *, exclude_me: bool = False) -> list[str]:
@@ -7888,7 +7929,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 event["at"] = str(message.get("at"))
             return event
         op = str(message.get("task_op") or "").strip()
-        if op not in ("assign", "update", "cancel", "submit", "accept"):
+        if op not in ("assign", "update", "cancel", "submit", "accept", "decline"):
             return None
         author = str(message.get("author") or self._githubLogin() or "Someone")
         juniors = _task_juniors_label(message)
@@ -7937,6 +7978,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 text = "%s requested a review for task: %s" % (author, excerpt)
             else:
                 text = "%s requested a review on their line." % author
+        elif op == "decline":
+            excerpt = _task_excerpt(message.get("description") or "")
+            text = (
+                "%s declined %s's review request for task: %s"
+                % (author, juniors, excerpt)
+                if excerpt
+                else "%s declined %s's review request." % (author, juniors)
+            )
         else:
             excerpt = _task_excerpt(message.get("description") or "")
             text = (
@@ -8127,6 +8176,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
         if op == "accept":
             return self._tasksWithStatus(current, message, "accepted")
+        if op == "decline":
+            # Back to In progress (🟠): junior can Request review again.
+            return self._tasksWithStatus(current, message, "")
         if op == "cancel":
             tid = str((message or {}).get("task_id") or "").strip()
             junior_keys = {name.lower() for name in juniors}
@@ -8165,6 +8217,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 task["status"] = status
                 if status == "submitted":
                     task["submitted_description"] = snapshot or str(task.get("description") or "")
+                    submitted_vid = str(
+                        (message or {}).get("submitted_version_id") or ""
+                    ).strip()
+                    if submitted_vid:
+                        task["submitted_version_id"] = submitted_vid
+                    else:
+                        task.pop("submitted_version_id", None)
+                elif not status:
+                    task.pop("submitted_description", None)
+                    task.pop("submitted_version_id", None)
                 matched = True
             updated.append(task)
         if not matched:
@@ -8992,20 +9054,31 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return None
 
     def _reviewPendingVersionIds(self) -> set:
-        """Tip version ids of submitted task lanes (show 🔵 on the Version tree)."""
-        pending_slugs = set()
+        """Version ids with an open review request (🔵 on that exact node)."""
+        known_ids = {
+            str((spec or {}).get("id") or "").strip()
+            for spec in (
+                (getattr(self, "_project_history_bundle", None) or {}).get(
+                    "version_specs"
+                )
+                or []
+            )
+            if str((spec or {}).get("id") or "").strip()
+        }
+        marked = set()
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "") != "submitted":
                 continue
+            submitted_vid = str(task.get("submitted_version_id") or "").strip()
+            if submitted_vid:
+                # Only paint 🔵 when that exact version is already on this computer.
+                if submitted_vid in known_ids:
+                    marked.add(submitted_vid)
+                continue
+            # Legacy tasks without a stored version: tip of the lane if present.
             slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
-            if slug:
-                pending_slugs.add(slug.lower())
-        if not pending_slugs:
-            return set()
-        marked = set()
-        for slug in pending_slugs:
-            tip_id = self._tipVersionIdForLane(slug)
-            if tip_id:
+            tip_id = self._tipVersionIdForLane(slug) if slug else ""
+            if tip_id and tip_id in known_ids:
                 marked.add(tip_id)
         return marked
 
@@ -9156,11 +9229,30 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return None
 
     def _isOwnReviewLane(self, lane: str) -> bool:
+        """True when HEAD is on this named cv-review lane (checkout helper)."""
         key = str(lane or "").strip().lower()
         if not key or key == "main":
             return False
         current = self._currentNamedBranchSlug().lower()
         return bool(current and current == key)
+
+    def _isDiyMergeLane(self, lane: str) -> bool:
+        """Named branch with no active task — senior can Merge (checkout-independent)."""
+        key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
+        if not key or key == "main":
+            return False
+        return self._activeTaskForBranchSlug(key) is None
+
+    def _versionIsSharedOnTree(self, version_id: str) -> bool:
+        """True when this Version-tree node is shared (solid), not local dashed."""
+        if not str(version_id or "").strip():
+            return False
+        # Empty status = shared (legacy rows); only explicit "local" is dashed.
+        return self._versionHistoryStatus(version_id) != "local"
+
+    def _isTipVersionOfLane(self, version_id: str, lane: str) -> bool:
+        tip = self._tipVersionIdForLane(lane)
+        return bool(tip) and tip == str(version_id or "").strip()
 
     def _versionHistoryStatus(self, version_id: str) -> str:
         vid = str(version_id or "").strip()
@@ -9195,6 +9287,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _withDeleteAction(self, payload: dict, spec) -> dict:
         out = dict(payload or {})
+        # Delete is exclusive — never next to Request review / Accept / Decline / Merge.
+        if (
+            out.get("submit")
+            or out.get("accept")
+            or out.get("decline")
+            or out.get("merge")
+        ):
+            return out
         if self._canDeleteLocalUnsharedVersion(spec):
             out["delete"] = True
             out["delete_note"] = (
@@ -9207,12 +9307,33 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _reviewActionsForVersion(self, spec, history) -> dict:
         """Build Version-details actions from local state only (no GitHub round-trip)."""
         lane = str((spec or {}).get("branch") or "")
+        version_id = str((spec or {}).get("id") or "").strip()
+        # …/start = lane anchor only — details + Close, never review/merge/delete.
+        if (spec or {}).get("lane_start"):
+            task = self._activeTaskForBranchSlug(lane)
+            if task is None:
+                return {}
+            status = str(task.get("status") or "").strip().lower()
+            text = str(
+                (task.get("submitted_description") if status == "submitted" else "")
+                or task.get("description")
+                or ""
+            ).strip()
+            if not text:
+                return {}
+            return {
+                "task_text": text,
+                "task_senior": str(task.get("senior") or "").strip(),
+            }
         # Task lanes first — never show bare "Merge" instead of Accept/Decline.
         task = self._activeTaskForBranchSlug(lane)
         if task is not None:
-            return self._withDeleteAction(self._reviewActionsForTaskLane(task, lane), spec)
-        # Owner / senior: merge their own shared line onto main (no task).
-        if self._canAssignTask() and self._isOwnReviewLane(lane):
+            actions = self._reviewActionsForTaskLane(
+                task, lane, version_id=version_id
+            )
+            return self._withDeleteAction(actions, spec)
+        # Senior: Merge on DIY named lanes (no active task) — independent of checkout.
+        if self._canAssignTask() and self._isDiyMergeLane(lane):
             return self._withDeleteAction({"merge": True}, spec)
         # Local task fields only — PR lookup happens when Accept/Decline is clicked.
         role = self._taskRoleForLane(lane, network=False)
@@ -9230,18 +9351,31 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             "task_senior": str(linked.get("senior") or "").strip(),
         }
         if kind == "submit":
-            payload["submit"] = True
+            if (
+                self._versionIsSharedOnTree(version_id)
+                and self._isTipVersionOfLane(version_id, lane)
+            ):
+                payload["submit"] = True
             return self._withDeleteAction(payload, spec)
-        payload["accept"] = True
-        payload["decline"] = True
+        submitted_vid = str(linked.get("submitted_version_id") or "").strip()
+        if submitted_vid:
+            if version_id == submitted_vid:
+                payload["accept"] = True
+                payload["decline"] = True
+        elif self._isTipVersionOfLane(version_id, lane):
+            payload["accept"] = True
+            payload["decline"] = True
         return self._withDeleteAction(payload, spec)
 
-    def _reviewActionsForTaskLane(self, task: dict, lane: str) -> dict:
+    def _reviewActionsForTaskLane(
+        self, task: dict, lane: str, version_id: str = ""
+    ) -> dict:
         """Actions for a unified task branch (1 task = 1 lane). Local-only (fast)."""
         status = str((task or {}).get("status") or "").strip().lower()
         me = (self._githubLogin() or "").strip().lower()
         senior = str((task or {}).get("senior") or "").strip().lower()
         juniors = {name.lower() for name in _task_junior_logins(task)}
+        vid = str(version_id or "").strip()
         text = str(
             (task.get("submitted_description") if status == "submitted" else "")
             or task.get("description")
@@ -9252,17 +9386,41 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             "task_senior": str(task.get("senior") or "").strip(),
         }
         if status == "submitted":
-            if self._canAssignTask() and senior and senior == me:
-                # Show Accept/Decline immediately; resolve the open PR on click.
+            submitted_vid = str(task.get("submitted_version_id") or "").strip()
+            # Accept/Decline only on the exact reviewed version (or tip if legacy).
+            on_review_node = (
+                (submitted_vid and vid == submitted_vid)
+                or (
+                    not submitted_vid
+                    and self._isTipVersionOfLane(vid, lane)
+                )
+            )
+            if (
+                on_review_node
+                and self._canAssignTask()
+                and senior
+                and senior == me
+            ):
                 payload["accept"] = True
                 payload["decline"] = True
             return payload
         if me in juniors and status != "accepted":
-            payload["submit"] = True
+            # Request review only on the shared tip — never on local dashed nodes.
+            if self._versionIsSharedOnTree(vid) and self._isTipVersionOfLane(
+                vid, lane
+            ):
+                payload["submit"] = True
         return payload
 
     def onVersionReviewAction(self, action: str, spec) -> None:
         lane = str((spec or {}).get("branch") or "")
+        version_id = str((spec or {}).get("id") or "").strip()
+        if (spec or {}).get("lane_start"):
+            self._appendFeed(
+                "Start versions have no review actions — only details.",
+                error=True,
+            )
+            return
         if action == "delete":
             self._deleteLocalUnsharedVersion(spec)
             return
@@ -9276,12 +9434,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     return
                 self._mergeOwnReviewLine(lane)
                 return
-            if not self._canAssignTask() or not self._isOwnReviewLane(lane):
-                self._appendFeed("You can merge only your own branch.", error=True)
+            if not self._canAssignTask() or not self._isDiyMergeLane(lane):
+                self._appendFeed("You can merge only a DIY branch (no task).", error=True)
                 return
             self._mergeOwnReviewLine(lane)
             return
         if action == "submit":
+            if not self._versionIsSharedOnTree(version_id):
+                self._showShareBranchBeforeReviewHint()
+                return
             if task is not None:
                 if str(task.get("status") or "") == "submitted":
                     self._appendFeed(
@@ -9293,7 +9454,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not role or role[0] != "submit":
                 self._appendFeed("You can request a review only on your own branch.", error=True)
                 return
-            self._submitOwnReviewLine(lane)
+            self._submitOwnReviewLine(lane, version_id=version_id)
             return
         if action not in ("accept", "decline"):
             return
@@ -9338,12 +9499,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._markTaskAccepted(review_task)
         else:
             confirmed = slicer.util.confirmYesNoDisplay(
-                "Decline %s's branch?\n\nThe versions stay in the version tree." % junior,
+                "Decline %s's review request ?\n\n"
+                "The task goes back to In progress (🟠)."
+                % junior,
                 windowTitle="Decline",
             )
             if not confirmed:
                 return
-            self._declineReviewedShareRequest(request)
+            if self._declineReviewedShareRequest(request):
+                self._markTaskDeclined(review_task)
         self._updateActiveVersionIndicators()
         self._updateTaskButtonUi()
 
@@ -9464,7 +9628,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         slicer.util.warningDisplay(text, windowTitle="Request review")
         self._appendFeed("Share your branch first.", error=True)
 
-    def _submitOwnReviewLine(self, lane: str = "") -> None:
+    def _submitOwnReviewLine(self, lane: str = "", version_id: str = "") -> None:
         slug = normalize_branch_slug(lane) or self._currentNamedBranchSlug()
         if not slug:
             self._showShareBranchBeforeReviewHint()
@@ -9475,6 +9639,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         task = role[1]
         description = str(task.get("description") or "").strip()
+        # Pin 🔵 to the shared tip being reviewed (clicked node, else current tip).
+        submitted_vid = str(version_id or "").strip() or self._tipVersionIdForLane(slug)
         if self._openReviewForJunior(self._githubLogin(), lane=slug):
             slicer.util.infoDisplay(
                 "A review is already requested for this branch.",
@@ -9497,18 +9663,29 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._closeProgress()
         if outcome == "updated":
             if str(task.get("status") or "") != "submitted":
-                self._markTaskSubmitted(task, description)
+                self._markTaskSubmitted(
+                    task, description, version_id=submitted_vid
+                )
             slicer.util.infoDisplay(
                 "A review is already requested for this branch.",
                 windowTitle="Review already requested",
             )
             return
-        self._markTaskSubmitted(task, description)
-        self._appendFeed("Review requested. This branch is not on main yet.")
+        self._markTaskSubmitted(task, description, version_id=submitted_vid)
+        tip_label = self._versionDisplayTag(submitted_vid) if submitted_vid else slug
+        self._appendFeed(
+            "Review requested for %s. This branch is not on main yet." % tip_label
+        )
 
-    def _markTaskSubmitted(self, task: dict, description: str) -> None:
+    def _markTaskSubmitted(
+        self, task: dict, description: str, version_id: str = ""
+    ) -> None:
         juniors = _task_junior_logins(task)
         excerpt = _task_excerpt(description)
+        submitted_vid = str(version_id or "").strip()
+        if not submitted_vid:
+            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            submitted_vid = self._tipVersionIdForLane(slug) if slug else ""
         body = (
             "requested a review for this task: %s" % excerpt
             if excerpt
@@ -9529,8 +9706,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         branch_slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
         if branch_slug:
             message["branch_slug"] = branch_slug
+        if submitted_vid:
+            message["submitted_version_id"] = submitted_vid
         self._enqueueTaskMessage(message)
         self._updateTaskButtonUi()
+        self._updateActiveVersionIndicators()
 
     def _markTaskAccepted(self, task: dict) -> None:
         juniors = _task_junior_logins(task)
@@ -9560,6 +9740,41 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             message["branch_slug"] = branch_slug
         self._enqueueTaskMessage(message)
         self._updateTaskButtonUi()
+
+        self._updateActiveVersionIndicators()
+
+    def _markTaskDeclined(self, task: dict) -> None:
+        """After Decline: clear submitted → In progress (🟠); junior can resubmit."""
+        juniors = _task_junior_logins(task)
+        description = str(
+            (task or {}).get("submitted_description")
+            or (task or {}).get("description")
+            or ""
+        ).strip()
+        excerpt = _task_excerpt(description)
+        body = (
+            "declined the review; task is In progress again: %s" % excerpt
+            if excerpt
+            else "declined the review; task is In progress again."
+        )
+        try:
+            message = build_project_message(self._githubLogin(), body, kind="task")
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._appendFeed(str(error).split("\n")[0], error=True)
+            return
+        message["task_op"] = "decline"
+        message["task_id"] = str((task or {}).get("id") or "")
+        message["juniors"] = list(juniors)
+        if juniors:
+            message["junior"] = juniors[0]
+        message["senior"] = str((task or {}).get("senior") or "")
+        message["description"] = normalize_task_title(description)
+        branch_slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+        if branch_slug:
+            message["branch_slug"] = branch_slug
+        self._enqueueTaskMessage(message)
+        self._updateTaskButtonUi()
+        self._updateActiveVersionIndicators()
 
     def _acceptReviewedShareRequest(self, request: dict) -> None:
         full_name = request.get("full_name") or ""
@@ -9604,7 +9819,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._runNotificationChecks(announce=False)
         return True
 
-    def _declineReviewedShareRequest(self, request: dict) -> None:
+    def _declineReviewedShareRequest(self, request: dict) -> bool:
         author = request.get("author") or "the colleague"
         self._openProgress("Review version", "Declining the version…")
         try:
@@ -9627,25 +9842,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._appendFeed(str(error).split("\n")[0], error=True)
-            return
+            return False
         self._closeProgress()
-        me = self._githubLogin() or "Someone"
-        excerpt = self._taskExcerptForJunior(author)
-        decline_text = (
-            "%s declined %s's line for task: %s" % (me, author, excerpt)
-            if excerpt
-            else "%s declined %s's line." % (me, author)
-        )
-        self._recordActivity(
-            request.get("full_name") or self._currentProjectName(),
-            "decline",
-            decline_text,
-        )
+        # Activity / notif comes only from `_markTaskDeclined` (task_op) — do not
+        # also `_recordActivity` here or the junior gets two Decline notifications.
         self._appendFeed(
-            "Declined the version from %s. Their versions stay in the version tree." % author
+            "Declined %s's review request. The task is In progress again (🟠)."
+            % author
         )
         self._refreshUiState()
         self._runNotificationChecks(announce=False)
+        return True
 
     def _promptDeleteProjectChoice(self, full_name: str) -> str:
         """Return ``local``, ``remote_and_local``, or ``cancel``."""
@@ -10886,20 +11093,37 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             else:
                 self.checkedOutLabel.setVisible(False)
         canvas = getattr(self.logic, "_historyCanvas", None) if self.logic else None
-        if canvas is not None and hasattr(canvas, "set_active_version_id"):
-            try:
-                bundle = getattr(self, "_project_history_bundle", None) or {}
-                specs = list(bundle.get("version_specs") or [])
-                if specs and hasattr(canvas, "version_specs"):
-                    canvas.version_specs = specs
-                    canvas._specs_by_id = {spec["id"]: spec for spec in specs}
-                    canvas.commit_history_by_id = CollaborativeVersioningLib.GraphCanvas.commit_history_lookup(
-                        bundle.get("commit_history", [])
-                    )
+        if canvas is None:
+            return
+        try:
+            bundle = getattr(self, "_project_history_bundle", None) or {}
+            specs = list(bundle.get("version_specs") or [])
+            if specs and hasattr(canvas, "version_specs"):
+                canvas.version_specs = specs
+                canvas._specs_by_id = {spec["id"]: spec for spec in specs}
+                canvas.commit_history_by_id = CollaborativeVersioningLib.GraphCanvas.commit_history_lookup(
+                    bundle.get("commit_history", [])
+                )
+            pending = set(self._reviewPendingVersionIds() or ())
+            locked = set(self._writeLockedVersionIds() or ())
+            # Always redraw so 🔵 appears in place after Request review (not only
+            # when the checked-out node changes).
+            if hasattr(canvas, "refresh_status_badges"):
+                canvas.refresh_status_badges(
+                    review_pending_ids=pending,
+                    write_locked_ids=locked,
+                    active_version_id=active,
+                )
+            else:
+                if hasattr(canvas, "review_pending_ids"):
+                    canvas.review_pending_ids = pending
+                if hasattr(canvas, "write_locked_ids"):
+                    canvas.write_locked_ids = locked
                 canvas.active_version_id = None
-                canvas.set_active_version_id(active)
-            except (RuntimeError, ValueError):
-                pass
+                if hasattr(canvas, "set_active_version_id"):
+                    canvas.set_active_version_id(active)
+        except (RuntimeError, ValueError, AttributeError, TypeError):
+            pass
 
     def onOpenDependencyGraph(self) -> None:
         if not self._canOpenDependencyGraph():
@@ -11185,7 +11409,8 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             extra_bits = []
             if review_pending_ids:
                 extra_bits.append(
-                    "🔵 = awaiting senior review (double-click to Accept or Decline)"
+                    "🔵 = that exact version awaits review "
+                    "(double-click the 🔵 node to Accept or Decline)"
                 )
             if write_locked_ids:
                 extra_bits.append(
