@@ -1811,6 +1811,32 @@ def _share_request_head(full_name: str, number) -> tuple[str, str]:
     return branch, sha
 
 
+def _checkout_lane_for_branch_name(branch_name: str) -> str:
+    """History lane slug for checkout_local_version (``main`` or review slug)."""
+    current = str(branch_name or "").strip()
+    if not current or current == "main":
+        return "main"
+    if current.startswith("cv-review/"):
+        return normalize_branch_slug(current.split("/", 1)[-1]) or "main"
+    return normalize_branch_slug(current) or "main"
+
+
+def _restore_checkout_after_merge(
+    repo_dir: str, restore_sha: str, restore_lane: str
+) -> None:
+    """Put HEAD + worktree back on the version that was displayed before merge.
+
+    Accept/Merge must not leave the user on the merge-target tip when the Version
+    tree selector still points at another node (e.g. local DIY). Other branch
+    tips stay untouched.
+    """
+    tip = _git_rev_parse(repo_dir, restore_sha) or str(restore_sha or "").strip()
+    lane = str(restore_lane or "main").strip() or "main"
+    if not tip:
+        return
+    checkout_local_version(repo_dir, tip, lane)
+
+
 def accept_share_request(full_name: str, branch: str, number) -> str:
     """Merge the reviewed line into the shared project. Keep that line's versions.
 
@@ -1818,12 +1844,20 @@ def accept_share_request(full_name: str, branch: str, number) -> str:
     with main and the review tip as parents (no GitHub conflict check).
 
     Uses the local clone as already updated by Open — no git fetch here.
+
+    Advances only the merge-target refs (``main`` today). Then restores HEAD and
+    the worktree to the commit that was checked out before Accept/Merge so the
+    Version tree selector, Slicer scene, and disk stay aligned.
     """
     dest, sha = fetch_share_request_sha(full_name, branch)
     login = _review_login_from_ref(branch) or "colleague"
     accepter = current_login()
     if accepter:
         _configure_repo_identity(dest, accepter)
+    # Remember the displayed checkout — restore after updating merge-target refs.
+    restore_sha = _git_rev_parse(dest, "HEAD") or ""
+    restore_lane = _checkout_lane_for_branch_name(_current_branch_name(dest))
+    # Merge target = inheritance parent of the review line (tasks today → main).
     origin = _git_rev_parse(dest, "origin/main") or _git_rev_parse(dest, "refs/heads/main")
     head = sha
     if not origin or not head:
@@ -1861,6 +1895,7 @@ def accept_share_request(full_name: str, branch: str, number) -> str:
         )
         if push.returncode != 0:
             _raise_share_failure((push.stderr or push.stdout or "").strip())
+        # Move only main tips — do not reset whatever branch HEAD is on.
         _run_git(["update-ref", "refs/remotes/origin/main", merge_sha], cwd=dest, timeout=20)
         _run_git(["update-ref", "refs/heads/main", merge_sha], cwd=dest, timeout=20)
     if number not in (None, ""):
@@ -1885,8 +1920,14 @@ def accept_share_request(full_name: str, branch: str, number) -> str:
         _ensure_github_branch(full_name, branch, sha)
     except (GitHubAuthError, OSError, ValueError):
         pass
-    # Local main refs already match what we pushed — no fetch needed.
-    _run_git(["reset", "--hard", "refs/heads/main"], cwd=dest, timeout=180)
+    _run_git(
+        ["branch", "--set-upstream-to=origin/main", "main"],
+        cwd=dest,
+        timeout=20,
+    )
+    # Align disk with the node still shown in the Version tree (not main/2).
+    if restore_sha:
+        _restore_checkout_after_merge(dest, restore_sha, restore_lane)
     return dest
 
 
