@@ -530,13 +530,13 @@ def branch_color(branch):
 
 
 def _ranges_overlap(first, second):
-    """True when ranges share a row or merely touch.
+    """True when ranges share at least one row (inclusive).
 
-    Touching spans still conflict: a fork edge travels vertically through the
-    parent row into the child row, so an adjacent branch in the same column
-    would sit on that corridor (nodes/edges overlapping).
+    Adjacent corridors (one ends at row N, the next starts at N+1) do not
+    conflict — there is already visual gap between consecutive version rows —
+    so a free side column can be recycled (e.g. jks above, test below on -1).
     """
-    return not (first[1] + 1 < second[0] or second[1] + 1 < first[0])
+    return not (first[1] + 1 <= second[0] or second[1] + 1 <= first[0])
 
 
 def _side_branch_spans(specs, rows):
@@ -1469,14 +1469,58 @@ class InteractiveGraphView(qt.QGraphicsView):
         except Exception:
             scene.setBackgroundBrush(qt.QBrush(qt.QColor(_ui.GRAPH_BG)))
 
+    def _note_base_scene_rect(self):
+        """Remember content sceneRect from draw() so pad does not stack."""
+        scene = getattr(self, "_graphe_scene", None)
+        if scene is None:
+            self._base_scene_rect = None
+            return
+        try:
+            self._base_scene_rect = qt.QRectF(scene.sceneRect)
+        except (AttributeError, TypeError, RuntimeError):
+            self._base_scene_rect = None
+
     def _pad_scene_rect(self, margin=100):
-        rect = self._graphe_scene.sceneRect
-        self._graphe_scene.setSceneRect(
-            rect.x() - margin,
-            rect.y() - margin,
-            rect.width() + 2 * margin,
-            rect.height() + 2 * margin,
-        )
+        scene = getattr(self, "_graphe_scene", None)
+        if scene is None:
+            return
+        base = getattr(self, "_base_scene_rect", None)
+        if base is None:
+            try:
+                base = qt.QRectF(scene.sceneRect)
+                self._base_scene_rect = base
+            except (AttributeError, TypeError, RuntimeError):
+                return
+        try:
+            scene.setSceneRect(
+                base.x() - margin,
+                base.y() - margin,
+                base.width() + 2 * margin,
+                base.height() + 2 * margin,
+            )
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+
+    def _capture_view_scroll(self):
+        try:
+            return (
+                int(self.horizontalScrollBar().value()),
+                int(self.verticalScrollBar().value()),
+            )
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            return None
+
+    def _restore_view_scroll(self, saved):
+        if not saved:
+            return
+        h, v = saved
+        try:
+            hbar = self.horizontalScrollBar()
+            vbar = self.verticalScrollBar()
+            hbar.setValue(min(max(int(h), hbar.minimum()), hbar.maximum()))
+            vbar.setValue(min(max(int(v), vbar.minimum()), vbar.maximum()))
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            pass
 
     def reset_view(self):
         # Guard against fitInView ↔ scrollbar ↔ resize feedback loops.
@@ -1677,8 +1721,10 @@ class VersionHistoryCanvas(InteractiveGraphView):
         if version_id == self.active_version_id:
             return
         self.active_version_id = version_id
+        scroll = self._capture_view_scroll()
         self.draw()
         self._pad_scene_rect()
+        self._restore_view_scroll(scroll)
 
     def refresh_status_badges(
         self,
@@ -1686,15 +1732,29 @@ class VersionHistoryCanvas(InteractiveGraphView):
         write_locked_ids=None,
         active_version_id=None,
     ):
-        """Force-redraw 🔵 / 🔒 (and checkout) without requiring an active-id change."""
+        """Redraw 🔵 / 🔒 (and checkout) only when status actually changed."""
+        new_pending = set(self.review_pending_ids or ())
+        new_locked = set(self.write_locked_ids or ())
+        new_active = self.active_version_id
         if review_pending_ids is not None:
-            self.review_pending_ids = set(review_pending_ids or ())
+            new_pending = set(review_pending_ids or ())
         if write_locked_ids is not None:
-            self.write_locked_ids = set(write_locked_ids or ())
+            new_locked = set(write_locked_ids or ())
         if active_version_id is not None:
-            self.active_version_id = active_version_id
+            new_active = active_version_id
+        if (
+            new_pending == set(self.review_pending_ids or ())
+            and new_locked == set(self.write_locked_ids or ())
+            and new_active == self.active_version_id
+        ):
+            return
+        self.review_pending_ids = new_pending
+        self.write_locked_ids = new_locked
+        self.active_version_id = new_active
+        scroll = self._capture_view_scroll()
         self.draw()
         self._pad_scene_rect()
+        self._restore_view_scroll(scroll)
 
     def set_compare_content(
         self,
@@ -1730,7 +1790,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
             self.result_roles = dict(result_roles or {})
         self.draw()
         self._pad_scene_rect()
-        self.reset_view()
+        self.reset_view()  # intentional: compare preview replaces content
 
     def create_toolbar(self):
         if self.pick_mode:
@@ -1842,6 +1902,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
             self._graphe_scene.setSceneRect(0, 0, 400, 200)
             self._nodes_by_id = {}
             self._content_fit_rect = None
+            self._note_base_scene_rect()
             return
 
         positions, edges = _layout_version_graph(self.version_specs)
@@ -1944,6 +2005,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
                 scene_right - scene_left,
                 scene_bottom - scene_top,
             )
+            self._note_base_scene_rect()
             return
 
         # Normal Version tree — classic layout (no auto enlarge / special centering).
@@ -2012,6 +2074,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
             legend_y += 18
         if any_write_locked:
             _draw_write_lock_legend(self._graphe_scene, MARGIN, legend_y)
+        self._note_base_scene_rect()
 
 
 def _compute_scene_bounds(nodes, padding=30):
@@ -2479,6 +2542,7 @@ class DependencyGraphCanvas(InteractiveGraphView):
             self._specs_by_id = {}
             self._coverage_map = {}
             self._refresh_coverage_legend()
+            self._note_base_scene_rect()
             return
 
         visible_specs, _children_map = _visible_specs_from_expansion(
@@ -2493,6 +2557,7 @@ class DependencyGraphCanvas(InteractiveGraphView):
             self._graphe_scene.setSceneRect(0, 0, 400, 200)
             self._coverage_map = _coverage_by_id(self._all_specs, self._painted_ids)
             self._refresh_coverage_legend()
+            self._note_base_scene_rect()
             return
 
         positions, edges = _layout_hierarchy(
@@ -2534,3 +2599,4 @@ class DependencyGraphCanvas(InteractiveGraphView):
         title.setDefaultTextColor(qt.QColor(_ui.GRAPH_TITLE))
         title.setPos(MARGIN, scene_h + 4)
         self._refresh_coverage_legend()
+        self._note_base_scene_rect()

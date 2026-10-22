@@ -8794,8 +8794,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 )
             pending = set(self._reviewPendingVersionIds() or ())
             locked = set(self._writeLockedVersionIds() or ())
-            # Always redraw so 🔵 appears in place after Request review (not only
-            # when the checked-out node changes).
+            # refresh_status_badges skips redraw when 🔵 / 🔒 / checkout are unchanged
+            # (messages poll ~1s) and preserves scroll when a redraw is needed.
             if hasattr(canvas, "refresh_status_badges"):
                 canvas.refresh_status_badges(
                     review_pending_ids=pending,
