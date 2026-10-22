@@ -1161,7 +1161,62 @@ def _acknowledge_task_branch_cap(repo_dir: str, slug: str, sha: str) -> None:
     if not caps.get("origin_main"):
         caps["origin_main"] = _git_rev_parse(repo_dir, "origin/main") or ""
     caps["review_tips"] = tips
+    # Permanent …/start is for Assign tasks only — not DIY Share branches.
+    starts = {
+        str(name or "").strip().lower()
+        for name in (caps.get("task_start_slugs") or [])
+        if str(name or "").strip()
+    }
+    starts.add(key)
+    caps["task_start_slugs"] = sorted(starts)
     save_remote_sync_caps(repo_dir, caps)
+
+
+def _task_branch_slugs_from_project_info(repo_dir: str) -> set[str]:
+    """Branch slugs recorded on active/past tasks in local project-info (no network)."""
+    ref = _resolve_local_project_info_ref(repo_dir)
+    if not ref:
+        return set()
+    try:
+        doc = _git_show_json(repo_dir, ref, _MESSAGES_PATH)
+    except (GitHubAuthError, OSError, RuntimeError, TypeError, ValueError):
+        return set()
+    slugs: set[str] = set()
+    for task in _normalize_stored_tasks(doc):
+        slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+        if slug:
+            slugs.add(slug.lower())
+    return slugs
+
+
+def _start_stub_slugs_for_history(
+    repo_dir: str,
+    remote_tips: dict[str, list[str]],
+    main_tip: str,
+    commit_by_sha: dict[str, dict],
+) -> set[str]:
+    """Slugs that keep a permanent ``…/start`` node (Assign tasks only).
+
+    DIY Share also creates ``origin/cv-review/*`` — those must NOT get a Task start
+    stub. Include: task branch_slugs from project-info / caps, and empty shared
+    lanes whose tip still sits on main (Assign before any Save).
+    """
+    stubs: set[str] = set()
+    caps = load_remote_sync_caps(repo_dir) or {}
+    for name in caps.get("task_start_slugs") or []:
+        key = str(name or "").strip().lower()
+        if key:
+            stubs.add(key)
+    stubs.update(_task_branch_slugs_from_project_info(repo_dir))
+    main_set = set(_first_parent_chain(commit_by_sha, main_tip)) if main_tip else set()
+    if not main_set and main_tip:
+        main_set = {main_tip}
+    for slug, tips in (remote_tips or {}).items():
+        key = str(slug or "").strip().lower()
+        tip = _first_tip(tips)
+        if key and tip and tip in main_set:
+            stubs.add(key)
+    return stubs
 
 
 def ensure_can_share_with_shared(
@@ -2470,8 +2525,8 @@ def build_project_history_model(
         for extra in parents[1:]:
             remember_side(_slug_from_merge(commit_by_sha, merge_sha, extra, review_tips), extra)
 
-    # Permanent …/start anchors for shared task lanes (Assign), even after …/1+.
-    # DIY local-only branches are excluded (not in start_stub_slugs).
+    # Permanent …/start anchors for Assign task lanes only (even after …/1+).
+    # DIY Share branches must not be listed in start_stub_slugs.
     stub_ok = {
         str(name or "").strip().lower()
         for name in (start_stub_slugs or ())
@@ -2686,7 +2741,12 @@ def capture_remote_sync_caps(repo_dir: str) -> dict[str, Any]:
                 tip = candidate
         if tip:
             review[str(login).strip().lower()] = tip
-    return {"origin_main": origin, "review_tips": review}
+    previous = load_remote_sync_caps(repo_dir) or {}
+    return {
+        "origin_main": origin,
+        "review_tips": review,
+        "task_start_slugs": list(previous.get("task_start_slugs") or []),
+    }
 
 
 def save_remote_sync_caps(repo_dir: str, caps: dict[str, Any] | None) -> None:
@@ -2695,9 +2755,17 @@ def save_remote_sync_caps(repo_dir: str, caps: dict[str, Any] | None) -> None:
         return
     _ensure_ui_sync_caps_gitignored(repo_dir)
     path = os.path.join(repo_dir, _UI_SYNC_CAPS_FILE)
+    task_starts = sorted(
+        {
+            str(name or "").strip().lower()
+            for name in ((caps or {}).get("task_start_slugs") or [])
+            if str(name or "").strip()
+        }
+    )
     payload = {
         "origin_main": str((caps or {}).get("origin_main") or "").strip(),
         "review_tips": dict((caps or {}).get("review_tips") or {}),
+        "task_start_slugs": task_starts,
     }
     try:
         with open(path, "w", encoding="utf-8") as handle:
@@ -2723,6 +2791,9 @@ def load_remote_sync_caps(repo_dir: str) -> dict[str, Any] | None:
     tips = payload.get("review_tips")
     if tips is not None and not isinstance(tips, dict):
         tips = {}
+    starts = payload.get("task_start_slugs")
+    if starts is not None and not isinstance(starts, list):
+        starts = []
     return {
         "origin_main": str(payload.get("origin_main") or "").strip(),
         "review_tips": {
@@ -2730,6 +2801,13 @@ def load_remote_sync_caps(repo_dir: str) -> dict[str, Any] | None:
             for login, sha in (tips or {}).items()
             if str(login).strip() and str(sha).strip()
         },
+        "task_start_slugs": sorted(
+            {
+                str(name or "").strip().lower()
+                for name in (starts or [])
+                if str(name or "").strip()
+            }
+        ),
     }
 
 
@@ -2798,7 +2876,12 @@ def derive_remote_sync_caps_from_history(
             review[str(login).strip().lower()] = capped
         elif current and current in known:
             review[str(login).strip().lower()] = current
-    return {"origin_main": origin_cap, "review_tips": review}
+    previous = load_remote_sync_caps(repo_dir) or {}
+    return {
+        "origin_main": origin_cap,
+        "review_tips": review,
+        "task_start_slugs": list(previous.get("task_start_slugs") or []),
+    }
 
 
 def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[str, Any]:
@@ -2864,12 +2947,10 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
 
     unpushed = _unpushed_commit_shas(repo_dir)
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
-    # Permanent …/start for shared task lanes (origin), not local DIY branches.
-    stub_slugs = {
-        str(name).strip().lower()
-        for name in remote_tips.keys()
-        if str(name).strip()
-    }
+    # Permanent …/start for Assign tasks only — not every origin/cv-review (DIY Share).
+    stub_slugs = _start_stub_slugs_for_history(
+        repo_dir, remote_tips, main_tip or local_main or "", commit_by_sha
+    )
     model = build_project_history_model(
         commit_by_sha,
         main_tip,
@@ -2942,11 +3023,9 @@ def read_compare_project_histories(
     )
 
     # Shared = what GitHub has now (after fetch / ls-remote sync).
-    remote_stub_slugs = {
-        str(name).strip().lower()
-        for name in remote_review_tips.keys()
-        if str(name).strip()
-    }
+    remote_stub_slugs = _start_stub_slugs_for_history(
+        repo_dir, remote_review_tips, origin or local_main or "", commit_by_sha
+    )
     remote_model = empty
     if (origin or remote_review_tips) and commit_by_sha:
         remote_model = build_project_history_model(
