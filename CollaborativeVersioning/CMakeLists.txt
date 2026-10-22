@@ -10,6 +10,12 @@ set(MODULE_PYTHON_SCRIPTS
   CollaborativeVersioningLib/OntologyLoader.py
   CollaborativeVersioningLib/GraphCanvas.py
   CollaborativeVersioningLib/UiStyles.py
+  CollaborativeVersioningLib/ModuleConstants.py
+  CollaborativeVersioningLib/QtHelpers.py
+  CollaborativeVersioningLib/Helpers.py
+  CollaborativeVersioningLib/Dialogs.py
+  CollaborativeVersioningLib/Widget.py
+  CollaborativeVersioningLib/Logic.py
   )
 
 set(MODULE_PYTHON_RESOURCES
