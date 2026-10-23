@@ -2076,6 +2076,25 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "This project is already open."
         return ""
 
+    def _currentLaneHasSubmittedReview(self) -> bool:
+        """True when the checkout lane has a task in submitted (🔵) state.
+
+        Share must pause on that lane until Accept or Decline so the tip cannot
+        move past the reviewed version.
+        """
+        version_id = str(getattr(self, "_currentVersionId", None) or "").strip()
+        lane = (self._historyLaneForVersion(version_id) or "main").strip()
+        lane_key = normalize_branch_slug(lane) if lane else ""
+        if not lane_key or lane_key.lower() == "main" or str(lane).strip().lower() == "main":
+            return False
+        for task in getattr(self, "_project_tasks", []) or []:
+            if str(task.get("status") or "").strip().lower() != "submitted":
+                continue
+            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            if slug and slug.lower() == lane_key.lower():
+                return True
+        return False
+
     def _canShare(self) -> bool:
         if not self._connected:
             return False
@@ -2084,6 +2103,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if self._isCurrentProjectLocalOnly():
             return False
         if self._isCurrentVersionWriteLocked():
+            return False
+        if self._currentLaneHasSubmittedReview():
             return False
         if not self._unshared_version:
             return False
@@ -2103,6 +2124,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "This project is not on GitHub."
         if self._isCurrentVersionWriteLocked():
             return self._writeLockBlockedReason("Share")
+        if self._currentLaneHasSubmittedReview():
+            return (
+                "Review already requested — Share is paused until Accept or Decline."
+            )
         repo = self._currentRemoteRepo()
         if repo and not repo.get("can_push"):
             return "This project is read-only for your account."
@@ -7475,6 +7500,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._enqueueTaskMessage(message)
         self._updateTaskButtonUi()
         self._updateActiveVersionIndicators()
+        self._updateVersionActionButtons()
 
     def _markTaskAccepted(self, task: dict) -> None:
         juniors = _task_junior_logins(task)
@@ -7504,8 +7530,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             message["branch_slug"] = branch_slug
         self._enqueueTaskMessage(message)
         self._updateTaskButtonUi()
-
         self._updateActiveVersionIndicators()
+        self._updateVersionActionButtons()
 
     def _markTaskDeclined(self, task: dict) -> None:
         """After Decline: clear submitted → In progress (🟠); junior can resubmit."""
@@ -7539,6 +7565,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._enqueueTaskMessage(message)
         self._updateTaskButtonUi()
         self._updateActiveVersionIndicators()
+        self._updateVersionActionButtons()
 
     def _acceptReviewedShareRequest(self, request: dict) -> None:
         full_name = request.get("full_name") or ""
