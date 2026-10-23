@@ -7436,9 +7436,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 windowTitle="Review already requested",
             )
             return
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
+            self._appendFeed("Open the project first.", error=True)
+            return
         full_name = self._currentProjectName()
-        self._openProgress("Request review", "Asking for a review…")
+        self._openProgress("Request review", "Checking the shared project…")
         try:
+            local_freeze = copy.deepcopy(
+                getattr(self, "_project_history_bundle", None)
+            )
+            ensure_can_share_with_shared(
+                local_path,
+                local_history=local_freeze,
+                action="request review",
+            )
             self._updateProgress("Asking for a review…")
             outcome = submit_review_line(full_name, slug)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
