@@ -90,6 +90,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     ensure_can_share_with_shared,
     start_local_review_branch,
     create_and_publish_task_branch,
+    review_lane_tip_integrated_into_main,
     delete_local_unshared_version,
     sha_is_shared_on_remote,
     accept_share_request,
@@ -6922,6 +6923,31 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return False
         return self._activeTaskForBranchSlug(key) is None
 
+    def _laneHasAcceptedTask(self, lane: str) -> bool:
+        """True when a task on this lane was already Accept'd (status accepted)."""
+        lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
+        if not lane_key or lane_key == "main":
+            return False
+        for task in getattr(self, "_project_tasks", []) or []:
+            if str(task.get("status") or "").strip().lower() != "accepted":
+                continue
+            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            if slug and slug.lower() == lane_key:
+                return True
+        return False
+
+    def _laneAlreadyIntegrated(self, lane: str) -> bool:
+        """True after Accept or DIY Merge — Version details should not offer Merge again."""
+        if self._laneHasAcceptedTask(lane):
+            return True
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if not local_path:
+            return False
+        try:
+            return bool(review_lane_tip_integrated_into_main(local_path, lane))
+        except (GitHubAuthError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+
     def _versionIsSharedOnTree(self, version_id: str) -> bool:
         """True when this Version-tree node is shared (solid), not local dashed."""
         if not str(version_id or "").strip():
@@ -7026,11 +7052,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 task, lane, version_id=version_id
             )
             return self._withDeleteAction(actions, spec)
-        # Senior: Merge only on shared DIY named lanes (never main, never local).
+        # Senior: Merge only on shared DIY named lanes not yet on main
+        # (after Accept / Merge → details + Close only).
         if (
             self._canAssignTask()
             and self._isDiyMergeLane(lane)
             and self._versionIsSharedOnTree(version_id)
+            and not self._laneAlreadyIntegrated(lane)
         ):
             return self._withDeleteAction({"merge": True}, spec)
         # Local task fields only — PR lookup happens when Accept/Decline is clicked.
@@ -7140,6 +7168,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 return
             if not self._canAssignTask() or not self._isDiyMergeLane(lane):
                 self._appendFeed("You can merge only a DIY branch (no task).", error=True)
+                return
+            if self._laneAlreadyIntegrated(lane):
+                self._appendFeed(
+                    "This branch is already on main — nothing to Merge.",
+                    error=True,
+                )
                 return
             self._mergeOwnReviewLine(lane)
             return
@@ -7296,6 +7330,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         slug = normalize_branch_slug(lane) or self._currentNamedBranchSlug()
         if not slug:
             self._appendFeed("Switch to your branch first.", error=True)
+            return
+        if self._laneAlreadyIntegrated(slug):
+            self._appendFeed(
+                "This branch is already on main — nothing to Merge.",
+                error=True,
+            )
             return
         task = self._activeTaskForBranchSlug(slug)
         confirmed = slicer.util.confirmYesNoDisplay(
@@ -8201,8 +8241,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
         if self._hasActiveTaskAsJunior():
             return (
-                "Shared on your branch. Next: open that branch in the version "
-                "tree → Request review."
+                "Shared on the task branch. "
+                "If you want a review, open that branch in the Version tree → "
+                "Request review."
             )
         return (
             "Shared on your branch. To request a review, ask a senior to "

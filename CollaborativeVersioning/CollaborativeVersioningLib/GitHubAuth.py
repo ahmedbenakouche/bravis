@@ -1514,6 +1514,30 @@ def review_lane_slug(name: str) -> str:
     return normalize_branch_slug(name) or ""
 
 
+def review_lane_tip_integrated_into_main(repo_dir: str, lane: str) -> bool:
+    """True when this named lane's tip is already reachable from main (Accept/Merge done).
+
+    Empty tip still on main counts as integrated (nothing left to Merge).
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return False
+    slug = normalize_branch_slug(lane)
+    if not slug:
+        return False
+    branch = review_branch_for(slug)
+    tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch) or _git_rev_parse(
+        repo_dir, "refs/remotes/origin/%s" % branch
+    )
+    main_tip = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
+        repo_dir, "origin/main"
+    )
+    if not tip or not main_tip:
+        return False
+    if tip == main_tip:
+        return True
+    return _is_ancestor(repo_dir, tip, main_tip)
+
+
 def review_branch_for(name: str) -> str:
     """Git branch for a named work line: cv-review/<slug>."""
     safe = normalize_branch_slug(name) or "branch"
