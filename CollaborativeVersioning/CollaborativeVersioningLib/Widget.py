@@ -7052,12 +7052,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 task, lane, version_id=version_id
             )
             return self._withDeleteAction(actions, spec)
-        # Senior: Merge only on shared DIY named lanes not yet on main
-        # (after Accept / Merge → details + Close only).
+        # Senior: Merge only on the shared DIY tip, and only if not yet on main
+        # (after Accept / Merge → details + Close only; older lane nodes → no Merge).
         if (
             self._canAssignTask()
             and self._isDiyMergeLane(lane)
             and self._versionIsSharedOnTree(version_id)
+            and self._isTipVersionOfLane(version_id, lane)
             and not self._laneAlreadyIntegrated(lane)
         ):
             return self._withDeleteAction({"merge": True}, spec)
