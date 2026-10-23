@@ -7562,7 +7562,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
         self._appendFeed("Accepted the version from %s. It is now on the project." % author)
         self._runNotificationChecks(announce=False)
+        # Open Version tree must redraw the new main tip (badge-only refresh would skip).
+        self._updateActiveVersionIndicators()
+        self._refreshOpenVersionTreeIfNeeded()
         return True
+
+    def _refreshOpenVersionTreeIfNeeded(self) -> None:
+        """Rebuild an open Version tree dialog so Merge/Accept/Share topology shows up."""
+        logic = getattr(self, "logic", None)
+        dialog = getattr(logic, "historyDialog", None) if logic is not None else None
+        if dialog is None or not _qt_widget_is_valid(dialog):
+            return
+        qt.QTimer.singleShot(0, lambda: self.onOpenHistoryGraph(pick_mode=False))
 
     def _declineReviewedShareRequest(self, request: dict) -> bool:
         author = request.get("author") or "the colleague"
@@ -8873,6 +8884,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         try:
             bundle = getattr(self, "_project_history_bundle", None) or {}
             specs = list(bundle.get("version_specs") or [])
+            prev_spec_ids = tuple(
+                str((spec or {}).get("id") or "")
+                for spec in (getattr(canvas, "version_specs", None) or [])
+            )
+            new_spec_ids = tuple(
+                str((spec or {}).get("id") or "") for spec in specs
+            )
+            specs_changed = bool(specs) and prev_spec_ids != new_spec_ids
             if specs and hasattr(canvas, "version_specs"):
                 canvas.version_specs = specs
                 canvas._specs_by_id = {spec["id"]: spec for spec in specs}
@@ -8881,9 +8900,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 )
             pending = set(self._reviewPendingVersionIds() or ())
             locked = set(self._writeLockedVersionIds() or ())
-            # refresh_status_badges skips redraw when 🔵 / 🔒 / checkout are unchanged
-            # (messages poll ~1s) and preserves scroll when a redraw is needed.
-            if hasattr(canvas, "refresh_status_badges"):
+            # After Merge/Accept/Share the graph topology changes but 🔵/🔒/checkout
+            # may stay the same — refresh_status_badges would skip draw. Force a
+            # full redraw when version_specs change; otherwise badge-only refresh.
+            if specs_changed and hasattr(canvas, "draw"):
+                canvas.review_pending_ids = pending
+                canvas.write_locked_ids = locked
+                canvas.active_version_id = active
+                scroll = None
+                if hasattr(canvas, "_capture_view_scroll"):
+                    scroll = canvas._capture_view_scroll()
+                canvas.draw()
+                if hasattr(canvas, "_pad_scene_rect"):
+                    canvas._pad_scene_rect()
+                if scroll is not None and hasattr(canvas, "_restore_view_scroll"):
+                    canvas._restore_view_scroll(scroll)
+            elif hasattr(canvas, "refresh_status_badges"):
                 canvas.refresh_status_badges(
                     review_pending_ids=pending,
                     write_locked_ids=locked,
