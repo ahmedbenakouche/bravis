@@ -3,11 +3,9 @@ from __future__ import annotations
 
 import copy
 import html
-import importlib
 import logging
 import os
 import re
-import sys
 import time
 from datetime import datetime
 
@@ -16,8 +14,6 @@ import qt
 import slicer
 import vtk
 from slicer.ScriptedLoadableModule import *
-from slicer.i18n import tr as _
-from slicer.i18n import translate
 from slicer.util import VTKObservationMixin
 
 import CollaborativeVersioningLib
@@ -95,7 +91,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     sha_is_shared_on_remote,
     accept_share_request,
     decline_share_request,
-    suggest_github_usernames,
     work_is_on_review_branch,
     is_viewing_older_than_branch_tip,
     review_branch_for,
@@ -108,7 +103,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     PEOPLE_ACCESS_JUNIOR,
     PRESENCE_PUBLISH_INTERVAL_SECONDS,
     presence_is_online,
-    format_presence_ago,
     utc_now_stamp,
 )
 
@@ -126,10 +120,6 @@ from CollaborativeVersioningLib.OntologyLoader import (
 
 from CollaborativeVersioningLib.UiStyles import (
     ACCENT_ICE,
-    ACCENT_INDIGO,
-    ACCENT_MINT,
-    BG_ELEVATED,
-    BORDER,
     BTN_CONNECT,
     BTN_CREATE,
     BTN_DELETE,
@@ -180,7 +170,6 @@ from CollaborativeVersioningLib.ModuleConstants import (
     _MESSAGES_POLL_MS,
     _MESSAGE_MONTHS,
     _NOTIFICATIONS_POLL_MS,
-    _UI_BUILD_TAG,
     _VERSIONS_SYNC_ACTIVITY_KINDS,
 )
 from CollaborativeVersioningLib.QtHelpers import (
@@ -193,14 +182,9 @@ from CollaborativeVersioningLib.QtHelpers import (
     _safe_qt_call,
 )
 from CollaborativeVersioningLib.Helpers import (
-    _notification_detail_title,
-    _notification_list_label,
-    _notification_text,
     _task_excerpt,
     _task_junior_logins,
     _task_juniors_label,
-    _task_status_label,
-    _task_status_mark,
 )
 from CollaborativeVersioningLib.Dialogs import (
     CompareWithSharedDialog,
@@ -209,17 +193,12 @@ from CollaborativeVersioningLib.Dialogs import (
     PeopleDialog,
     ProjectConfigDialog,
     TaskDialog,
-    _CompareGraphLogic,
 )
 from CollaborativeVersioningLib.DataManager import DataManager
 from CollaborativeVersioningLib.Logic import CollaborativeVersioningLogic
 
 _STYLE_EXPORTS = (
     "ACCENT_ICE",
-    "ACCENT_INDIGO",
-    "ACCENT_MINT",
-    "BG_ELEVATED",
-    "BORDER",
     "BTN_CONNECT",
     "BTN_CREATE",
     "BTN_DELETE",
@@ -906,19 +885,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self._updateVersionActionButtons()
         self._updateRightDockAvailability()
-
-    def _clearProjectAssetFields(self) -> None:
-        self._blockProjectAssetSignals(True)
-        try:
-            if _qt_widget_is_valid(getattr(self, "volumeSelector", None)):
-                self.volumeSelector.setCurrentNode(None)
-            if _qt_widget_is_valid(getattr(self, "segmentationSelector", None)):
-                self.segmentationSelector.setCurrentNode(None)
-            self._clearOntologyDocument()
-            self._removeServerOntologyComboEntry()
-            self._setOntologyComboNone()
-        finally:
-            self._blockProjectAssetSignals(False)
 
     def _hideLoadedProjectAssetFields(self) -> None:
         """Clear asset selectors only — keep scene nodes + ontology stash for restore."""
@@ -4550,20 +4516,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
         self._updateNotificationsBadge()
 
-    def _taskExcerptForJunior(self, junior: str) -> str:
-        name = str(junior or "").strip().lower()
-        if not name:
-            return ""
-        for task in getattr(self, "_project_tasks", []) or []:
-            if name not in {login.lower() for login in _task_junior_logins(task)}:
-                continue
-            if str(task.get("status") or "") == "accepted":
-                continue
-            return _task_excerpt(
-                task.get("submitted_description") or task.get("description") or ""
-            )
-        return ""
-
     def _updateNotificationsBadge(self) -> None:
         badge = getattr(self, "notificationsBadge", None)
         behind_badge = getattr(self, "notificationsBehindBadge", None)
@@ -6928,14 +6880,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return find_open_review_request(full_name, name)
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             return None
-
-    def _isOwnReviewLane(self, lane: str) -> bool:
-        """True when HEAD is on this named cv-review lane (checkout helper)."""
-        key = str(lane or "").strip().lower()
-        if not key or key == "main":
-            return False
-        current = self._currentNamedBranchSlug().lower()
-        return bool(current and current == key)
 
     def _isDiyMergeLane(self, lane: str) -> bool:
         """Named branch with no active task — senior can Merge (checkout-independent)."""
