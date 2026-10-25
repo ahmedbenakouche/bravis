@@ -485,6 +485,10 @@ def prepare_branch_colors(branches) -> None:
     ``main`` stays on the theme indigo. Side lanes are sorted and take distinct
     palette entries until the palette is exhausted (then colors reuse).
     Call before painting the Version tree or styling Version history so both match.
+
+    Compare with shared should pass the union of Local + Shared + Result lane
+    names once, then paint panels with ``refresh_branch_colors=False`` so each
+    side does not rebuild a private palette (same rank → same color collision).
     """
     global _branch_color_by_lane
     names = sorted(
@@ -825,10 +829,11 @@ def _version_graph_edges(specs):
     return edges
 
 
-def _layout_version_graph(specs):
+def _layout_version_graph(specs, refresh_branch_colors=True):
     """Layout : colonnes par ligne de versions, lignes sans chevauchement."""
     specs_by_id = {spec["id"]: dict(spec) for spec in specs}
-    prepare_branch_colors(spec.get("branch", "main") for spec in specs)
+    if refresh_branch_colors:
+        prepare_branch_colors(spec.get("branch", "main") for spec in specs)
     rows = _compute_version_rows(specs)
     centers = _lane_centers_for(specs, rows)
 
@@ -1652,6 +1657,7 @@ class VersionHistoryCanvas(InteractiveGraphView):
         pick_mode=False,
         write_locked_ids=None,
         review_pending_ids=None,
+        refresh_branch_colors=True,
     ):
         InteractiveGraphView.__init__(self, parent)
         self.logic = logic
@@ -1662,6 +1668,8 @@ class VersionHistoryCanvas(InteractiveGraphView):
         self.commit_history_by_id = dict(commit_history_by_id or {})
         self.read_only = bool(read_only)
         self.pick_mode = bool(pick_mode)
+        # False: reuse the map from prepare_branch_colors (Compare shared palette).
+        self.refresh_branch_colors = bool(refresh_branch_colors)
         self.conflict_ids = set(conflict_ids or ())
         # Junior write locks: Switch/view OK, Save/Share blocked on these nodes.
         self.write_locked_ids = set(write_locked_ids or ())
@@ -1905,7 +1913,10 @@ class VersionHistoryCanvas(InteractiveGraphView):
             self._note_base_scene_rect()
             return
 
-        positions, edges = _layout_version_graph(self.version_specs)
+        positions, edges = _layout_version_graph(
+            self.version_specs,
+            refresh_branch_colors=getattr(self, "refresh_branch_colors", True),
+        )
         self._nodes_by_id = positions
         nodes_by_id = positions
         trunk_order = _main_trunk_order(self.version_specs)

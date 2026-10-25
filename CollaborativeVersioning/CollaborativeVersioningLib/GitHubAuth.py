@@ -2875,10 +2875,25 @@ def derive_remote_sync_caps_from_history(
 
     Used before a Compare peek-fetch so Open does not suddenly show newer origin tips
     that were only fetched for the compare dialog.
+
+    Do **not** acknowledge a remote lane merely because ``main`` is an ancestor of
+    its tip (that invented phantom ``…/start`` nodes after Reload). Only:
+    - lanes with a unique side commit already on the freeze, or
+    - lanes already acknowledged by a prior Validate Update (previous caps), kept
+      when still valid.
     """
     known = _history_shas(history)
     commit_by_sha = _read_repo_commits(repo_dir)
     origin = _git_rev_parse(repo_dir, "origin/main") or ""
+    main_set = set(_first_parent_chain(commit_by_sha, origin)) if origin else set()
+    if not main_set and origin:
+        main_set = {origin}
+    previous = load_remote_sync_caps(repo_dir) or {}
+    prev_review = {
+        str(login).strip().lower(): str(sha).strip()
+        for login, sha in (previous.get("review_tips") or {}).items()
+        if str(login).strip() and str(sha).strip()
+    }
 
     def _newest_known_on_chain(tip: str) -> str:
         if not tip:
@@ -2888,19 +2903,52 @@ def derive_remote_sync_caps_from_history(
                 return sha
         return ""
 
+    def _newest_known_side_commit(tip: str) -> str:
+        """Newest freeze SHA unique to this lane (stops at main — never main itself)."""
+        if not tip:
+            return ""
+        for sha in _first_parent_chain(commit_by_sha, tip):
+            if sha in main_set:
+                break
+            if sha in known:
+                return sha
+        return ""
+
     origin_cap = _newest_known_on_chain(origin) or origin
+    remote_tips = _review_tips(repo_dir, remote_only=True)
     review: dict[str, str] = {}
-    for login, tips in sorted(_review_tips(repo_dir, remote_only=True).items()):
+    for login, tips in sorted(remote_tips.items()):
+        key = str(login).strip().lower()
         current = ""
         for candidate in tips:
             if candidate:
                 current = candidate
-        capped = _newest_known_on_chain(current)
-        if capped:
-            review[str(login).strip().lower()] = capped
-        elif current and current in known:
-            review[str(login).strip().lower()] = current
-    previous = load_remote_sync_caps(repo_dir) or {}
+        if not key or not current:
+            continue
+        side_known = _newest_known_side_commit(current)
+        if side_known:
+            review[key] = side_known
+        elif current in known and current not in main_set:
+            review[key] = current
+
+    # Preserve prior Update acks; drop polluted "main-only" acks for DIY lanes that
+    # now have side commits never shown on the Version tree.
+    for key, stored in prev_review.items():
+        if key in review:
+            continue
+        current = ""
+        for candidate in remote_tips.get(key) or ():
+            if candidate:
+                current = str(candidate).strip()
+        if not current:
+            current = stored
+        if current in main_set:
+            # Empty shared tip (Assign …/start) still on main — keep after Update.
+            review[key] = current
+        elif stored not in main_set:
+            review[key] = _cap_remote_tip(repo_dir, stored, current) or stored
+        # else: stored was main but remote tip has real side commits → do not peek-ack
+
     return {
         "origin_main": origin_cap,
         "review_tips": review,
@@ -3087,22 +3135,38 @@ def read_compare_project_histories(
     elif commit_by_sha and (local_main or head_sha or local_review_tips):
         review_for_local = dict(local_review_tips)
         # Keep named lanes already shown in the Version tree (acked remote tips).
+        # Do not treat "main is an ancestor" as evidence — that pulled DIY remote
+        # lanes into Compare Local as phantom …/start nodes.
         if freeze_ok:
+            freeze_lanes = _history_lane_slugs(local_history)
+            main_stop = remote_main_shas or local_main_shas or set()
             for slug, tips in remote_review_tips.items():
                 tip = _first_tip(tips)
                 if not tip:
                     continue
-                if tip in freeze_shas or any(
-                    sha in freeze_shas for sha in _first_parent_chain(commit_by_sha, tip)
-                ):
-                    bucket = review_for_local.setdefault(slug, [])
+                key = str(slug or "").strip().lower()
+                side = {
+                    sha
+                    for sha in _unique_side_chain(commit_by_sha, tip, main_stop)
+                    if sha
+                }
+                on_tree = bool(side & freeze_shas) or key in freeze_lanes
+                if not on_tree:
+                    continue
+                bucket = review_for_local.setdefault(slug, [])
+                # Cap to the newest side commit already on the freeze (not newer remote).
+                shown = ""
+                for sha in _first_parent_chain(commit_by_sha, tip):
+                    if sha in main_stop:
+                        break
+                    if sha in freeze_shas:
+                        shown = sha
+                        break
+                if not shown and key in freeze_lanes and tip in main_stop:
+                    # Empty / start-only lane on the freeze (Assign tip still on main).
                     shown = tip
-                    for sha in _first_parent_chain(commit_by_sha, tip):
-                        if sha in freeze_shas:
-                            shown = sha
-                            break
-                    if shown not in bucket:
-                        bucket.append(shown)
+                if shown and shown not in bucket:
+                    bucket.append(shown)
         if head_is_side_review_commit(
             repo_dir, head_sha, local_main or origin, review_for_local
         ):

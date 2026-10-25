@@ -346,6 +346,21 @@ class CompareWithSharedDialog(qt.QDialog):
         diff_local = set(self._compare.get("only_local_ids_local") or set())
         diff_remote = set(self._compare.get("only_remote_ids_remote") or set())
 
+        # One palette for Local + Shared + all Result previews (avoid same-rank collisions).
+        compare_branch_names = []
+        for model in (
+            local_model,
+            remote_model,
+            self._compare.get("result"),
+            self._compare.get("linear"),
+            self._compare.get("reset"),
+        ):
+            for spec in (model or {}).get("version_specs") or []:
+                name = str((spec or {}).get("branch") or "").strip()
+                if name:
+                    compare_branch_names.append(name)
+        graph_module.prepare_branch_colors(compare_branch_names)
+
         graphs_row = qt.QWidget()
         graphs_layout = qt.QHBoxLayout(graphs_row)
         graphs_layout.setContentsMargins(0, 0, 0, 0)
@@ -374,6 +389,7 @@ class CompareWithSharedDialog(qt.QDialog):
             diff_side="local",
             minimum_height=200,
             fit_tight=True,
+            refresh_branch_colors=False,
         )
         local_col.addWidget(self._local_canvas, 1)
         graphs_layout.addLayout(local_col, 1)
@@ -397,6 +413,7 @@ class CompareWithSharedDialog(qt.QDialog):
             diff_side="shared",
             minimum_height=200,
             fit_tight=True,
+            refresh_branch_colors=False,
         )
         remote_col.addWidget(self._remote_canvas, 1)
         graphs_layout.addLayout(remote_col, 1)
@@ -545,6 +562,7 @@ class CompareWithSharedDialog(qt.QDialog):
             read_only=True,
             minimum_height=200,
             fit_tight=True,
+            refresh_branch_colors=False,
         )
         result_layout.addWidget(self._result_canvas, 1)
         # Same stretch as the Local | Shared row so graph 3 matches their size.
