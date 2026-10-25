@@ -1326,15 +1326,36 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         from_older_main: bool = False,
         junior: bool = False,
         older_lane: str = "",
+        at_lane_tip: bool = False,
     ) -> str:
-        """When saving from main: Put on main / Create a branch / cancel.
+        """Ask where to save. Returns main | same | branch | cancel.
 
-        Juniors never get Put on main (they can only Share a branch).
-        Older tip view (main or task lane): only Create a branch so later tips stay.
+        - Tip of main (senior): Put on main / Create a branch.
+        - Tip of a side lane: Save on this branch / Create a branch (fork).
+        - Older tip view: Create a branch only (do not rewind the tip).
+        - Junior (legacy path): Create a branch only.
         """
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Save version")
         lane_label = str(older_lane or "").strip() or "main"
+        if at_lane_tip:
+            box.setText("Where should this version be saved?")
+            box.setInformativeText(
+                "Save on this branch — continue on %s.\n"
+                "Create a branch — start a new branch from here."
+                % lane_label
+            )
+            same_btn = box.addButton("Save on this branch", qt.QMessageBox.AcceptRole)
+            branch_btn = box.addButton("Create a branch", qt.QMessageBox.ActionRole)
+            box.addButton("Cancel", qt.QMessageBox.RejectRole)
+            box.setDefaultButton(same_btn)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == same_btn:
+                return "same"
+            if clicked == branch_btn:
+                return "branch"
+            return "cancel"
         if junior or from_older_main:
             if junior and from_older_main:
                 box.setText("Save from this older %s version?" % lane_label)
@@ -7954,7 +7975,23 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             # Attached name but viewing older tip should not happen often; still
             # force Create a branch so we never rewind the tip on Save.
             on_branch = False
-        if not on_branch:
+        if on_branch and not from_older_line:
+            # Tip of a side lane: continue here or fork a new flat lane (sub-branch base).
+            tip_lane = lane_slug or older_lane or "branch"
+            destination = self._promptSaveDestination(
+                at_lane_tip=True,
+                older_lane=tip_lane,
+            )
+            if destination == "cancel":
+                self._appendFeed("Save cancelled.")
+                return
+            if destination == "branch":
+                new_branch_slug = self._promptBranchName()
+                if not new_branch_slug:
+                    self._appendFeed("Save cancelled.")
+                    return
+            # "same" → keep on_branch and commit on the current lane.
+        elif not on_branch:
             # Junior: Create a branch only (cannot Share from main).
             # Older tip (main or task): Create a branch only.
             destination = self._promptSaveDestination(
@@ -7970,6 +8007,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if not new_branch_slug:
                     self._appendFeed("Save cancelled.")
                     return
+            if destination == "main":
+                pass
         default_message = "First version" if not self._currentVersionId else "New version"
         message = self._promptCommitMessage(
             "Save version",
