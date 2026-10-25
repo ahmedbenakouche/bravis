@@ -3047,6 +3047,9 @@ def build_project_history_model(
         unique.sort(key=lambda item: str((commit_by_sha.get(item) or {}).get("date") or ""))
         stub_id = "%s/start" % slug
         stub_sha = sha_by_id.get(stub_id) or ""
+        parent_slug = parent_of.get(slug) or parent_lane_slug(slug) or ""
+        parent_stub_id = "%s/start" % parent_slug if parent_slug else ""
+        parent_stub_sha = sha_by_id.get(parent_stub_id) or ""
         for index, sha in enumerate(unique, start=1):
             record = commit_by_sha.get(sha) or {}
             parents = record.get("parents") or []
@@ -3055,6 +3058,16 @@ def build_project_history_model(
             # First real lane commit hangs off …/start, not directly off main.
             if stub_id in specs_by_id and first and stub_sha and first == stub_sha:
                 parent_id = stub_id
+            # Sub-branch created from a task …/start: Git parent SHA is the
+            # main anchor (same as start). Hang under parent …/start, not main/N.
+            elif (
+                parent_stub_id
+                and parent_stub_id in specs_by_id
+                and first
+                and parent_stub_sha
+                and first == parent_stub_sha
+            ):
+                parent_id = parent_stub_id
             add_spec("%s/%d" % (slug, index), sha, parent_id, slug)
 
     leftover = []

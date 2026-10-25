@@ -1402,6 +1402,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "branch"
         return "cancel"
 
+    def _forkParentLaneForCreate(self, hint_lane: str = "") -> str:
+        """Lane to nest under for Create (empty = under main).
+
+        Prefers the Version-tree checkout: a ``…/start`` node still belongs to
+        its task lane (same SHA as main must not clear the parent).
+        """
+        version_id = str(getattr(self, "_currentVersionId", None) or "").strip()
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        for spec in bundle.get("version_specs") or []:
+            if str((spec or {}).get("id") or "").strip() != version_id:
+                continue
+            branch = normalize_lane_path(str((spec or {}).get("branch") or "").strip())
+            if branch and branch.lower() != "main":
+                return branch
+            break
+        source = normalize_lane_path(hint_lane or "")
+        if source and source.lower() != "main":
+            return source
+        return ""
+
     def _promptBranchName(self, parent_lane: str = "") -> str:
         """Ask for a short branch name (Create a branch). Empty = cancelled.
 
@@ -8006,7 +8026,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed("Save cancelled.")
                 return
             if destination == "branch":
-                fork_parent = normalize_lane_path(tip_lane)
+                fork_parent = self._forkParentLaneForCreate(
+                    tip_lane or older_lane or lane_slug
+                )
                 new_branch_slug = self._promptBranchName(parent_lane=fork_parent)
                 if not new_branch_slug:
                     self._appendFeed("Save cancelled.")
@@ -8015,7 +8037,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         elif not on_branch:
             # Junior: Create a branch only (cannot Share from main).
             # Older tip (main or task): Create a branch only.
-            # From a side-lane node: nest under that lane (parent/child).
+            # From a side-lane node (incl. …/start): nest under that lane.
             destination = self._promptSaveDestination(
                 from_older_main=from_older_line,
                 junior=self._shareNeedsApproval(),
@@ -8025,10 +8047,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed("Save cancelled.")
                 return
             if destination == "branch":
-                fork_parent = ""
-                source_lane = normalize_lane_path(older_lane or lane_slug or "")
-                if source_lane and source_lane.lower() != "main":
-                    fork_parent = source_lane
+                fork_parent = self._forkParentLaneForCreate(
+                    older_lane or lane_slug
+                )
                 new_branch_slug = self._promptBranchName(parent_lane=fork_parent)
                 if not new_branch_slug:
                     self._appendFeed("Save cancelled.")
