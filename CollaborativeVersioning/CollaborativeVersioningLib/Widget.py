@@ -1402,42 +1402,47 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "branch"
         return "cancel"
 
+    def _isMainHistoryLane(self, lane: str) -> bool:
+        """True for main (incl. normalize_branch_slug('main') → branch-main)."""
+        raw = str(lane or "").strip().lower()
+        if not raw or raw == "main":
+            return True
+        path = normalize_lane_path(lane).lower()
+        return path in ("", "main", "branch-main")
+
     def _forkParentLaneForCreate(self, hint_lane: str = "") -> str:
-        """Lane to nest under for Create (empty = under main).
+        """Lane to nest under for Create (empty = flat under main / cv-review).
 
         Prefers the Version-tree checkout: a ``…/start`` node still belongs to
-        its task lane (same SHA as main must not clear the parent).
+        its task lane (same SHA as main must not clear the parent). Never nest
+        under main itself (cv-review/<name>, not cv-review/branch-main/<name>).
         """
         version_id = str(getattr(self, "_currentVersionId", None) or "").strip()
         bundle = getattr(self, "_project_history_bundle", None) or {}
         for spec in bundle.get("version_specs") or []:
             if str((spec or {}).get("id") or "").strip() != version_id:
                 continue
-            branch = normalize_lane_path(str((spec or {}).get("branch") or "").strip())
-            if branch and branch.lower() != "main":
-                return branch
+            branch = str((spec or {}).get("branch") or "").strip()
+            if branch and not self._isMainHistoryLane(branch):
+                return normalize_lane_path(branch)
             break
-        source = normalize_lane_path(hint_lane or "")
-        if source and source.lower() != "main":
-            return source
+        if hint_lane and not self._isMainHistoryLane(hint_lane):
+            return normalize_lane_path(hint_lane)
         return ""
 
     def _promptBranchName(self, parent_lane: str = "") -> str:
-        """Ask for a short branch name (Create a branch). Empty = cancelled.
+        """Ask for a branch name (Create a branch). Empty = cancelled.
 
-        When ``parent_lane`` is set (fork from a side lane), the real Git name
-        becomes ``parent/child`` so hierarchy is in the branch name.
+        When ``parent_lane`` is a side lane, Git becomes parent+child; under main
+        the name stays flat (cv-review/<name>).
         """
-        parent = normalize_lane_path(parent_lane)
-        hint = (
-            "Short name for this sub-branch (saved as %s/<name>):" % parent
-            if parent
-            else "Name for this branch:"
-        )
+        parent = ""
+        if parent_lane and not self._isMainHistoryLane(parent_lane):
+            parent = normalize_lane_path(parent_lane)
         name, ok = _qt_input_text(
             slicer.util.mainWindow(),
             "Branch name",
-            hint,
+            "Name for this branch:",
             "",
         )
         if not ok:
