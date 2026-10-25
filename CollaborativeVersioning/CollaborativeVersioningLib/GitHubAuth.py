@@ -1276,17 +1276,50 @@ def git_branch_for_history_lane(lane: str) -> str:
 
 
 def is_viewing_older_than_branch_tip(repo_dir: str, lane: str = "main") -> bool:
-    """True when HEAD is a strict ancestor of the lane's branch tip.
+    """True when HEAD is a strict ancestor of the lane's effective tip.
 
     Happens after Switch to an older version: the tip (e.g. unshared main/2–3)
     stays on the branch while the worktree shows an earlier commit.
+
+    For ``main``, only the local tip counts (origin ahead without Update must not
+    force Create a branch).
+
+    For side lanes (``cv-review/*``), also consider ``origin/cv-review/<slug>``:
+    task work is often Shared by a junior first, so the Version tree can show
+    ``…/2`` from origin while ``refs/heads/cv-review/…`` still points at ``…/1``.
+    Without the remote tip, Save on ``…/1`` looked like the tip and skipped
+    Create a branch (``…/start`` still worked because its SHA is main).
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return False
     branch = git_branch_for_history_lane(lane)
-    tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
     head = _git_rev_parse(repo_dir, "HEAD")
-    if not tip or not head or tip == head:
+    if not head:
+        return False
+    candidates = []
+    local_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
+    if local_tip:
+        candidates.append(local_tip)
+    # Side lanes only — do not pull origin/main into this check (main Update flow).
+    if branch != "main":
+        remote_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch)
+        if remote_tip and remote_tip not in candidates:
+            candidates.append(remote_tip)
+    if not candidates:
+        return False
+    tip = candidates[0]
+    for cand in candidates[1:]:
+        if tip == cand:
+            continue
+        if _is_ancestor(repo_dir, tip, cand):
+            tip = cand
+        elif not _is_ancestor(repo_dir, cand, tip):
+            # Diverged tips: prefer the one that still has HEAD as ancestor.
+            if _is_ancestor(repo_dir, head, cand) and not _is_ancestor(
+                repo_dir, head, tip
+            ):
+                tip = cand
+    if not tip or tip == head:
         return False
     return _is_ancestor(repo_dir, head, tip)
 
