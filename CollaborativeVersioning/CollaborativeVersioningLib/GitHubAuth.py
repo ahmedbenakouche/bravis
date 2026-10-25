@@ -908,11 +908,12 @@ def commit_local_version(repo_dir: str, message: str) -> None:
 def start_local_review_branch(repo_dir: str, branch_name: str) -> str:
     """Create or switch to cv-review/<slug> at HEAD without publishing. Returns slug.
 
-    Keeps the worktree (mixed reset) so a following Save can commit on that branch.
+    ``branch_name`` may be nested (``parent/child``). Keeps the worktree (mixed
+    reset) so a following Save can commit on that branch.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
-    slug = normalize_branch_slug(branch_name)
+    slug = normalize_lane_path(branch_name)
     if not slug:
         raise GitHubAuthError("Choose a branch name first.")
     branch = review_branch_for(slug)
@@ -988,6 +989,11 @@ def _drop_empty_local_only_review_branch(repo_dir: str, branch: str, tip_sha: st
 
     Returns the SHA to treat as current (main tip when the branch was dropped).
     Assigned/shared task branches (origin/cv-review/*) are left alone so …/start stays.
+
+    Sub-branches forked from another DIY/task lane are empty when their tip only
+    sits on that parent lane's history (e.g. delete gd/1 → tip falls back to
+    lol/2). The old "ahead of main" check kept those zombie refs and they
+    reappeared on the next Save.
     """
     if not branch.startswith("cv-review/"):
         return tip_sha
@@ -1001,14 +1007,30 @@ def _drop_empty_local_only_review_branch(repo_dir: str, branch: str, tip_sha: st
     tip = _git_rev_parse(repo_dir, tip_sha) or str(tip_sha or "").strip()
     if not tip or not main_tip:
         return tip_sha
-    # Still ahead of main with its own commits → keep the branch.
-    if tip.lower() != main_tip.lower() and _is_ancestor(repo_dir, main_tip, tip):
+    commit_by_sha = _read_repo_commits(repo_dir)
+    main_set = set(_first_parent_chain(commit_by_sha, main_tip)) if main_tip else set()
+    if not main_set and main_tip:
+        main_set = {main_tip}
+    our_side = set(_unique_side_chain(commit_by_sha, tip, main_set))
+    other_side: set[str] = set()
+    for slug, tips in _review_tips(repo_dir, local_only=True).items():
+        other_branch = review_branch_for(slug)
+        if other_branch == branch:
+            continue
+        for other_tip in tips or ():
+            sha = str(other_tip or "").strip()
+            if not sha:
+                continue
+            other_side.update(_unique_side_chain(commit_by_sha, sha, main_set))
+            other_side.add(sha)
+    # Also treat main-line commits as not unique to this DIY lane.
+    unique = {sha for sha in our_side if sha and sha not in other_side and sha not in main_set}
+    # Tip coincides with another lane tip → no identity of its own.
+    if tip in other_side or tip in main_set:
+        unique = set()
+    if unique:
         return tip_sha
-    # Diverged from main → do not auto-delete.
-    if tip.lower() != main_tip.lower() and not _is_ancestor(repo_dir, tip, main_tip):
-        return tip_sha
-    # tip == main or tip is on main's history → empty DIY lane after deleting
-    # the only local version; drop the branch and return to main.
+    # Empty DIY lane (incl. sub-branch whose tip fell back onto the parent lane).
     login = current_login()
     if login:
         _configure_repo_identity(repo_dir, login)
@@ -1258,7 +1280,7 @@ def publish_current_line(repo_dir: str, branch_name: str | None = None) -> str:
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
-    slug = normalize_branch_slug(branch_name) if branch_name else ""
+    slug = normalize_lane_path(branch_name) if branch_name else ""
     if slug:
         return publish_review_branch(repo_dir, slug)
     if work_is_on_review_branch(repo_dir):
@@ -1532,7 +1554,7 @@ def remote_people_access_or_none(full_name: str, login: str | None = None) -> st
 
 
 def normalize_branch_slug(name: str) -> str:
-    """Safe lane / git-ref slug for a named work branch (not tied to a login)."""
+    """Safe single-segment lane name (no ``/``). Use ``normalize_lane_path`` for nests."""
     text = " ".join(str(name or "").strip().split())
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip(".-_")
     if not text:
@@ -1542,9 +1564,71 @@ def normalize_branch_slug(name: str) -> str:
     return text[:64]
 
 
+# Git cannot have both refs/heads/cv-review/sos and .../sos/kg (file vs dir).
+# UI/history keep ``sos/kg``; git refs use ``cv-review/sos+kg``.
+_LANE_NEST_GIT_SEP = "+"
+
+
+def normalize_lane_path(name: str) -> str:
+    """Lane path ``parent/child/...`` (each segment sanitized). Empty if invalid."""
+    raw = str(name or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    # Accept git-encoded form sos+kg as well as UI form sos/kg.
+    if _LANE_NEST_GIT_SEP in raw and "/" not in raw:
+        raw = raw.replace(_LANE_NEST_GIT_SEP, "/")
+    parts: list[str] = []
+    for piece in raw.split("/"):
+        seg = normalize_branch_slug(piece)
+        if not seg:
+            return ""
+        parts.append(seg)
+    return "/".join(parts)
+
+
+def lane_path_to_git_suffix(name: str) -> str:
+    """``sos/kg`` → ``sos+kg`` for refs under cv-review/."""
+    path = normalize_lane_path(name)
+    if not path:
+        return ""
+    return path.replace("/", _LANE_NEST_GIT_SEP)
+
+
+def git_suffix_to_lane_path(suffix: str) -> str:
+    """``sos+kg`` (or legacy ``sos/kg``) → lane path ``sos/kg``."""
+    return normalize_lane_path(suffix)
+
+
+def parent_lane_slug(name: str) -> str:
+    """Immediate parent path (``lol/sq`` → ``lol``), or \"\" under main."""
+    path = normalize_lane_path(name)
+    if "/" not in path:
+        return ""
+    return path.rsplit("/", 1)[0]
+
+
+def leaf_lane_slug(name: str) -> str:
+    """Last segment of a lane path (``lol/sq`` → ``sq``)."""
+    path = normalize_lane_path(name)
+    if not path:
+        return ""
+    return path.rsplit("/", 1)[-1]
+
+
+def child_lane_path(parent: str, child_name: str) -> str:
+    """Build ``parent/child`` (parent may itself be nested). Child is one segment."""
+    leaf = normalize_branch_slug(child_name)
+    if not leaf:
+        return ""
+    base = normalize_lane_path(parent)
+    if not base:
+        return leaf
+    return "%s/%s" % (base, leaf)
+
+
 def review_lane_slug(name: str) -> str:
-    """Version-tree column for a named work branch."""
-    return normalize_branch_slug(name) or ""
+    """Version-tree column for a named work branch (may be nested)."""
+    return normalize_lane_path(name) or ""
 
 
 def review_lane_tip_integrated_into_main(repo_dir: str, lane: str) -> bool:
@@ -1554,7 +1638,7 @@ def review_lane_tip_integrated_into_main(repo_dir: str, lane: str) -> bool:
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return False
-    slug = normalize_branch_slug(lane)
+    slug = normalize_lane_path(lane)
     if not slug:
         return False
     branch = review_branch_for(slug)
@@ -1572,8 +1656,8 @@ def review_lane_tip_integrated_into_main(repo_dir: str, lane: str) -> bool:
 
 
 def review_branch_for(name: str) -> str:
-    """Git branch for a named work line: cv-review/<slug>."""
-    safe = normalize_branch_slug(name) or "branch"
+    """Git branch for a lane: ``cv-review/sos`` or ``cv-review/sos+kg`` (nested)."""
+    safe = lane_path_to_git_suffix(name) or "branch"
     return "cv-review/%s" % safe
 
 
@@ -1582,7 +1666,7 @@ def current_review_branch_slug(repo_dir: str) -> str:
     current = _current_branch_name(repo_dir)
     if not current.startswith("cv-review/"):
         return ""
-    return normalize_branch_slug(current.split("/", 1)[-1])
+    return git_suffix_to_lane_path(current.split("/", 1)[-1])
 
 
 def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
@@ -1600,7 +1684,11 @@ def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
     if not login:
         raise GitHubNotSignedInError(not_signed_in_message())
     _configure_repo_identity(repo_dir, login)
-    slug = normalize_branch_slug(branch_name) if branch_name else current_review_branch_slug(repo_dir)
+    slug = (
+        normalize_lane_path(branch_name)
+        if branch_name
+        else current_review_branch_slug(repo_dir)
+    )
     if not slug:
         raise GitHubAuthError("Choose a branch name first.")
     branch = review_branch_for(slug)
@@ -1646,7 +1734,7 @@ def submit_review_line(full_name: str, branch_name: str | None = None) -> str:
     login = current_login()
     if not login:
         raise GitHubNotSignedInError(not_signed_in_message())
-    slug = normalize_branch_slug(branch_name) if branch_name else ""
+    slug = normalize_lane_path(branch_name) if branch_name else ""
     if not slug:
         dest = local_project_dir(full_name, login)
         slug = current_review_branch_slug(dest)
@@ -1819,13 +1907,13 @@ def fetch_share_request_sha(full_name: str, branch: str) -> tuple[str, str]:
 
 
 def _review_login_from_ref(ref: str) -> str:
-    """Lane slug from a cv-review/<name> ref."""
+    """Lane path from a cv-review/* ref (``…/sos+kg`` → ``sos/kg``)."""
     text = (ref or "").replace("\\", "/").strip()
     marker = "cv-review/"
     if marker not in text:
         return ""
     slug = text.split(marker, 1)[-1].strip().strip("/")
-    return normalize_branch_slug(slug.split("/")[0] if slug else "") or ""
+    return git_suffix_to_lane_path(slug) or ""
 
 
 def _history_lane_slug(name: str) -> str:
@@ -2196,8 +2284,10 @@ def _sync_origin_review_tips_from_ls_remote(repo_dir: str) -> dict[str, list[str
     tips: dict[str, list[str]] = {}
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return tips
+    # Full ls-remote then filter: nested lanes are cv-review/parent/child (a
+    # single ``cv-review/*`` glob only matches one path segment).
     listed = _run_git(
-        ["ls-remote", "--refs", "origin", "refs/heads/cv-review/*"],
+        ["ls-remote", "--refs", "origin"],
         cwd=repo_dir,
         timeout=120,
     )
@@ -2211,19 +2301,22 @@ def _sync_origin_review_tips_from_ls_remote(repo_dir: str) -> dict[str, list[str
         sha, ref = text.split("\t", 1)
         sha = str(sha or "").strip()
         ref = str(ref or "").strip()
+        if "refs/heads/cv-review/" not in ref.replace("\\", "/"):
+            continue
         slug = _review_login_from_ref(ref)
         if not sha or not slug:
             continue
         key = slug.lower()
         tips[key] = [sha]
-        tracking = "refs/remotes/origin/cv-review/%s" % slug
+        branch = review_branch_for(slug)
+        tracking = "refs/remotes/origin/%s" % branch
         current = _git_rev_parse(repo_dir, tracking)
         if current == sha:
             continue
         # Fetch the commit object if this clone does not have it yet.
         if not _git_rev_parse(repo_dir, sha):
             got = _run_git(
-                ["fetch", "origin", "%s:refs/remotes/origin/cv-review/%s" % (ref, slug)],
+                ["fetch", "origin", "%s:refs/remotes/origin/%s" % (ref, branch)],
                 cwd=repo_dir,
                 timeout=180,
             )
@@ -2413,6 +2506,280 @@ def _unique_side_chain(commit_by_sha: dict[str, dict], tip: str, stop: set[str])
     return chain
 
 
+def _sha_is_ancestor_in_map(
+    commit_by_sha: dict[str, dict], ancestor: str, descendant: str
+) -> bool:
+    """True when ancestor is on descendant's first-parent chain (incl. equal)."""
+    anc = str(ancestor or "").strip()
+    desc = str(descendant or "").strip()
+    if not anc or not desc:
+        return False
+    if anc == desc:
+        return True
+    for sha in _first_parent_chain(commit_by_sha, desc):
+        if sha == anc:
+            return True
+    return False
+
+
+def _nearest_ancestor_tip(
+    commit_by_sha: dict[str, dict], tip: str, other_tips: list[str]
+) -> str:
+    """Closest other tip that is a strict first-parent ancestor of tip."""
+    best = ""
+    for other in other_tips:
+        other_sha = str(other or "").strip()
+        if not other_sha or other_sha == tip:
+            continue
+        if not _sha_is_ancestor_in_map(commit_by_sha, other_sha, tip):
+            continue
+        if other_sha == tip:
+            continue
+        # Prefer the ancestor closest to tip (descendant of previous best).
+        if not best or _sha_is_ancestor_in_map(commit_by_sha, best, other_sha):
+            best = other_sha
+    return best
+
+
+def _commit_date(commit_by_sha: dict[str, dict], sha: str) -> str:
+    return str((commit_by_sha.get(str(sha or "").strip()) or {}).get("date") or "")
+
+
+def _lane_tips_key_lookup(lane_tips: dict[str, str], want: str) -> str:
+    """Return the actual key in lane_tips matching want (case-insensitive)."""
+    target = normalize_lane_path(want)
+    if not target:
+        return ""
+    if target in (lane_tips or {}):
+        return target
+    lower = target.lower()
+    for key in (lane_tips or {}):
+        if str(key or "").strip().lower() == lower:
+            return str(key).strip()
+    return ""
+
+
+def _resolve_parent_lane(
+    slug: str,
+    lane_tips: dict[str, str],
+    commit_by_sha: dict[str, dict],
+    main_set: set[str],
+) -> str:
+    """Parent lane from naming convention ``parent/child`` (\"\" = under main).
+
+    Nested Create builds ``cv-review/<parent>/<child>``; the parent path is the
+    prefix. Longest existing prefix wins (``sos/p/w`` → ``sos/p`` if present).
+    """
+    del commit_by_sha, main_set  # hierarchy comes from the name, not Git dates
+    path = normalize_lane_path(slug)
+    if "/" not in path:
+        return ""
+    parts = path.split("/")
+    for end in range(len(parts) - 1, 0, -1):
+        prefix = "/".join(parts[:end])
+        found = _lane_tips_key_lookup(lane_tips, prefix)
+        if found:
+            return found
+    return "/".join(parts[:-1])
+
+
+def _build_parent_lane_map(
+    lane_tips: dict[str, str],
+    commit_by_sha: dict[str, dict],
+    main_set: set[str],
+) -> dict[str, str]:
+    """slug → parent slug (missing/\"\" = under main). Breaks cycles safely."""
+    parent_of: dict[str, str] = {}
+    for slug in (lane_tips or {}):
+        name = str(slug or "").strip()
+        if not name:
+            continue
+        parent_of[name] = _resolve_parent_lane(
+            name, lane_tips, commit_by_sha, main_set
+        )
+    for slug in list(parent_of):
+        seen = {slug}
+        cur = parent_of.get(slug) or ""
+        while cur:
+            if cur in seen:
+                parent_of[slug] = ""
+                break
+            seen.add(cur)
+            cur = parent_of.get(cur) or ""
+    return parent_of
+
+
+def _exclusive_side_chain(
+    commit_by_sha: dict[str, dict],
+    tip: str,
+    all_tips: list[str],
+    main_set: set[str],
+    parent_tip: str = "",
+    sibling_tips: list[str] | None = None,
+) -> list[str]:
+    """Side commits owned by this tip for the Version tree (hierarchy-aware).
+
+    Walk tip → main. Stop at main, at the parent-lane tip, or at history that
+    belongs on the parent line. Child forks are ignored when deciding stops so
+    a mid-lane Create (sos/1 → q) cannot steal sos/1 from sos. Sibling tips
+    under the same parent still stop at their shared fork point.
+    """
+    tip_sha = str(tip or "").strip()
+    if not tip_sha or tip_sha in (main_set or set()):
+        return []
+    parent_tip_sha = str(parent_tip or "").strip()
+    if sibling_tips is None:
+        others = [
+            str(other or "").strip()
+            for other in (all_tips or [])
+            if str(other or "").strip() and str(other or "").strip() != tip_sha
+        ]
+        if not parent_tip_sha:
+            parent_tip_sha = _nearest_ancestor_tip(commit_by_sha, tip_sha, others)
+        siblings = [
+            other
+            for other in others
+            if other != parent_tip_sha
+            and not _sha_is_ancestor_in_map(commit_by_sha, tip_sha, other)
+            and not _sha_is_ancestor_in_map(commit_by_sha, other, tip_sha)
+        ]
+    else:
+        siblings = [
+            str(other or "").strip()
+            for other in sibling_tips
+            if str(other or "").strip() and str(other or "").strip() != tip_sha
+        ]
+    chain: list[str] = []
+    for sha in _first_parent_chain(commit_by_sha, tip_sha):
+        if not sha or sha in (main_set or set()):
+            break
+        if parent_tip_sha and sha == parent_tip_sha:
+            break
+        if parent_tip_sha and sha != tip_sha and _sha_is_ancestor_in_map(
+            commit_by_sha, sha, parent_tip_sha
+        ):
+            break
+        # Diverged siblings (same parent / both under main): do not take the
+        # shared trunk — the parent lane (or main) keeps the fork point.
+        shared_with_sibling = False
+        for other in siblings:
+            if sha == other or _sha_is_ancestor_in_map(commit_by_sha, sha, other):
+                shared_with_sibling = True
+                break
+        if shared_with_sibling:
+            break
+        chain.append(sha)
+    chain.reverse()
+    return chain
+
+
+def _topo_lane_order(
+    lane_tips: dict[str, str],
+    parent_of: dict[str, str],
+    commit_by_sha: dict[str, dict] | None = None,
+) -> list[str]:
+    """Parent lanes before children; older tip first among siblings."""
+    pending = {str(s).strip() for s in (lane_tips or {}) if str(s).strip()}
+    ordered: list[str] = []
+
+    def _ready_key(slug: str) -> tuple:
+        tip = str((lane_tips or {}).get(slug) or "").strip()
+        return (_commit_date(commit_by_sha or {}, tip), tip, slug)
+
+    while pending:
+        ready = [
+            slug
+            for slug in pending
+            if (parent_of.get(slug) or "") not in pending
+        ]
+        if not ready:
+            ordered.extend(sorted(pending, key=_ready_key))
+            break
+        for slug in sorted(ready, key=_ready_key):
+            ordered.append(slug)
+            pending.discard(slug)
+    return ordered
+
+
+def _prefer_unclaimed_owner(
+    candidates: list[str],
+    lane_tips: dict[str, str],
+    parent_of: dict[str, str],
+    commit_by_sha: dict[str, dict],
+    sha: str,
+) -> str:
+    """Prefer parent lane over child, then farthest tip, then older tip."""
+    best = ""
+    best_tip = ""
+    best_depth = 10**9
+    best_date = ""
+    for slug in candidates:
+        name = str(slug or "").strip()
+        tip = str((lane_tips or {}).get(name) or "").strip()
+        if not name or not tip:
+            continue
+        if not _sha_is_ancestor_in_map(commit_by_sha, sha, tip):
+            continue
+        depth = 0
+        walk = name
+        seen = set()
+        while walk and walk not in seen:
+            seen.add(walk)
+            parent = parent_of.get(walk) or ""
+            if not parent:
+                break
+            depth += 1
+            walk = parent
+        tip_date = _commit_date(commit_by_sha, tip)
+        farther = bool(
+            best_tip and _sha_is_ancestor_in_map(commit_by_sha, best_tip, tip)
+        )
+        closer_hier = depth < best_depth
+        same_hier_farther = depth == best_depth and farther
+        incomparable = not farther and not (
+            best_tip and _sha_is_ancestor_in_map(commit_by_sha, tip, best_tip)
+        )
+        same_hier_older = (
+            depth == best_depth
+            and incomparable
+            and bool(best_date and tip_date and tip_date < best_date)
+        )
+        same_hier_tie_tip = (
+            depth == best_depth
+            and incomparable
+            and tip_date == best_date
+            and bool(best_tip)
+            and tip < best_tip
+        )
+        if not best or closer_hier or same_hier_farther or same_hier_older or same_hier_tie_tip:
+            best = name
+            best_tip = tip
+            best_depth = depth
+            best_date = tip_date
+    return best
+
+
+def _prefer_farther_tip(
+    commit_by_sha: dict[str, dict], current: str, candidate: str
+) -> str:
+    """Keep the tip that has the other as ancestor; else prefer candidate if newer."""
+    cur = str(current or "").strip()
+    cand = str(candidate or "").strip()
+    if not cand:
+        return cur
+    if not cur:
+        return cand
+    if cur == cand:
+        return cur
+    if _sha_is_ancestor_in_map(commit_by_sha, cur, cand):
+        return cand
+    if _sha_is_ancestor_in_map(commit_by_sha, cand, cur):
+        return cur
+    cur_date = str((commit_by_sha.get(cur) or {}).get("date") or "")
+    cand_date = str((commit_by_sha.get(cand) or {}).get("date") or "")
+    return cand if cand_date > cur_date else cur
+
+
 def _lane_start_anchor_sha(
     commit_by_sha: dict[str, dict], tip: str, main_set: set[str]
 ) -> str:
@@ -2458,9 +2825,12 @@ def _slug_from_merge(
     found = re.search(r"Accept version from\s+(\S+)", message, re.I)
     if found:
         return _history_lane_slug(found.group(1))
-    found = re.search(r"cv-review/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)", message)
+    found = re.search(
+        r"cv-review/([A-Za-z0-9._+/-]+)",
+        message,
+    )
     if found:
-        return _history_lane_slug(found.group(1))
+        return _history_lane_slug(found.group(1).rstrip("/.,)+"))
     extra_chain = set(_first_parent_chain(commit_by_sha, extra_sha))
     for login, tips in review_tips.items():
         if isinstance(tips, str):
@@ -2514,6 +2884,10 @@ def build_project_history_model(
     ``start_stub_slugs``: branch slugs that keep a permanent ``…/start`` anchor
     (assigned/shared task lanes). The stub stays even after ``…/1``, ``…/2``, …
     Local DIY branches must not get a start stub.
+
+    Side lanes form a hierarchy under main from nested names
+    (``cv-review/parent/child`` → parent_lane = parent). Parents are labeled
+    before children; a tip only keeps commits after the parent line.
     """
     empty = {
         "commit_history": [],
@@ -2568,8 +2942,10 @@ def build_project_history_model(
     def remember_side(slug: str, tip: str) -> None:
         if not slug or not tip:
             return
-        lane_tips[slug] = tip
-        lane_shas.setdefault(slug, []).extend(_unique_side_chain(commit_by_sha, tip, main_set))
+        # Keep the farthest tip per slug (local + origin / merge extras).
+        lane_tips[slug] = _prefer_farther_tip(
+            commit_by_sha, lane_tips.get(slug) or "", tip
+        )
 
     for login, tips in sorted(review_tips.items(), key=lambda item: item[0]):
         slug = _history_lane_slug(login)
@@ -2581,6 +2957,51 @@ def build_project_history_model(
         parents = (commit_by_sha.get(merge_sha) or {}).get("parents") or []
         for extra in parents[1:]:
             remember_side(_slug_from_merge(commit_by_sha, merge_sha, extra, review_tips), extra)
+
+    # Hierarchy under main: each side lane has a parent lane (\"\" = main).
+    parent_of = _build_parent_lane_map(lane_tips, commit_by_sha, main_set)
+    tips_by_parent: dict[str, list[str]] = {}
+    for slug, tip in lane_tips.items():
+        name = str(slug or "").strip()
+        tip_sha = str(tip or "").strip()
+        if not name or not tip_sha:
+            continue
+        key = parent_of.get(name) or ""
+        tips_by_parent.setdefault(key, []).append(tip_sha)
+
+    all_tips = [tip for tip in lane_tips.values() if tip]
+    for slug, tip in lane_tips.items():
+        name = str(slug or "").strip()
+        tip_sha = str(tip or "").strip()
+        parent_slug = parent_of.get(name) or ""
+        parent_tip = str(lane_tips.get(parent_slug) or "").strip() if parent_slug else ""
+        siblings = list(tips_by_parent.get(parent_slug) or [])
+        lane_shas[name] = list(
+            _exclusive_side_chain(
+                commit_by_sha,
+                tip_sha,
+                all_tips,
+                main_set,
+                parent_tip=parent_tip,
+                sibling_tips=siblings,
+            )
+        )
+    # Shared ancestors left unclaimed: prefer parent lane over child, then
+    # farthest tip (mid-fork must not give sos/1 to q/gd).
+    claimed = {sha for shas in lane_shas.values() for sha in shas}
+    unclaimed_owners: dict[str, list[str]] = {}
+    for slug, tip in lane_tips.items():
+        for sha in _unique_side_chain(commit_by_sha, tip, main_set):
+            if not sha or sha in claimed or sha in main_set:
+                continue
+            unclaimed_owners.setdefault(sha, []).append(slug)
+    for sha, slugs in unclaimed_owners.items():
+        best = _prefer_unclaimed_owner(
+            slugs, lane_tips, parent_of, commit_by_sha, sha
+        )
+        if best:
+            lane_shas.setdefault(best, []).append(sha)
+            claimed.add(sha)
 
     # Permanent …/start anchors for Assign task lanes only (even after …/1+).
     # DIY Share branches must not be listed in start_stub_slugs.
@@ -2611,7 +3032,11 @@ def build_project_history_model(
         # Same SHA as main anchor — not registered in id_by_sha (main keeps the id).
         sha_by_id[stub_id] = anchor
 
-    for slug, shas in sorted(lane_shas.items()):
+    # Parent lanes before children so fork edges resolve (sos before q, …).
+    lane_order = _topo_lane_order(lane_tips, parent_of, commit_by_sha)
+
+    for slug in lane_order:
+        shas = lane_shas.get(slug) or []
         unique = []
         seen = set()
         for sha in shas:
@@ -3934,8 +4359,8 @@ def _lane_slug_for_git_branch(branch: str) -> str:
     if not name or name == "main":
         return "main"
     if name.startswith("cv-review/"):
-        return normalize_branch_slug(name.split("/", 1)[-1]) or name
-    return normalize_branch_slug(name) or name
+        return git_suffix_to_lane_path(name.split("/", 1)[-1]) or name
+    return git_suffix_to_lane_path(name) or name
 
 
 def _integrate_shared_review_lane(repo_dir: str, slug: str) -> None:

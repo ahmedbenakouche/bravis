@@ -96,6 +96,8 @@ from CollaborativeVersioningLib.GitHubAuth import (
     review_branch_for,
     current_review_branch_slug,
     normalize_branch_slug,
+    normalize_lane_path,
+    child_lane_path,
     submit_review_line,
     find_open_review_request,
     find_open_review_request_for_branch,
@@ -1400,21 +1402,39 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "branch"
         return "cancel"
 
-    def _promptBranchName(self) -> str:
-        """Ask for a branch name (Create a branch). Empty = cancelled."""
+    def _promptBranchName(self, parent_lane: str = "") -> str:
+        """Ask for a short branch name (Create a branch). Empty = cancelled.
+
+        When ``parent_lane`` is set (fork from a side lane), the real Git name
+        becomes ``parent/child`` so hierarchy is in the branch name.
+        """
+        parent = normalize_lane_path(parent_lane)
+        hint = (
+            "Short name for this sub-branch (saved as %s/<name>):" % parent
+            if parent
+            else "Name for this branch:"
+        )
         name, ok = _qt_input_text(
             slicer.util.mainWindow(),
             "Branch name",
-            "Name for this branch:",
+            hint,
             "",
         )
         if not ok:
             return ""
-        slug = normalize_branch_slug(name)
-        if not slug:
+        if any(ch in str(name or "") for ch in ("/", "\\", "+")):
+            self._appendFeed(
+                "Use a short name without '/' or '+' — the parent is added automatically.",
+                error=True,
+            )
+            return ""
+        leaf = normalize_branch_slug(name)
+        if not leaf:
             self._appendFeed("Enter a valid branch name.", error=True)
             return ""
-        return slug
+        if parent:
+            return child_lane_path(parent, leaf)
+        return leaf
 
     def _promptTaskBranchName(
         self,
@@ -1486,7 +1506,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         lane = (self._historyLaneForVersion(version_id) or "main").strip()
         if not lane or lane.lower() == "main":
             return ""
-        return normalize_branch_slug(lane) or ""
+        return normalize_lane_path(lane) or ""
 
     def _confirmShareCurrentLine(self, local_path: str) -> bool:
         """Explain exactly what Share will publish on the current branch."""
@@ -7318,7 +7338,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not me or not self._canAssignTask():
             self._appendFeed("Only a senior can merge their branch onto main.", error=True)
             return
-        slug = normalize_branch_slug(lane) or self._currentNamedBranchSlug()
+        slug = normalize_lane_path(lane) or self._currentNamedBranchSlug()
         if not slug:
             self._appendFeed("Switch to your branch first.", error=True)
             return
@@ -7383,7 +7403,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._appendFeed("Share your branch first.", error=True)
 
     def _submitOwnReviewLine(self, lane: str = "", version_id: str = "") -> None:
-        slug = normalize_branch_slug(lane) or self._currentNamedBranchSlug()
+        slug = normalize_lane_path(lane) or self._currentNamedBranchSlug()
         if not slug:
             self._showShareBranchBeforeReviewHint()
             return
@@ -7976,7 +7996,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             # force Create a branch so we never rewind the tip on Save.
             on_branch = False
         if on_branch and not from_older_line:
-            # Tip of a side lane: continue here or fork a new flat lane (sub-branch base).
+            # Tip of a side lane: continue here or fork parent/<child>.
             tip_lane = lane_slug or older_lane or "branch"
             destination = self._promptSaveDestination(
                 at_lane_tip=True,
@@ -7986,7 +8006,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed("Save cancelled.")
                 return
             if destination == "branch":
-                new_branch_slug = self._promptBranchName()
+                fork_parent = normalize_lane_path(tip_lane)
+                new_branch_slug = self._promptBranchName(parent_lane=fork_parent)
                 if not new_branch_slug:
                     self._appendFeed("Save cancelled.")
                     return
@@ -7994,6 +8015,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         elif not on_branch:
             # Junior: Create a branch only (cannot Share from main).
             # Older tip (main or task): Create a branch only.
+            # From a side-lane node: nest under that lane (parent/child).
             destination = self._promptSaveDestination(
                 from_older_main=from_older_line,
                 junior=self._shareNeedsApproval(),
@@ -8003,7 +8025,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed("Save cancelled.")
                 return
             if destination == "branch":
-                new_branch_slug = self._promptBranchName()
+                fork_parent = ""
+                source_lane = normalize_lane_path(older_lane or lane_slug or "")
+                if source_lane and source_lane.lower() != "main":
+                    fork_parent = source_lane
+                new_branch_slug = self._promptBranchName(parent_lane=fork_parent)
                 if not new_branch_slug:
                     self._appendFeed("Save cancelled.")
                     return
