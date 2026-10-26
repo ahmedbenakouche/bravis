@@ -6061,8 +6061,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._task_anchor_picking = True
         self._task_anchor_pick_done = False
         self._appendFeed(
-            "Click a shared start version in the Version tree "
-            "(dashed nodes must be shared first)."
+            "Click a shared version on main in the Version tree "
+            "(other branches coming later; dashed nodes must be shared first)."
         )
         self.onOpenHistoryGraph(pick_mode=True, parent=dialog)
 
@@ -6090,6 +6090,21 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             getattr(logic, "historyDialog", None) if logic is not None else None
         )
         vid = str(version_id or "").strip()
+        lane = self._historyLaneForVersion(vid)
+        if not self._isMainHistoryLane(lane):
+            message = (
+                "Task assignment can currently use only versions on main.\n\n"
+                "Selecting a start on other branches (sub-branches, task lanes, …) "
+                "will come in a later update.\n\n"
+                "Please choose a shared version on main."
+            )
+            if dialog is not None:
+                dialog.set_status(
+                    "Choose a shared version on main (other branches coming later).",
+                    error=True,
+                )
+            self._showTaskWarning(message, parent=graph_parent or dialog)
+            return
         if self._versionIsUnshared(vid):
             message = "You have to share this version first."
             if dialog is not None:

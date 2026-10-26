@@ -170,7 +170,7 @@ Les **sous-branches** sous une tâche suivent les règles Merge nested ci-dessus
 
 1. Description de la tâche  
 2. Un ou plusieurs **juniors**  
-3. **Version de départ** : choisie sur le Version tree, **obligatoirement shared**  
+3. **Version de départ** : nœud sur **main** uniquement, **obligatoirement shared** (les starts sur d’autres branches viennent plus tard)  
 4. **Nom de branche** pour la tâche  
 5. Assign crée / publie la branche de tâche ; tout le monde peut la voir (même vide au début)
 

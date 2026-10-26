@@ -1803,7 +1803,8 @@ class VersionHistoryCanvas(InteractiveGraphView):
     def create_toolbar(self):
         if self.pick_mode:
             hint = qt.QLabel(
-                "Click a shared node (solid) · dashed = share that version first"
+                "Click a shared node on main · other branches coming later · "
+                "dashed = share that version first"
             )
         elif self.read_only:
             hint = qt.QLabel("Read-only · Double-click for details")
