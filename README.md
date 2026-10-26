@@ -1,239 +1,284 @@
-# Collaborative Versioning — notes / brouillon
+# Collaborative Versioning
 
-> Doc informelle pour moi (et futurs moi). Pas un manuel pro.
-> Extension 3D Slicer : versioning collaboratif d’annotations autour de GitHub.
+Extension **3D Slicer** pour versionner et partager des annotations (segmentation, etc.) en équipe, autour d’un projet GitHub.
 
-Dernière synchro mentale : après stabilisation **Tasks + review (🔵) + write locks**.  
-Pas encore : sous-branches juniors, awareness / Share my workspace.
+Ce document décrit **ce que tu peux faire dans l’outil** et **quand** les boutons apparaissent. Ce n’est pas un manuel Git.
 
 ---
 
-## C’est quoi l’idée ?
+## À quoi ça sert ?
 
-On annote dans Slicer. Au lieu de s’échanger des fichiers à la main :
+Tu travailles dans Slicer sur un projet partagé. Chacun a une copie sur son ordinateur. Les versions validées et partagées vivent sur GitHub. L’extension affiche un **Version tree** (graphe de versions) : tu vois l’historique, tu changes de version, tu enregistres, tu partages, tu merges, tu assignes des tâches.
 
-- chacun a une **copie locale** du projet (repo Git)
-- le **partagé** vit sur GitHub (`main` + branches de travail)
-- une branche cachée **`project-info`** porte le “métier” : people, messages/notifs, tasks…
-- l’UI montre un **Version tree** (graphe de versions) plutôt que du Git brut
+En résumé :
+- **Save** = enregistrer une version **ici** (sur ta machine)
+- **Share** = publier sur le projet partagé
+- **Compare with shared** = te synchroniser quand d’autres ont avancé
+- **Tasks** = le senior donne du travail aux juniors, avec review
 
-But : collab **asynchrone** (Share / Compare / Accept) avec un peu de synchrone via notifs + Tasks.
+---
+
+## Ce qu’il te faut
+
+- 3D Slicer avec cette extension chargée
+- **Git** et **GitHub CLI (`gh`)** installés et accessibles
+- Un compte GitHub (idéalement un senior + un ou deux juniors pour tester)
 
 ---
 
 ## Rôles
 
-| Rôle | En gros |
-|------|---------|
-| **Owner / senior** | Crée le projet, invite, assigne des Tasks, Share sur `main`, Accept/Decline les reviews |
-| **Junior** | Travaille sur les branches de tâche assignées, Save + Share sur sa lane, Request review |
-| **Pending** | Invité GitHub, pas encore Join |
+| Rôle | Ce que tu fais |
+|------|----------------|
+| **Owner / senior** | Crée le projet, invite les gens, assigne les Tasks, Share / Merge vers `main`, Accept ou Decline les reviews |
+| **Junior** | Travaille sur les branches de ses tâches, Save + Share sur ces branches, peut demander une review ; peut merger des **sous-branches** vers leur parent |
+| **Invité (pending)** | A reçu l’invitation GitHub, n’a pas encore rejoint le projet |
 
-Rappel UI People :
-- Senior → Tasks, share onto main, Accept/Decline
-- Junior → travaille après qu’un senior assigne une Task
+Dans **People**, le rôle senior / junior fixe qui peut Assign et qui est limité par le cadenas.
 
 ---
 
-## Gros blocs de l’UI
+## Premiers pas
 
-1. **Connect with GitHub** — `gh` + git, session, liste des repos
-2. **Create / Open project** — clone local sous le workspace
-3. **People** — inviter / retirer, rôles
-4. **Tasks** — assign (senior), liste + statuts
-5. **Version tree** — graphe local (+ caps remote), Switch, Save, Share, Request review, Accept…
-6. **Compare with shared** — local vs remote, choix (Update / Keep / Reset / Linear…), Validate
-7. **Notifications** — cloche, invitations, activity (share, assign, submit…), ⚠ si le remote a bougé
+1. **Connect with GitHub** — connexion via `gh`
+2. **Create project** ou **Open** un projet existant — une copie locale est créée / mise à jour
+3. Charge volume + segmentation (et l’ontologie si besoin)
+4. Annoter → **Save version** → éventuellement **Share**
 
-Fichiers principaux :
-- `CollaborativeVersioning.py` — UI + orchestration
-- `CollaborativeVersioningLib/GitHubAuth.py` — Git/GitHub, history model, tasks messages, PRs review
-- `CollaborativeVersioningLib/GraphCanvas.py` — dessin du Version tree
-- `DataManager` / ontology / styles — le reste du panneau annotation
+Le panneau principal regroupe aussi : People, Delete (owner), Messages, Tasks, Version tree, cloche de notifications.
 
 ---
 
-## Modèle mental Git (important)
+## Lire le Version tree
 
-```
-main                          ← “vérité” partagée du projet (surtout senior)
-cv-review/<slug>              ← lane de travail (souvent = 1 task unifiée)
-project-info                  ← people + messages.json (tasks, activity…)  [pas le graphe MRML]
-```
+Ouvre le **Version tree** pour voir l’historique du projet.
 
-### Version tree
-- nœuds du style `main/3`, `ma-tache/2`, stub `ma-tache/start`
-- **bordure pleine** = déjà shared (sur le remote)
-- **bordure en pointillés** = local pas encore partagé
-- **🔒** = junior peut voir / Switch, mais **pas** Save/Share depuis ce nœud
-- **🔵** = tip d’une tâche en *Submitted* (attente review senior)
+| Apparence | Sens |
+|-----------|------|
+| **Cadre plein** | Version déjà **shared** (sur le projet distant) |
+| **Cadre en pointillés** | Version **locale** seulement — pas encore Share |
+| **🔒** | En junior : tu peux regarder / Switch, mais **pas** Save ni Share ici |
+| **🔵** | Une review a été demandée sur cette version (tâche en attente) |
+| Icône lecture / flèche | Version actuellement ouverte |
 
-### Caps remote (`.cv_ui_sync_caps.json`, local, gitignored)
-Le Version tree **ne gobbe pas** tout ce que Compare a fetché.
-Les tips remote n’avancent dans le tree qu’après **Validate Update / Take** (ou sync explicite).
-Sinon un simple peek Compare réécrirait le tree au prochain Open — déjà vécu, déjà fixé.
+Les noms ressemblent à `main/3`, `sos/2`, `sos/ok/1`, ou `ma-tache/start`.
 
-### Stub `…/start`
-Lane de tâche vide : tip Git encore = start sur main.
-UI montre un nœud start. Premier **Save** → vrai `…/1`, le stub disparaît.
-Ne pas traiter ça comme “merge obsolete” (sinon Share casse après le 1er Save).
+### Nœud `…/start`
+
+Sur une **tâche Assign**, tu peux voir un nœud de départ `…/start` (ancrage de la branche). Ce n’est pas une “vraie” version séparée à merger : détails seulement. Le premier **Save** sur la branche crée `…/1`.
+
+Les branches DIY (créées à la main, sans tâche) n’ont en général **pas** de stub `start`.
 
 ---
 
-## Tasks — ce qui est en place
+## Save version
+
+Enregistre l’état actuel comme une nouvelle version sur la branche où tu es (ou selon le dialogue proposé).
+
+Selon le contexte, on peut te proposer par exemple :
+- **Save on this branch** — continuer sur la même branche (au tip)
+- **Create a branch** — forker une nouvelle branche depuis ici
+- **Put on main** — (senior, tip de main) enregistrer directement sur main
+
+**Junior** : Save seulement sur une branche de **tâche assignée** (ou sous-branche dessous). Ailleurs → cadenas / refus.
+
+---
+
+## Create a branch (sous-branches)
+
+Depuis Save (ou le flux Create), tu peux créer une branche de travail.
+
+- Sous **main** : le nom reste simple (`sos`, `lol`, …)
+- Depuis une **autre branche** : le nom devient **parent/enfant** (ex. depuis `sos` → `sos/ok` ; depuis `sos/ok` → `sos/ok/yoi`)
+
+Tu saisis seulement le **dernier** morceau du nom (sans `/`). Le parent est ajouté automatiquement.
+
+Ensuite : Save sur cette sous-branche, puis Share quand tu veux la publier.
+
+---
+
+## Share
+
+Publie les versions locales pas encore partagées de la branche courante.
+
+Avant de pousser, l’outil **vérifie** le projet partagé. S’il y a des versions distantes que tu n’as pas encore (ou des tips divergents), Share est refusé : ouvre **Compare with shared**, mets-toi à jour, puis réessaie.
+
+Autres cas où Share est bloqué :
+- rien de nouveau à partager
+- junior hors de sa zone autorisée (cadenas)
+- une **review 🔵** est déjà ouverte sur cette branche de tâche → Share en pause jusqu’à Accept ou Decline
+
+Pour une sous-branche, Share publie aussi ce qu’il faut du côté des **parents** pour que le graphe distant reste cohérent (tu n’as rien de spécial à cocher).
+
+---
+
+## Switch version
+
+Double-clic / Switch sur un nœud : charge cette version dans Slicer.
+
+Tu peux Switch même sur un nœud avec 🔒 (consultation). Seuls Save / Share sont bloqués.
+
+---
+
+## Merge — quand le bouton apparaît
+
+Le bouton **Merge** est dans les **détails** d’une version (pas un bouton global). Règles actuelles :
+
+### Branche DIY “plate” (ex. `sos`, sans tâche)
+
+- **Qui** : senior
+- **Où** : tip de la branche, version **déjà shared**
+- **Vers** : **main**
+- **Pas de Merge** si : pas tip, pas shared, déjà intégré dans main, ou ce n’est pas une branche DIY
+
+Avant le merge : même type de **vérification** que Share (projet shared à jour).
+
+### Sous-branche (nom avec `/`, ex. `sos/ok` ou `sos/ok/yoi`)
+
+- **Qui** : senior, **ou** junior assigné à la tâche dont dépend cette branche
+- **Où** : tip **shared**, pas déjà mergé dans son **parent**
+- **Vers** : le **parent immédiat** (pas main)  
+  - `sos/ok` → merge dans `sos`  
+  - `sos/ok/yoi` → merge dans `sos/ok`
+- Même **vérification** shared qu’un Merge DIY
+
+**Parent déjà mergé plus haut** : si le parent est déjà rentré dans *son* parent (ex. `sos/ok` déjà dans `sos`), on **ne montre plus Merge** sur les enfants pas encore mergés (ex. `sos/ok/yoi`). L’idée : la ligne du parent est “fermée” vers le haut ; merger encore dedans obligerait à re-merger le parent ensuite.
+
+Après un Merge réussi, le tip enfant est considéré intégré → plus de bouton Merge sur ce tip.
+
+### Branche de **tâche** (Assign), niveau “racine” (ex. `ma-tache`)
+
+Pas de Merge DIY nu. À la place :
+- junior → **Request review**
+- senior de la tâche → **Accept** / **Decline**
+
+Accept intègre vers **main** et **clôture la tâche** pour tous les juniors assignés.
+
+Les **sous-branches** sous une tâche suivent les règles Merge nested ci-dessus (vers le parent), pas Accept vers main.
+
+### Ce qui n’a jamais Merge / Accept / Request review
+
+- nœuds `…/start`
+- versions en **pointillés** (pas encore Share) — éventuellement **Delete** (local seulement)
+- vieux nœuds qui ne sont plus le tip (sauf Accept sur la version exacte soumise en review)
+
+---
+
+## Tasks (tâches)
 
 ### Assign (senior)
-1. Description
-2. Cocher **un ou plusieurs** juniors (un junior peut être sur plusieurs tasks)
-3. **Start version obligatoire** — pick sur le tree, **shared only**
-4. Tasks reste ouvert pendant le pick (dialog enfant)
-5. Nom de branche **manuel** (slug) → `create_and_publish_task_branch` (push **uniquement** ce ref)
-6. Tout le monde voit la lane (même vide) ; notif `assign`
 
-### Une task = une branche unifiée
-Pas une ligne par junior. Plusieurs juniors → **même** `branch_slug` / même lane.
+1. Description de la tâche  
+2. Un ou plusieurs **juniors**  
+3. **Version de départ** : choisie sur le Version tree, **obligatoirement shared**  
+4. **Nom de branche** pour la tâche  
+5. Assign crée / publie la branche de tâche ; tout le monde peut la voir (même vide au début)
 
-### Statuts (Tasks + un peu le tree)
+**Une tâche = une branche** partagée par tous les juniors cochés (pas une branche par personne).
+
+### Statuts
+
 | Marque | Sens |
 |--------|------|
-| 🟠 | In progress |
-| 🔵 | Submitted — review demandée, tip marqué aussi sur le Version tree |
-| ✅ | Closed (`accepted`) — **pour tous** les juniors de la task |
+| 🟠 | En cours |
+| 🔵 | Review demandée |
+| ✅ | Acceptée / fermée (pour tous les juniors de la tâche) |
 
-### Côté junior sur sa lane
-- Write OK seulement sur les lanes des tasks actives assignées
-- Sinon 🔒 partout (sauf seniors)
-- Pas de task active → tout write-locked
-- **Request review** → PR GitHub + task `submitted` + 🔵
-- Si déjà submitted → pas de 2e Request review
+### Junior sur sa tâche
 
-### Côté senior sur une lane submitted
-- **Accept / Decline** (pas un Merge “nu” qui oublie de fermer la task)
-- Accept → merge côté shared + `_markTaskAccepted` → ✅ pour tout le monde
-- Si pas de PR ouverte trouvée → Merge en fallback, **ferme quand même** la task
+- Travaille sur la branche (et sous-branches) de la tâche  
+- Save → Share → **Request review** (sur le tip shared)  
+- Une seule review à la fois : si déjà 🔵, pas de second Request review  
+- Share bloqué tant que 🔵
 
-### Notifs review
-- Tout le monde peut voir qu’une review a été demandée
-- Texte d’aide **différent** :
-  - senior → ouvre le tree, trouve 🔵, Accept/Decline
-  - junior → un coéquipier a déjà demandé, wait
+### Senior sur une review
+
+- Ouvre le nœud **🔵** → **Accept** ou **Decline**  
+- Accept → sur main + tâche ✅  
+- Decline → la tâche repart en cours ; le junior peut re-demander une review  
+
+Les notifications aident : le senior est guidé vers le 🔵 ; les autres juniors voient qu’une review est déjà demandée.
 
 ---
 
-## Scénarios typiques (à retester si doute)
+## Compare with shared
 
-### A — Solo senior, pas de task
-1. Connect → Create project
-2. Annoter → **Save version** (local)
-3. **Share** → pousse sur `main`
-4. Version tree avance `main/1`, `main/2`…
+Quand le projet distant a bougé (ou que Share / Merge refuse parce que tu n’es pas à jour) :
 
-### B — Inviter un junior
-1. People → Add (GitHub username)
-2. Junior reçoit invitation → Join
-3. Junior Open project → clone local
+1. Ouvre **Compare with shared** (souvent via la cloche)  
+2. Tu vois ton côté, le shared, et un aperçu selon le choix  
+3. Tu choisis une action puis tu valides  
 
-### C — Task à 1 junior (happy path review)
-1. Senior : Tasks → description + cocher Bob + Choose on tree (shared) + slug branche
-2. Assign → branche `cv-review/<slug>` publiée, stub start visible
-3. Bob : Switch sur la lane → Save → Share (sur la lane, pas main)
-4. Bob : Request review → task 🔵, tip 🔵
-5. Senior : notif + Accept → task ✅, lane intégrée / fermée selon le flux Accept
+Actions typiques :
+- **Update** — mettre à jour ce que tu *vois* du shared sur cette machine  
+- **Keep mine** — garder ton arbre tel quel pour l’instant  
+- **Reset to shared** — aligner certaines branches sur le tip shared  
+- **Add shared, then mine** — intégrer le shared puis rejouer tes versions locales dessus (cas de divergence)
 
-### D — Task à 2 juniors (même branche)
-1. Assign Bob + Carol, même start, même slug
-2. Les deux travaillent sur la **même** lane unifiée (pour l’instant pas de sous-branches)
-3. Un des deux Request review → submitted pour la task
-4. Accept → ✅ pour les deux
-
-### E — Junior hors de sa lane
-1. Bob Switch sur `main/2` (view OK)
-2. Save / Share → bloqué + warning (🔒)
-3. Retour sur sa task lane → OK
-
-### F — Remote a bougé, toi pas à jour
-1. Notif ⚠ (share / accept / assign…)
-2. **Compare with shared**
-3. Choisir Update / Keep / Reset / Linear… → **Validate**
-4. Caps remote mis à jour → le Version tree peut afficher les nouveaux tips
-
-### G — Start version non shared
-1. Senior pick un nœud en pointillés → warning “share first”
-2. Il doit Share ce nœud avant de pouvoir l’utiliser comme start
+Important : **regarder** le Compare (peek) ne suffit pas toujours à “valider” l’update du tree. Il faut bien enchaîner l’action choisie. Les autres personnes ne sont pas mises à jour toute seules : chacune Compare / Update de son côté.
 
 ---
 
-## Compare with shared — rappel rapide
+## People, Messages, notifications
 
-- Gauche = **ton** graphe local (souvent figé tel qu’avant fetch)
-- Droite = **shared** après fetch
-- Bas = preview résultat selon le choix
-- Validate = applique **sur cette machine** (pas magie télépathique pour les autres)
-
-Options qu’on a croisées :
-- Update version tree
-- Keep mine
-- Reset to shared
-- Add shared, then mine (linear)
-- Keep both (merge) — souvent “coming” / pas le focus actuel
+- **People** — inviter / retirer, voir les rôles  
+- **Messages** — fil du projet + présence approximative  
+- **Cloche** — invitations, activité (share, assign, review…), alerte si le remote a avancé  
 
 ---
 
-## Ce qui n’est PAS encore là
+## Delete
 
-### Vague C — sous-branches entre juniors
-Plusieurs juniors sur une task pourraient forker / merger entre eux avant le review senior.
-**Pas commencé** — on a volontairement stabilisé le review unifié d’abord.
-
-### Awareness / “Share my workspace”
-Idée validée conceptuellement, **pas codée** :
-- pas du temps réel (trop cher : `read_project_history` + écritures `project-info`)
-- à la demande : bouton style **Share my workspace** → snapshot du graphe local + head/sélecteur sur `project-info`
-- les autres ouvrent un panneau Colleagues pour tracer ce snapshot
-- bonus plus tard : online/offline, last_seen
+- **Delete project** (owner) — suppression du projet distant (permissions GitHub requises)  
+- Sur une version en **pointillés** : Delete dans les détails = enlève seulement cette version **locale** (pas le shared)
 
 ---
 
-## Pièges / trucs à ne pas oublier
+## Cadenas (junior)
 
-1. **`…/start` n’est pas un vrai commit séparé** — c’est un stub UI (même SHA que le start sur main).
-2. **1 task = 1 branche**, pas 1 branche par junior.
-3. **Accept doit fermer la task** — même s’il n’y a qu’un junior (avant, Merge “propre lane” pouvait laisser Submitted).
-4. **Compare peek ≠ Update tree** — caps.
-5. **Write lock ≠ lecture** — Switch/consult OK ; Save/Share non.
-6. **Messages tasks** vivent dans `project-info` / `messages.json` — sync concurrente possible (conflit → retry / merge messages).
-7. Commit messages git du repo d’extension : style cmd Windows  
-   `echo …> commitmsg.txt` puis `echo …>> commitmsg.txt` puis `git commit -F commitmsg.txt`  
-   (éviter les pièges `()` sous cmd si besoin).
+Sans tâche active assignée → écriture bloquée un peu partout.  
+Avec des tâches → Save / Share autorisés sur ces branches **et** leurs sous-branches.  
+Ailleurs → 🔒 : tu peux Switch pour regarder, pas modifier.
 
 ---
 
-## Prérequis machine (brut)
+## Scénarios utiles
 
-- 3D Slicer avec l’extension chargée
-- `git` + GitHub CLI (`gh`) installés et dans le PATH
-- Compte(s) de test utiles : genre 1 senior + 2 juniors (`cv-senior-…`, `cv-junior-…`)
+### Solo senior
+Connect → Create → annoter → Save → Share sur main → le tree avance (`main/1`, `main/2`, …).
 
----
+### Inviter un junior
+People → invitation → le junior Join → Open le projet.
 
-## Fichiers / branches “métier” côté projet collab
+### Tâche + review
+Senior assigne (start shared + nom de branche) → junior Save / Share → Request review → senior Accept → tâche fermée.
 
-| Où | Quoi |
-|----|------|
-| `main` | versions partagées “officielles” |
-| `cv-review/<slug>` | lanes de travail / tasks |
-| `project-info` | people rights, messages (tasks, activity, notifs) |
-| local `.cv_ui_sync_caps.json` | jusqu’où le tree a le droit d’afficher le remote |
+### Sous-branches DIY
+Sur `sos` (tip) → Create `ok` → travail sur `sos/ok` → Share → Merge dans `sos`.  
+Puis Create `yoi` sous `sos/ok` → Merge dans `sos/ok` **seulement si** `sos/ok` n’est pas déjà entièrement “fermé” dans `sos` (voir règle Merge plus haut).
 
----
+### Deux juniors, même tâche
+Même branche de tâche. L’un demande la review → 🔵. L’autre attend. Accept clôture pour les deux.
 
-## Prochaines pistes (ordre vague)
-
-1. ~~Review 🔵 + Accept ferme la task~~ ✅ testé
-2. **Awareness light** (Share my workspace à la demande) — optionnel avant ou après C
-3. **Vague C** — sous-branches / merges entre juniors sur une même task
-4. Polish Compare merge “keep both”, etc.
+### Share refusé alors que “ta” branche a l’air bonne
+Souvent le Checking regarde **tout** le projet (main ou d’autres branches en avance), pas seulement la sous-branche affichée. Compare with shared, puis réessaie.
 
 ---
 
-*Brouillon — à mettre à jour quand on touche un flux critique.*
+## Limites actuelles (pour ne pas chercher en vain)
+
+- Pas encore d’outil du type “Share my workspace” / awareness temps réel entre collègues  
+- Compare “garder les deux” (merge de tips) n’est pas le flux principal  
+- Les détails Version tree peuvent être un peu plus lents sur certaines sous-branches (calculs Merge) — amélioration prévue plus tard  
+
+---
+
+## En cas de doute
+
+1. Suis-je senior ou junior ?  
+2. Est-ce que ce nœud est tip + shared ?  
+3. Est-ce une tâche (Request / Accept) ou une branche DIY / sous-branche (Merge) ?  
+4. Le parent n’est-il pas déjà mergé plus haut ?  
+5. Compare with shared si Share / Merge parle d’un projet distant en avance  
+
+Bon travail.
