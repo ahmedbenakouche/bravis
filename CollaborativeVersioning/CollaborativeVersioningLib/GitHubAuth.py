@@ -1669,6 +1669,100 @@ def current_review_branch_slug(repo_dir: str) -> str:
     return git_suffix_to_lane_path(current.split("/", 1)[-1])
 
 
+def _lane_ancestor_parent_slugs(slug: str) -> list[str]:
+    """Parent chain root → … → immediate parent (excludes ``slug`` itself).
+
+    ``sos/gh/mptf`` → ``[sos, sos/gh]``.
+    """
+    path = normalize_lane_path(slug)
+    if not path or "/" not in path:
+        return []
+    parts = path.split("/")
+    return ["/".join(parts[:index]) for index in range(1, len(parts))]
+
+
+def _push_review_sha_to_origin(repo_dir: str, sha: str, branch: str) -> None:
+    """Push ``sha`` to ``origin`` branch ref and refresh the local origin/* tip."""
+    tip = str(sha or "").strip()
+    ref = str(branch or "").strip()
+    if not tip or not ref:
+        return
+    push = _run_git(
+        ["push", "origin", "%s:refs/heads/%s" % (tip, ref)],
+        cwd=repo_dir,
+        timeout=180,
+    )
+    if push.returncode != 0:
+        _raise_share_failure((push.stderr or push.stdout or "").strip())
+    _run_git(
+        ["update-ref", "refs/remotes/origin/%s" % ref, tip],
+        cwd=repo_dir,
+        timeout=20,
+    )
+
+
+def _parent_share_sha_on_lane(
+    repo_dir: str, parent_local_tip: str, share_sha: str
+) -> str:
+    """SHA to publish for a parent lane when Share tip may have diverged.
+
+    Walk share → root; return the first commit that still lies on the parent
+    tip's first-parent history. Example: Share ``drtg/pmpl/1`` while parent tip
+    is local-only ``drtg/2`` → publish ``drtg/1`` (fork point), not skip and not
+    ``drtg/2``.
+    """
+    parent_tip = str(parent_local_tip or "").strip()
+    share = str(share_sha or "").strip()
+    if not parent_tip or not share:
+        return ""
+    if parent_tip == share or _is_ancestor(repo_dir, parent_tip, share):
+        return parent_tip
+    # Parent tip diverged ahead of the fork (e.g. drtg/2 vs pmpl). Use the
+    # nearest ancestor of share that is still on the parent line.
+    current = share
+    seen = set()
+    while current and current not in seen:
+        seen.add(current)
+        if current == parent_tip or _is_ancestor(repo_dir, current, parent_tip):
+            return current
+        parents = _run_git(
+            ["rev-parse", "%s^" % current],
+            cwd=repo_dir,
+            timeout=20,
+        )
+        if parents.returncode != 0:
+            break
+        current = (parents.stdout or "").strip()
+    return ""
+
+
+def _publish_parent_lane_tips_for_share(
+    repo_dir: str, share_slug: str, share_sha: str
+) -> None:
+    """Create/advance origin tips for parent lanes needed by this Share history.
+
+    Pushes root → nearest parent first. Publishes the parent SHA required by the
+    shared tip (fork point if the parent tip has diverged ahead locally).
+    """
+    share = str(share_sha or "").strip()
+    if not share:
+        return
+    for parent in _lane_ancestor_parent_slugs(share_slug):
+        branch = review_branch_for(parent)
+        local_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
+        if not local_tip:
+            continue
+        publish_sha = _parent_share_sha_on_lane(repo_dir, local_tip, share)
+        if not publish_sha:
+            continue
+        remote_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch)
+        if remote_tip == publish_sha:
+            continue
+        if remote_tip and not _is_ancestor(repo_dir, remote_tip, publish_sha):
+            continue
+        _push_review_sha_to_origin(repo_dir, publish_sha, branch)
+
+
 def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
     """Share current versions on a named branch beside main. Returns the slug used.
 
@@ -1677,6 +1771,9 @@ def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
     When HEAD is detached on an older lane commit (tip still ahead locally), Share
     publishes only up to HEAD and does not move the local tip backward — same idea
     as sharing an older main commit.
+
+    Nested lanes: parent branch tips on origin are created/advanced first (root →
+    parent) so remotes reconstruct the same hierarchy as this computer.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -1716,15 +1813,9 @@ def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
     # Attach only when not already on the branch and attaching would not rewind the tip.
     if current != branch and not tip_ahead:
         _point_head_at(repo_dir, branch, head)
-    push = _run_git(
-        ["push", "origin", "%s:refs/heads/%s" % (head, branch)],
-        cwd=repo_dir,
-        timeout=180,
-    )
-    if push.returncode != 0:
-        _raise_share_failure((push.stderr or push.stdout or "").strip())
-    _run_git(["update-ref", "refs/remotes/origin/%s" % branch, head], cwd=repo_dir, timeout=20)
-    # Do not move refs/heads/main — Share publishes this branch only. Recolling
+    _publish_parent_lane_tips_for_share(repo_dir, slug, head)
+    _push_review_sha_to_origin(repo_dir, head, branch)
+    # Do not move refs/heads/main — Share publishes this branch (+ parents). Recolling
     # main onto origin/main would hide local unshared main versions from the tree.
     return slug
 
