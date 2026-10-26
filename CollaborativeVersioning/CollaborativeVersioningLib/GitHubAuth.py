@@ -1607,14 +1607,6 @@ def parent_lane_slug(name: str) -> str:
     return path.rsplit("/", 1)[0]
 
 
-def leaf_lane_slug(name: str) -> str:
-    """Last segment of a lane path (``lol/sq`` → ``sq``)."""
-    path = normalize_lane_path(name)
-    if not path:
-        return ""
-    return path.rsplit("/", 1)[-1]
-
-
 def child_lane_path(parent: str, child_name: str) -> str:
     """Build ``parent/child`` (parent may itself be nested). Child is one segment."""
     leaf = normalize_branch_slug(child_name)
@@ -2375,7 +2367,7 @@ def _sync_origin_review_tips_from_ls_remote(repo_dir: str) -> dict[str, list[str
     tips: dict[str, list[str]] = {}
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return tips
-    # Full ls-remote then filter: nested lanes are cv-review/parent/child (a
+    # Full ls-remote then filter: nested lanes are cv-review/parent+child (a
     # single ``cv-review/*`` glob only matches one path segment).
     listed = _run_git(
         ["ls-remote", "--refs", "origin"],
@@ -2613,25 +2605,6 @@ def _sha_is_ancestor_in_map(
     return False
 
 
-def _nearest_ancestor_tip(
-    commit_by_sha: dict[str, dict], tip: str, other_tips: list[str]
-) -> str:
-    """Closest other tip that is a strict first-parent ancestor of tip."""
-    best = ""
-    for other in other_tips:
-        other_sha = str(other or "").strip()
-        if not other_sha or other_sha == tip:
-            continue
-        if not _sha_is_ancestor_in_map(commit_by_sha, other_sha, tip):
-            continue
-        if other_sha == tip:
-            continue
-        # Prefer the ancestor closest to tip (descendant of previous best).
-        if not best or _sha_is_ancestor_in_map(commit_by_sha, best, other_sha):
-            best = other_sha
-    return best
-
-
 def _commit_date(commit_by_sha: dict[str, dict], sha: str) -> str:
     return str((commit_by_sha.get(str(sha or "").strip()) or {}).get("date") or "")
 
@@ -2650,18 +2623,12 @@ def _lane_tips_key_lookup(lane_tips: dict[str, str], want: str) -> str:
     return ""
 
 
-def _resolve_parent_lane(
-    slug: str,
-    lane_tips: dict[str, str],
-    commit_by_sha: dict[str, dict],
-    main_set: set[str],
-) -> str:
+def _resolve_parent_lane(slug: str, lane_tips: dict[str, str]) -> str:
     """Parent lane from naming convention ``parent/child`` (\"\" = under main).
 
-    Nested Create builds ``cv-review/<parent>/<child>``; the parent path is the
-    prefix. Longest existing prefix wins (``sos/p/w`` → ``sos/p`` if present).
+    Nested Create uses ``parent/child`` paths (Git: ``parent+child``). Longest
+    existing prefix wins (``sos/p/w`` → ``sos/p`` if present).
     """
-    del commit_by_sha, main_set  # hierarchy comes from the name, not Git dates
     path = normalize_lane_path(slug)
     if "/" not in path:
         return ""
@@ -2674,20 +2641,14 @@ def _resolve_parent_lane(
     return "/".join(parts[:-1])
 
 
-def _build_parent_lane_map(
-    lane_tips: dict[str, str],
-    commit_by_sha: dict[str, dict],
-    main_set: set[str],
-) -> dict[str, str]:
+def _build_parent_lane_map(lane_tips: dict[str, str]) -> dict[str, str]:
     """slug → parent slug (missing/\"\" = under main). Breaks cycles safely."""
     parent_of: dict[str, str] = {}
     for slug in (lane_tips or {}):
         name = str(slug or "").strip()
         if not name:
             continue
-        parent_of[name] = _resolve_parent_lane(
-            name, lane_tips, commit_by_sha, main_set
-        )
+        parent_of[name] = _resolve_parent_lane(name, lane_tips)
     for slug in list(parent_of):
         seen = {slug}
         cur = parent_of.get(slug) or ""
@@ -2703,7 +2664,6 @@ def _build_parent_lane_map(
 def _exclusive_side_chain(
     commit_by_sha: dict[str, dict],
     tip: str,
-    all_tips: list[str],
     main_set: set[str],
     parent_tip: str = "",
     sibling_tips: list[str] | None = None,
@@ -2711,35 +2671,18 @@ def _exclusive_side_chain(
     """Side commits owned by this tip for the Version tree (hierarchy-aware).
 
     Walk tip → main. Stop at main, at the parent-lane tip, or at history that
-    belongs on the parent line. Child forks are ignored when deciding stops so
-    a mid-lane Create (sos/1 → q) cannot steal sos/1 from sos. Sibling tips
-    under the same parent still stop at their shared fork point.
+    belongs on the parent line. Sibling tips under the same parent still stop
+    at their shared fork point.
     """
     tip_sha = str(tip or "").strip()
     if not tip_sha or tip_sha in (main_set or set()):
         return []
     parent_tip_sha = str(parent_tip or "").strip()
-    if sibling_tips is None:
-        others = [
-            str(other or "").strip()
-            for other in (all_tips or [])
-            if str(other or "").strip() and str(other or "").strip() != tip_sha
-        ]
-        if not parent_tip_sha:
-            parent_tip_sha = _nearest_ancestor_tip(commit_by_sha, tip_sha, others)
-        siblings = [
-            other
-            for other in others
-            if other != parent_tip_sha
-            and not _sha_is_ancestor_in_map(commit_by_sha, tip_sha, other)
-            and not _sha_is_ancestor_in_map(commit_by_sha, other, tip_sha)
-        ]
-    else:
-        siblings = [
-            str(other or "").strip()
-            for other in sibling_tips
-            if str(other or "").strip() and str(other or "").strip() != tip_sha
-        ]
+    siblings = [
+        str(other or "").strip()
+        for other in (sibling_tips or [])
+        if str(other or "").strip() and str(other or "").strip() != tip_sha
+    ]
     chain: list[str] = []
     for sha in _first_parent_chain(commit_by_sha, tip_sha):
         if not sha or sha in (main_set or set()):
@@ -2977,8 +2920,8 @@ def build_project_history_model(
     Local DIY branches must not get a start stub.
 
     Side lanes form a hierarchy under main from nested names
-    (``cv-review/parent/child`` → parent_lane = parent). Parents are labeled
-    before children; a tip only keeps commits after the parent line.
+    (``parent/child``, Git ``parent+child`` → parent_lane = parent). Parents
+    are labeled before children; a tip only keeps commits after the parent line.
     """
     empty = {
         "commit_history": [],
@@ -3050,7 +2993,7 @@ def build_project_history_model(
             remember_side(_slug_from_merge(commit_by_sha, merge_sha, extra, review_tips), extra)
 
     # Hierarchy under main: each side lane has a parent lane (\"\" = main).
-    parent_of = _build_parent_lane_map(lane_tips, commit_by_sha, main_set)
+    parent_of = _build_parent_lane_map(lane_tips)
     tips_by_parent: dict[str, list[str]] = {}
     for slug, tip in lane_tips.items():
         name = str(slug or "").strip()
@@ -3060,7 +3003,6 @@ def build_project_history_model(
         key = parent_of.get(name) or ""
         tips_by_parent.setdefault(key, []).append(tip_sha)
 
-    all_tips = [tip for tip in lane_tips.values() if tip]
     for slug, tip in lane_tips.items():
         name = str(slug or "").strip()
         tip_sha = str(tip or "").strip()
@@ -3071,7 +3013,6 @@ def build_project_history_model(
             _exclusive_side_chain(
                 commit_by_sha,
                 tip_sha,
-                all_tips,
                 main_set,
                 parent_tip=parent_tip,
                 sibling_tips=siblings,
