@@ -1640,6 +1640,45 @@ def _farthest_ref_tip(repo_dir: str, refs: list[str]) -> str:
     return best
 
 
+def ensure_merge_target_has_no_unshared_locals(
+    repo_dir: str, target_lane: str = "main"
+) -> None:
+    """Block Merge/Accept when the target tip has local-only work ahead of shared.
+
+    Merge/Accept build on the shared target tip then move the local tip there.
+    Unshared local versions on that target would otherwise disappear silently.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    raw = str(target_lane or "main").strip() or "main"
+    if raw.lower() == "main":
+        display = "main"
+        local_tip = _git_rev_parse(repo_dir, "refs/heads/main")
+        shared_tip = _git_rev_parse(
+            repo_dir, "refs/remotes/origin/main"
+        ) or _git_rev_parse(repo_dir, "origin/main")
+    else:
+        path = normalize_lane_path(raw)
+        if not path:
+            return
+        display = path
+        branch = review_branch_for(path)
+        local_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
+        shared_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch)
+    if not local_tip or not shared_tip or local_tip == shared_tip:
+        return
+    # Shared tip already contains local → nothing local-only to lose.
+    if _is_ancestor(repo_dir, local_tip, shared_tip):
+        return
+    # Local ahead of shared, or tips diverged: shared-based merge would drop locals.
+    raise GitHubAuthError(
+        "Could not continue.\n\n"
+        "Branch %s has local versions that are not shared yet.\n\n"
+        "Share branch %s first, then try again."
+        % (display, display)
+    )
+
+
 def review_lane_tip_integrated_into_main(repo_dir: str, lane: str) -> bool:
     """True when this named lane's tip is already reachable from main (Accept/Merge done).
 
@@ -1740,6 +1779,7 @@ def merge_nested_lane_into_parent(repo_dir: str, lane: str) -> str:
     parent = parent_lane_slug(slug)
     if not slug or not parent:
         raise GitHubAuthError("This branch has no parent to merge into.")
+    ensure_merge_target_has_no_unshared_locals(repo_dir, parent)
     login = current_login()
     if login:
         _configure_repo_identity(repo_dir, login)
@@ -2360,6 +2400,7 @@ def accept_share_request(full_name: str, branch: str, number) -> str:
     Version tree selector, Slicer scene, and disk stay aligned.
     """
     dest, sha = fetch_share_request_sha(full_name, branch)
+    ensure_merge_target_has_no_unshared_locals(dest, "main")
     login = _review_login_from_ref(branch) or "colleague"
     accepter = current_login()
     if accepter:

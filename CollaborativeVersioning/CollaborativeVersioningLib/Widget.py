@@ -7777,7 +7777,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             history = read_project_history(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
-            self._appendFeed(str(error).split("\n")[0], error=True)
+            self._showGithubError(error, box=True)
             return
         self._closeProgress()
         unshared = self._historyHasUnsharedVersion(history)
