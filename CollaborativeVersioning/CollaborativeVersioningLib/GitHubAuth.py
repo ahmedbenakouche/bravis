@@ -1623,10 +1623,29 @@ def review_lane_slug(name: str) -> str:
     return normalize_lane_path(name) or ""
 
 
+def _farthest_ref_tip(repo_dir: str, refs: list[str]) -> str:
+    """Prefer the tip that has the others as ancestors (local vs origin after Update)."""
+    best = ""
+    for ref in refs or []:
+        tip = _git_rev_parse(repo_dir, ref)
+        if not tip:
+            continue
+        if not best:
+            best = tip
+            continue
+        if tip == best:
+            continue
+        if _is_ancestor(repo_dir, best, tip):
+            best = tip
+    return best
+
+
 def review_lane_tip_integrated_into_main(repo_dir: str, lane: str) -> bool:
     """True when this named lane's tip is already reachable from main (Accept/Merge done).
 
     Empty tip still on main counts as integrated (nothing left to Merge).
+    Uses the farthest local/origin tips so a stale local main after Update does not
+    keep showing Merge.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return False
@@ -1634,17 +1653,147 @@ def review_lane_tip_integrated_into_main(repo_dir: str, lane: str) -> bool:
     if not slug:
         return False
     branch = review_branch_for(slug)
-    tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch) or _git_rev_parse(
-        repo_dir, "refs/remotes/origin/%s" % branch
+    tip = _farthest_ref_tip(
+        repo_dir,
+        ["refs/heads/%s" % branch, "refs/remotes/origin/%s" % branch],
     )
-    main_tip = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
-        repo_dir, "origin/main"
+    main_tip = _farthest_ref_tip(
+        repo_dir,
+        ["refs/heads/main", "refs/remotes/origin/main", "origin/main"],
     )
     if not tip or not main_tip:
         return False
     if tip == main_tip:
         return True
     return _is_ancestor(repo_dir, tip, main_tip)
+
+
+def is_nested_lane_path(name: str) -> bool:
+    """True for depth ≥ 2 (``parent/child``). Flat lanes stay on the main Merge/Accept path."""
+    path = normalize_lane_path(name)
+    return bool(path and "/" in path)
+
+
+def review_lane_tip_integrated_into_parent(repo_dir: str, lane: str) -> bool:
+    """True when a nested lane tip is already reachable from its parent tip.
+
+    Used so Version details hides Merge after child → parent Merge (depth ≥ 2).
+    Prefers farthest local/origin tips — juniors often still have an old local
+    parent head while ``origin/<parent>`` already has the merge commit.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return False
+    slug = normalize_lane_path(lane)
+    parent = parent_lane_slug(slug)
+    if not slug or not parent:
+        return False
+    child_branch = review_branch_for(slug)
+    parent_branch = review_branch_for(parent)
+    child_tip = _farthest_ref_tip(
+        repo_dir,
+        [
+            "refs/heads/%s" % child_branch,
+            "refs/remotes/origin/%s" % child_branch,
+        ],
+    )
+    parent_tip = _farthest_ref_tip(
+        repo_dir,
+        [
+            "refs/heads/%s" % parent_branch,
+            "refs/remotes/origin/%s" % parent_branch,
+        ],
+    )
+    if not child_tip or not parent_tip:
+        return False
+    if child_tip == parent_tip:
+        return True
+    return _is_ancestor(repo_dir, child_tip, parent_tip)
+
+
+def merge_nested_lane_into_parent(repo_dir: str, lane: str) -> str:
+    """Merge a nested lane tip onto its parent lane and publish the parent tip.
+
+    Same commit style as Accept / DIY→main (child tree, parents = parent tip +
+    child tip). Does not touch ``main`` or close review PRs. Returns parent slug.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    slug = normalize_lane_path(lane)
+    parent = parent_lane_slug(slug)
+    if not slug or not parent:
+        raise GitHubAuthError("This branch has no parent to merge into.")
+    login = current_login()
+    if login:
+        _configure_repo_identity(repo_dir, login)
+    child_branch = review_branch_for(slug)
+    parent_branch = review_branch_for(parent)
+    child_tip = (
+        _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % child_branch)
+        or _git_rev_parse(repo_dir, "refs/heads/%s" % child_branch)
+    )
+    parent_tip = (
+        _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % parent_branch)
+        or _git_rev_parse(repo_dir, "refs/heads/%s" % parent_branch)
+    )
+    if not child_tip:
+        raise GitHubAuthError(
+            "Could not find this sub-branch tip.\n\n"
+            "Share it first, then try Merge again."
+        )
+    if not parent_tip:
+        raise GitHubAuthError(
+            "Could not find the parent branch tip.\n\n"
+            "Open the shared project first, then try again."
+        )
+    if child_tip == parent_tip or _is_ancestor(repo_dir, child_tip, parent_tip):
+        raise GitHubAuthError(
+            "This sub-branch is already on %s — nothing to Merge." % parent
+        )
+    restore_sha = _git_rev_parse(repo_dir, "HEAD") or ""
+    restore_lane = _checkout_lane_for_branch_name(_current_branch_name(repo_dir))
+    tree = _run_git(["rev-parse", "%s^{tree}" % child_tip], cwd=repo_dir, timeout=20)
+    tree_sha = (tree.stdout or "").strip()
+    if tree.returncode != 0 or not tree_sha:
+        raise GitHubAuthError("Could not merge this sub-branch.")
+    commit = _run_git(
+        [
+            "commit-tree",
+            tree_sha,
+            "-p",
+            parent_tip,
+            "-p",
+            child_tip,
+            "-m",
+            "Merge %s onto %s" % (slug, parent),
+        ],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    merge_sha = (commit.stdout or "").strip()
+    if commit.returncode != 0 or not merge_sha:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise GitHubAuthError("Could not merge this sub-branch.\n%s" % detail[:400])
+    push = _run_git(
+        ["push", "origin", "%s:refs/heads/%s" % (merge_sha, parent_branch)],
+        cwd=repo_dir,
+        timeout=180,
+    )
+    if push.returncode != 0:
+        _raise_share_failure((push.stderr or push.stdout or "").strip())
+    _run_git(
+        ["update-ref", "refs/remotes/origin/%s" % parent_branch, merge_sha],
+        cwd=repo_dir,
+        timeout=20,
+    )
+    _run_git(
+        ["update-ref", "refs/heads/%s" % parent_branch, merge_sha],
+        cwd=repo_dir,
+        timeout=20,
+    )
+    # Child tip stays as-is (same idea as Accept keeping the review line).
+    if restore_sha:
+        _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
+    return parent
 
 
 def review_branch_for(name: str) -> str:
@@ -2150,13 +2299,18 @@ def _share_request_head(full_name: str, number) -> tuple[str, str]:
 
 
 def _checkout_lane_for_branch_name(branch_name: str) -> str:
-    """History lane slug for checkout_local_version (``main`` or review slug)."""
+    """History lane slug for checkout_local_version (``main`` or review slug).
+
+    Nested git refs use ``+`` (``cv-review/sos+lopj`` → lane ``sos/lopj``). Never run
+    that suffix through ``normalize_branch_slug`` (it turns ``+`` into ``-`` and
+    creates zombie heads like ``cv-review/sos-lopj``).
+    """
     current = str(branch_name or "").strip()
     if not current or current == "main":
         return "main"
     if current.startswith("cv-review/"):
-        return normalize_branch_slug(current.split("/", 1)[-1]) or "main"
-    return normalize_branch_slug(current) or "main"
+        return git_suffix_to_lane_path(current.split("/", 1)[-1]) or "main"
+    return normalize_lane_path(current) or "main"
 
 
 def _restore_checkout_after_merge(
@@ -2947,7 +3101,8 @@ def build_project_history_model(
             return
         record = commit_by_sha.get(sha) or {}
         parents = record.get("parents") or []
-        is_merge = branch == "main" and len(parents) > 1
+        # Any multi-parent tip (Accept→main or nested child→parent) draws merge_from.
+        is_merge = len(parents) > 1
         spec = {
             "id": version_id,
             "parent": parent_id,

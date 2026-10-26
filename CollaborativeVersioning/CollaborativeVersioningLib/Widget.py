@@ -87,6 +87,10 @@ from CollaborativeVersioningLib.GitHubAuth import (
     start_local_review_branch,
     create_and_publish_task_branch,
     review_lane_tip_integrated_into_main,
+    review_lane_tip_integrated_into_parent,
+    is_nested_lane_path,
+    merge_nested_lane_into_parent,
+    parent_lane_slug,
     delete_local_unshared_version,
     sha_is_shared_on_remote,
     accept_share_request,
@@ -6794,16 +6798,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _tipVersionIdForLane(self, lane: str) -> str:
         """Highest …/N (or …/start) id for this branch in the current history bundle."""
-        lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
-        if not lane_key:
+        want = normalize_lane_path(lane) or str(lane or "").strip().lower()
+        if not want:
             return ""
+        want_key = want.lower()
         best_id = ""
         best_rank = -1
         for spec in (
             (getattr(self, "_project_history_bundle", None) or {}).get("version_specs")
             or []
         ):
-            if str((spec or {}).get("branch") or "").strip().lower() != lane_key:
+            branch = str((spec or {}).get("branch") or "").strip()
+            got = normalize_lane_path(branch) or branch.lower()
+            if got.lower() != want_key:
                 continue
             vid = str((spec or {}).get("id") or "").strip()
             if not vid:
@@ -6976,16 +6983,38 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return False
 
     def _laneAlreadyIntegrated(self, lane: str) -> bool:
-        """True after Accept or DIY Merge — Version details should not offer Merge again."""
+        """True after Accept/DIY→main or nested→parent — hide Merge again."""
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if is_nested_lane_path(lane):
+            if not local_path:
+                return False
+            try:
+                return bool(review_lane_tip_integrated_into_parent(local_path, lane))
+            except (GitHubAuthError, OSError, RuntimeError, TypeError, ValueError):
+                return False
         if self._laneHasAcceptedTask(lane):
             return True
-        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
         if not local_path:
             return False
         try:
             return bool(review_lane_tip_integrated_into_main(local_path, lane))
         except (GitHubAuthError, OSError, RuntimeError, TypeError, ValueError):
             return False
+
+    def _canOfferNestedMerge(self, lane: str) -> bool:
+        """Who may Merge a depth≥2 tip onto its parent (DIY senior; task senior/junior)."""
+        if not is_nested_lane_path(lane):
+            return False
+        if self._canAssignTask():
+            return True
+        task = self._activeTaskForBranchSlug(lane)
+        if task is None:
+            return False
+        me = (self._githubLogin() or "").strip().lower()
+        if not me:
+            return False
+        juniors = {name.lower() for name in _task_junior_logins(task)}
+        return me in juniors
 
     def _versionIsSharedOnTree(self, version_id: str) -> bool:
         """True when this Version-tree node is shared (solid), not local dashed."""
@@ -7084,7 +7113,28 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     payload["task_text"] = text
                     payload["task_senior"] = str(task.get("senior") or "").strip()
             return self._withDeleteAction(payload, spec)
-        # Task lanes first — never show bare "Merge" instead of Accept/Decline.
+        # Depth ≥ 2: Merge onto parent (DIY-style) — not Request review / Accept.
+        if is_nested_lane_path(lane):
+            payload = {}
+            task = self._activeTaskForBranchSlug(lane)
+            if task is not None:
+                status = str(task.get("status") or "").strip().lower()
+                text = str(
+                    (task.get("submitted_description") if status == "submitted" else "")
+                    or task.get("description")
+                    or ""
+                ).strip()
+                if text:
+                    payload["task_text"] = text
+                    payload["task_senior"] = str(task.get("senior") or "").strip()
+            if (
+                self._canOfferNestedMerge(lane)
+                and self._isTipVersionOfLane(version_id, lane)
+                and not self._laneAlreadyIntegrated(lane)
+            ):
+                payload["merge"] = True
+            return self._withDeleteAction(payload, spec)
+        # Flat task lanes — never show bare "Merge" instead of Accept/Decline.
         task = self._activeTaskForBranchSlug(lane)
         if task is not None:
             actions = self._reviewActionsForTaskLane(
@@ -7199,8 +7249,25 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     error=True,
                 )
                 return
+            if is_nested_lane_path(lane):
+                if not self._canOfferNestedMerge(lane):
+                    self._appendFeed(
+                        "You can merge this sub-branch only if you own the task "
+                        "or are a senior.",
+                        error=True,
+                    )
+                    return
+                if self._laneAlreadyIntegrated(lane):
+                    parent = parent_lane_slug(lane) or "its parent"
+                    self._appendFeed(
+                        "This sub-branch is already on %s — nothing to Merge." % parent,
+                        error=True,
+                    )
+                    return
+                self._mergeNestedIntoParent(lane)
+                return
             if task is not None:
-                # Task lanes use Accept; Merge here still closes the task after merge.
+                # Flat task lanes use Accept; Merge here still closes the task after merge.
                 if not self._canAssignTask():
                     self._appendFeed("Only a senior can merge a task branch.", error=True)
                     return
@@ -7361,6 +7428,81 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if dialog is not None and _qt_widget_is_valid(dialog):
             qt.QTimer.singleShot(0, lambda: self.onOpenHistoryGraph(pick_mode=False))
 
+    def _mergeNestedIntoParent(self, lane: str = "") -> None:
+        """Merge a depth≥2 shared tip onto its parent lane (DIY-style Checking)."""
+        slug = normalize_lane_path(lane) or ""
+        parent = parent_lane_slug(slug)
+        if not slug or not parent:
+            self._appendFeed("This branch has no parent to merge into.", error=True)
+            return
+        if not self._canOfferNestedMerge(slug):
+            self._appendFeed(
+                "You can merge this sub-branch only if you own the task or are a senior.",
+                error=True,
+            )
+            return
+        if self._laneAlreadyIntegrated(slug):
+            self._appendFeed(
+                "This sub-branch is already on %s — nothing to Merge." % parent,
+                error=True,
+            )
+            return
+        confirmed = slicer.util.confirmYesNoDisplay(
+            "Merge branch %s onto %s and publish it to the shared project?"
+            % (slug, parent),
+            windowTitle="Merge",
+        )
+        if not confirmed:
+            return
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
+            self._appendFeed("Open the project first.", error=True)
+            return
+        me = (self._githubLogin() or "").strip()
+        self._openProgress("Merge", "Checking the shared project…")
+        try:
+            local_freeze = copy.deepcopy(
+                getattr(self, "_project_history_bundle", None)
+            )
+            ensure_can_share_with_shared(
+                local_path, local_history=local_freeze, action="merge"
+            )
+            self._updateProgress("Merging onto %s…" % parent)
+            merge_nested_lane_into_parent(local_path, slug)
+            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
+            self._updateProgress("Updating version history…")
+            history = read_project_history(local_path)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            self._showGithubError(error, box=True)
+            return
+        self._closeProgress()
+        unshared = self._historyHasUnsharedVersion(history)
+        self._suppress_dirty += 1
+        self._suppress_asset_ui_updates += 1
+        try:
+            self._applyProjectHistoryBundle(history)
+            self._clearChangeFlags()
+            self._unshared_version = unshared
+            self._syncAssetDataObservers()
+        finally:
+            self._suppress_asset_ui_updates -= 1
+            self._suppress_dirty -= 1
+        self._refreshUiState()
+        self._clearChangeFlags()
+        self._unshared_version = unshared
+        self._updateVersionActionButtons()
+        self._armLoadSettle()
+        self._recordActivity(
+            self._currentProjectName(),
+            "accept",
+            "%s merged branch %s onto %s." % (me or "Someone", slug, parent),
+        )
+        self._appendFeed("Merged %s onto %s." % (slug, parent))
+        self._updateActiveVersionIndicators()
+        self._updateTaskButtonUi()
+        self._refreshOpenVersionTreeIfNeeded()
+
     def _mergeOwnReviewLine(self, lane: str = "") -> None:
         """Senior/owner: put a shared named branch onto main (same merge as Accept)."""
         me = (self._githubLogin() or "").strip()
@@ -7370,6 +7512,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         slug = normalize_lane_path(lane) or self._currentNamedBranchSlug()
         if not slug:
             self._appendFeed("Switch to your branch first.", error=True)
+            return
+        if is_nested_lane_path(slug):
+            self._mergeNestedIntoParent(slug)
             return
         if self._laneAlreadyIntegrated(slug):
             self._appendFeed(
