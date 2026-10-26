@@ -1424,7 +1424,7 @@ def share_local_versions(repo_dir: str) -> None:
     if work_is_on_review_branch(repo_dir):
         raise GitHubAuthError(
             "You are on a branch (not main).\n\n"
-            "Share publishes this branch only. To put it on main, use Merge (or Accept)."
+            "Share publishes this named branch only — not main."
         )
     head = _git_rev_parse(repo_dir, "HEAD")
     main_tip = _git_rev_parse(repo_dir, "refs/heads/main") or head

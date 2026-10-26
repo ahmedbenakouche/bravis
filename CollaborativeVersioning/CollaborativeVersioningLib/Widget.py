@@ -1535,8 +1535,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.setInformativeText(
             "Branch: %s\n"
             "Up to: %s\n\n"
-            "This shares all unshared versions on this branch up to that tip.\n"
-            "Other local branches are not shared."
+            "This shares this branch up to that tip, including any unshared "
+            "ancestor commits that history needs.\n"
+            "Other local branch tips stay unchanged."
             % (branch, tip)
         )
         share_btn = box.addButton("Share", qt.QMessageBox.AcceptRole)
@@ -8358,10 +8359,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _shareLineNextStepMessage(self) -> str:
         if self._canAssignTask():
-            return (
-                "Shared on your branch. If you want to put it on main, open that "
-                "branch in the version tree and Merge."
-            )
+            return "Shared on your branch."
         if self._hasActiveTaskAsJunior():
             return (
                 "Shared on the task branch. "
