@@ -98,6 +98,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     normalize_branch_slug,
     normalize_lane_path,
     child_lane_path,
+    git_suffix_to_lane_path,
     submit_review_line,
     find_open_review_request,
     find_open_review_request_for_branch,
@@ -1359,27 +1360,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 return "branch"
             return "cancel"
         if junior or from_older_main:
-            if junior and from_older_main:
-                box.setText("Save from this older %s version?" % lane_label)
-                box.setInformativeText(
-                    "As a junior you save on a branch (not on main).\n"
-                    "%s still has later versions on this computer — "
-                    "Create a branch from here; those later versions stay."
-                    % lane_label
-                )
-            elif junior:
-                box.setText("Save on a branch?")
-                box.setInformativeText(
-                    "As a junior you save on a branch (not on main).\n"
-                    "Create a branch to save this version."
-                )
-            else:
+            if from_older_main:
                 box.setText("Save from this older %s version?" % lane_label)
                 box.setInformativeText(
                     "%s still has later versions on this computer.\n"
                     "Create a branch from here — those later versions stay."
                     % lane_label
                 )
+            else:
+                box.setText("Save on a branch?")
+                box.setInformativeText("Create a branch to save this version.")
             branch_btn = box.addButton("Create a branch", qt.QMessageBox.AcceptRole)
             box.addButton("Cancel", qt.QMessageBox.RejectRole)
             box.setDefaultButton(branch_btn)
@@ -2404,8 +2394,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         for spec in bundle.get("version_specs") or []:
             if not (spec or {}).get("lane_start"):
                 continue
-            lane = normalize_branch_slug(str((spec or {}).get("branch") or "").strip())
-            if not lane or lane.lower() not in allowed:
+            lane = normalize_lane_path(str((spec or {}).get("branch") or "").strip())
+            if not lane or not self._juniorMayWriteLane(lane):
                 continue
             start_id = str((spec or {}).get("id") or "").strip()
             start_sha = str(sha_by_id.get(start_id) or "").strip().lower()
@@ -6760,15 +6750,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return ""
 
     def _activeTaskForBranchSlug(self, lane: str):
-        """Active (non-accepted) task whose unified lane is this branch slug."""
-        lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
-        if not lane_key or lane_key == "main":
+        """Active task for this lane (exact task root or a nested sub-branch)."""
+        lane_key = normalize_lane_path(lane) or str(lane or "").strip().lower()
+        if not lane_key or self._isMainHistoryLane(lane_key):
             return None
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "") == "accepted":
                 continue
-            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
-            if slug and slug.lower() == lane_key:
+            slug = normalize_lane_path((task or {}).get("branch_slug") or "").lower()
+            if slug and (lane_key == slug or lane_key.startswith(slug + "/")):
                 return task
         return None
 
@@ -6836,16 +6826,24 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         ``network=False`` uses only local task fields (fast — for Version details
         dialog). ``network=True`` may query GitHub for open review PRs.
         """
-        lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
-        if not lane_key or lane_key == "main":
+        lane_key = normalize_lane_path(lane) or str(lane or "").strip().lower()
+        if not lane_key or self._isMainHistoryLane(lane_key):
             return None
         me = (self._githubLogin() or "").strip().lower()
         if not me:
             return None
-        current_slug = self._currentNamedBranchSlug().lower()
+        current_slug = (self._currentNamedBranchSlug() or "").lower()
         own = None
         review = None
         full_name = self._currentProjectName()
+
+        def _lane_under_task(candidate: str, task_root: str) -> bool:
+            cand = str(candidate or "").strip().lower()
+            root = str(task_root or "").strip().lower()
+            if not cand or not root:
+                return False
+            return cand == root or cand.startswith(root + "/")
+
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "") == "accepted":
                 continue
@@ -6854,10 +6852,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not juniors:
                 continue
             junior_keys = {name.lower() for name in juniors}
-            task_slug = normalize_branch_slug(task.get("branch_slug") or "").lower()
+            task_slug = normalize_lane_path(task.get("branch_slug") or "").lower()
             status = str(task.get("status") or "").strip().lower()
-            lane_matches = (task_slug and task_slug == lane_key) or (
-                current_slug and lane_key == current_slug
+            lane_matches = _lane_under_task(lane_key, task_slug) or (
+                current_slug and _lane_under_task(lane_key, current_slug)
             )
             if me in junior_keys:
                 # Already submitted: no second Request review (🔵 shows the state).
@@ -6868,7 +6866,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 continue
             if senior.lower() != me:
                 continue
-            if task_slug == lane_key and status == "submitted":
+            if _lane_under_task(lane_key, task_slug) and status == "submitted":
                 review = task
                 continue
             if not network:
@@ -6889,8 +6887,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if not req2:
                     continue
                 head = str(req2.get("branch") or "").strip()
-                head_slug = head.split("/")[-1].lower() if head else ""
-                if head_slug == lane_key:
+                if head.startswith("cv-review/"):
+                    head_slug = git_suffix_to_lane_path(head.split("/", 1)[-1]).lower()
+                else:
+                    head_slug = head.split("/")[-1].lower() if head else ""
+                if head_slug and (
+                    head_slug == lane_key or _lane_under_task(head_slug, task_slug)
+                ):
                     review = task
                     break
         if own:
@@ -8238,15 +8241,35 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return True
 
     def _writableTaskLaneSlugs(self):
-        """None = no locks. Empty set = lock all writes. Else only those lane slugs."""
+        """None = no locks. Empty set = lock all writes. Else task root lane slugs.
+
+        Nested Create lanes under a task (``task/sub``) stay writable via
+        ``_juniorMayWriteLane`` (prefix match), not only exact root equality.
+        """
         if not self._juniorWriteLockApplies():
             return None
         slugs = set()
         for task in self._activeTasksAsJunior():
-            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            slug = normalize_lane_path((task or {}).get("branch_slug") or "")
             if slug:
                 slugs.add(slug.lower())
         return slugs
+
+    def _juniorMayWriteLane(self, lane: str) -> bool:
+        """True when junior write locks allow this lane (task root or under it)."""
+        allowed = self._writableTaskLaneSlugs()
+        if allowed is None:
+            return True
+        path = normalize_lane_path(lane).lower() or str(lane or "").strip().lower()
+        if not path or self._isMainHistoryLane(path):
+            return False
+        for root in allowed:
+            base = str(root or "").strip().lower()
+            if not base:
+                continue
+            if path == base or path.startswith(base + "/"):
+                return True
+        return False
 
     def _attachGitToCurrentTaskStart(self, local_path: str) -> bool:
         """True when Git was attached to the junior's existing task …/start lane.
@@ -8266,11 +8289,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 break
         if not spec or not spec.get("lane_start"):
             return False
-        lane = normalize_branch_slug(str(spec.get("branch") or "").strip())
+        lane = normalize_lane_path(str(spec.get("branch") or "").strip())
         if not lane:
             return False
-        allowed = self._writableTaskLaneSlugs()
-        if allowed is None or lane.lower() not in allowed:
+        if not self._juniorMayWriteLane(lane):
             return False
         sha = str((bundle.get("sha_by_id") or {}).get(version_id) or "").strip()
         if not sha:
@@ -8282,13 +8304,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return True
 
     def _isVersionWriteLocked(self, version_id: str) -> bool:
-        allowed = self._writableTaskLaneSlugs()
-        if allowed is None:
+        if self._writableTaskLaneSlugs() is None:
             return False
-        lane = (self._historyLaneForVersion(version_id) or "main").strip().lower()
-        if not lane or lane == "main":
-            return True
-        return lane not in allowed
+        lane = (self._historyLaneForVersion(version_id) or "main").strip()
+        return not self._juniorMayWriteLane(lane)
 
     def _isCurrentVersionWriteLocked(self) -> bool:
         return self._isVersionWriteLocked(
@@ -8296,8 +8315,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         )
 
     def _writeLockedVersionIds(self) -> set:
-        allowed = self._writableTaskLaneSlugs()
-        if allowed is None:
+        if self._writableTaskLaneSlugs() is None:
             return set()
         locked = set()
         for spec in (
@@ -8307,8 +8325,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             vid = str((spec or {}).get("id") or "").strip()
             if not vid:
                 continue
-            branch = str((spec or {}).get("branch") or "main").strip().lower() or "main"
-            if branch == "main" or branch not in allowed:
+            branch = str((spec or {}).get("branch") or "main").strip() or "main"
+            if not self._juniorMayWriteLane(branch):
                 locked.add(vid)
         return locked
 
