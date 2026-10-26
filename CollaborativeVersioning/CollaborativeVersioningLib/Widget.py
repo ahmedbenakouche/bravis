@@ -88,6 +88,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     create_and_publish_task_branch,
     review_lane_tip_integrated_into_main,
     review_lane_tip_integrated_into_parent,
+    review_parent_lane_already_merged_upward,
     is_nested_lane_path,
     merge_nested_lane_into_parent,
     parent_lane_slug,
@@ -7016,6 +7017,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         juniors = {name.lower() for name in _task_junior_logins(task)}
         return me in juniors
 
+    def _nestedParentAlreadyMergedUp(self, lane: str) -> bool:
+        """True when parent tip is already merged upward — hide Merge on children."""
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if not local_path or not is_nested_lane_path(lane):
+            return False
+        try:
+            return bool(review_parent_lane_already_merged_upward(local_path, lane))
+        except (GitHubAuthError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+
     def _versionIsSharedOnTree(self, version_id: str) -> bool:
         """True when this Version-tree node is shared (solid), not local dashed."""
         if not str(version_id or "").strip():
@@ -7131,6 +7142,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._canOfferNestedMerge(lane)
                 and self._isTipVersionOfLane(version_id, lane)
                 and not self._laneAlreadyIntegrated(lane)
+                and not self._nestedParentAlreadyMergedUp(lane)
             ):
                 payload["merge"] = True
             return self._withDeleteAction(payload, spec)
@@ -7261,6 +7273,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     parent = parent_lane_slug(lane) or "its parent"
                     self._appendFeed(
                         "This sub-branch is already on %s — nothing to Merge." % parent,
+                        error=True,
+                    )
+                    return
+                if self._nestedParentAlreadyMergedUp(lane):
+                    parent = parent_lane_slug(lane) or "its parent"
+                    self._appendFeed(
+                        "Branch %s is already merged upward — nothing to Merge "
+                        "into it from this sub-branch." % parent,
                         error=True,
                     )
                     return
@@ -7444,6 +7464,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if self._laneAlreadyIntegrated(slug):
             self._appendFeed(
                 "This sub-branch is already on %s — nothing to Merge." % parent,
+                error=True,
+            )
+            return
+        if self._nestedParentAlreadyMergedUp(slug):
+            self._appendFeed(
+                "Branch %s is already merged upward — nothing to Merge "
+                "into it from this sub-branch." % parent,
                 error=True,
             )
             return

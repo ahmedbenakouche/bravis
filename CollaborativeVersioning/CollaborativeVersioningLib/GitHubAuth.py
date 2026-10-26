@@ -1710,6 +1710,24 @@ def review_lane_tip_integrated_into_parent(repo_dir: str, lane: str) -> bool:
     return _is_ancestor(repo_dir, child_tip, parent_tip)
 
 
+def review_parent_lane_already_merged_upward(repo_dir: str, lane: str) -> bool:
+    """True when this nested lane's parent tip is already merged into its parent.
+
+    Example: ``sos/ok`` tip is in ``sos`` → hide Merge on ``sos/ok/yoi`` (parent
+    line is closed upward; merging into it would require re-merging ``sos/ok``).
+    Flat parent under main: closed when that parent tip is already on main.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return False
+    slug = normalize_lane_path(lane)
+    parent = parent_lane_slug(slug)
+    if not slug or not parent:
+        return False
+    if is_nested_lane_path(parent):
+        return review_lane_tip_integrated_into_parent(repo_dir, parent)
+    return review_lane_tip_integrated_into_main(repo_dir, parent)
+
+
 def merge_nested_lane_into_parent(repo_dir: str, lane: str) -> str:
     """Merge a nested lane tip onto its parent lane and publish the parent tip.
 
