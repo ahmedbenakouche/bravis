@@ -17,6 +17,7 @@ from CollaborativeVersioningLib.ModuleConstants import _UI_BUILD_TAG  # noqa: F4
 _LIB_MODULE_NAMES = (
     "CollaborativeVersioningLib.UiStyles",
     "CollaborativeVersioningLib.DataManager",
+    "CollaborativeVersioningLib.SegmentationCubes",
     "CollaborativeVersioningLib.GitHubAuth",
     "CollaborativeVersioningLib.OntologyLoader",
     "CollaborativeVersioningLib.GraphCanvas",

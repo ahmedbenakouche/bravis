@@ -198,12 +198,10 @@ def geometry_from_volume(volume_node: Any) -> dict[str, Any]:
     return geometry
 
 
-def apply_geometry(volume_node: Any, geometry: dict[str, Any] | None, reference: Any = None) -> None:
+def apply_geometry(volume_node: Any, geometry: dict[str, Any] | None) -> None:
     if volume_node is None:
         return
     geo = dict(geometry or {})
-    if reference is not None and not geo:
-        geo = geometry_from_volume(reference)
     try:
         origin = geo.get("origin") or [0.0, 0.0, 0.0]
         volume_node.SetOrigin(float(origin[0]), float(origin[1]), float(origin[2]))

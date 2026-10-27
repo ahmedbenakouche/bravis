@@ -3676,23 +3676,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         finally:
             slicer.mrmlScene.RemoveNode(color_table)
 
-    def _saveNodeAsNifti(self, manager: DataManager, node, folder: str, filename: str, reference_volume=None) -> str:
+    def _saveNodeAsNifti(self, manager: DataManager, node, folder: str, filename: str) -> str:
+        """Save a volume/labelmap node as NIfTI (not used for segmentations — see cubes)."""
         path = os.path.join(folder, filename)
-        class_name = node.GetClassName() if node else ""
-        if "Segmentation" in class_name:
-            labelmap = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLLabelMapVolumeNode", "%s_labelmap" % node.GetName()
-            )
-            try:
-                exported = self._exportSegmentationPreservingLabels(node, labelmap, reference_volume)
-                if not exported:
-                    raise RuntimeError(
-                        "Could not save the segmentation with ontology IDs from segment names."
-                    )
-                manager.save_volume(labelmap, path)
-            finally:
-                slicer.mrmlScene.RemoveNode(labelmap)
-            return path
         manager.save_volume(node, path)
         return path
 
