@@ -1,8 +1,6 @@
-# Collaborative Versioning
+# BRAVIS
 
-Extension **3D Slicer** pour versionner et partager des annotations (segmentation, etc.) en équipe, autour d’un projet GitHub.
-
-Ce document décrit **ce que tu peux faire dans l’outil** et **quand** les boutons apparaissent. Ce n’est pas un manuel Git.
+Extension **3D Slicer** pour versionner et partager des annotations en équipe.
 
 ---
 
