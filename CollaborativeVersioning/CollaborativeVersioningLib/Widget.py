@@ -3727,17 +3727,51 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if write_volume:
             self._saveNodeAsNifti(manager, volume_node, folder, "%s_volume.nii.gz" % stem)
         if write_segmentation:
-            self._saveNodeAsNifti(
+            # Cubes + manifest under .cv_seg/ (not a versioned full NIfTI).
+            self._saveSegmentationAsCubes(
                 manager,
                 segmentation_node,
                 folder,
-                "%s_segmentation.nii.gz" % stem,
+                stem,
                 reference_volume=volume_node,
             )
         ontology_path = os.path.join(folder, "%s_ontologie.json" % stem)
         if write_ontology:
             save_ontology_file(self._ontology_document, ontology_path)
         return ontology_path
+
+    def _saveSegmentationAsCubes(
+        self,
+        manager: DataManager,
+        segmentation_node,
+        folder: str,
+        stem: str,
+        reference_volume=None,
+    ) -> dict:
+        """Export labels → xxHash cubes + manifest; remove legacy root segmentation NIfTI."""
+        if segmentation_node is None:
+            raise RuntimeError("Segmentation is missing.")
+        class_name = segmentation_node.GetClassName() if segmentation_node else ""
+        if "Segmentation" not in class_name:
+            # Scalar/labelmap node: store directly.
+            return manager.save_segmentation_cubes(folder, segmentation_node, stem)
+        labelmap = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode",
+            "%s_labelmap" % segmentation_node.GetName(),
+        )
+        try:
+            exported = self._exportSegmentationPreservingLabels(
+                segmentation_node,
+                labelmap,
+                reference_volume,
+            )
+            if not exported:
+                raise RuntimeError(
+                    "Could not save the segmentation with ontology IDs from segment names."
+                )
+            return manager.save_segmentation_cubes(folder, labelmap, stem)
+        finally:
+            slicer.mrmlScene.RemoveNode(labelmap)
 
     def _writeInitialProjectFiles(self, folder: str, volume_node, segmentation_node, project_name: str) -> str:
         return self._writeProjectFiles(
@@ -8902,7 +8936,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if volume_node is None and not volume_path:
             raise RuntimeError("This project has no 3D volume to open.")
         load_volume = volume_node is None
-        has_segmentation = bool(files.get("segmentation"))
+        # Prefer .cv_seg cubes when present; else legacy root *_segmentation.nii.gz.
+        use_cubes = bool(files.get("segmentation_store"))
+        has_segmentation = use_cubes or bool(files.get("segmentation"))
         steps = (1 if load_volume else 0) + (1 if has_segmentation else 0) + 1
         if load_volume:
             self._setProgressStep(1, steps, "Loading 3D volume…")
@@ -8916,17 +8952,25 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         step = 0
         names_to_replace = set()
         current_seg = self._selectorCurrentNode("segmentationSelector")
+        # Legacy NIfTI path if any; cube store is materialized later (needs progress step).
+        legacy_segmentation_path = files.get("segmentation") if not use_cubes else None
         can_inject = bool(
             from_snapshot
-            and files.get("segmentation")
+            and (use_cubes or legacy_segmentation_path)
             and current_seg is not None
             and hasattr(current_seg, "IsA")
             and current_seg.IsA("vtkMRMLSegmentationNode")
         )
         if load_volume:
             names_to_replace.add(manager._basename_without_extension(volume_path))
-        if files.get("segmentation") and not can_inject:
-            names_to_replace.add(manager._basename_without_extension(files["segmentation"]))
+        if legacy_segmentation_path and not can_inject:
+            names_to_replace.add(manager._basename_without_extension(legacy_segmentation_path))
+        elif use_cubes and not can_inject:
+            names_to_replace.add(
+                manager._basename_without_extension(
+                    "%s_segmentation.nii.gz" % self._savedProjectFileStem(folder)
+                )
+            )
         manager.remove_scene_nodes_by_names(names_to_replace)
         before_ids = self._sceneDataNodeIds()
         if load_volume:
@@ -8937,13 +8981,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if volume_node is not None:
             keep_ids.add(volume_node.GetID())
         segmentation_node = None
-        segmentation_path = files.get("segmentation")
-        if segmentation_path:
+        if has_segmentation:
             step += 1
             self._setProgressStep(step, steps, "Loading segmentation…")
             self._suppress_dirty += 1
             self._suppress_asset_ui_updates += 1
             try:
+                if use_cubes:
+                    stem = self._savedProjectFileStem(folder)
+                    segmentation_path = manager.materialize_segmentation_cubes(folder, stem)
+                else:
+                    segmentation_path = legacy_segmentation_path
                 if can_inject and manager.inject_segmentation_from_file(
                     current_seg,
                     segmentation_path,

@@ -492,7 +492,12 @@ class DataManager:
             return 0
 
     def discover_project_files(self, folder: str) -> dict[str, Any]:
-        empty = {"volume": None, "segmentation": None, "ontologies": []}
+        empty = {
+            "volume": None,
+            "segmentation": None,
+            "segmentation_store": False,
+            "ontologies": [],
+        }
         if not folder or not os.path.isdir(folder):
             return empty
         volumes = []
@@ -525,11 +530,53 @@ class DataManager:
                 volumes.append(extra_volume)
             if extra_segmentation:
                 segmentations.append(extra_segmentation)
+        from CollaborativeVersioningLib import SegmentationCubes
+
+        has_store = SegmentationCubes.store_exists(folder)
         return {
             "volume": volumes[0] if volumes else None,
             "segmentation": segmentations[0] if segmentations else None,
+            "segmentation_store": has_store,
             "ontologies": ontologies,
         }
+
+    def save_segmentation_cubes(self, folder: str, labelmap_node: Any, stem: str) -> dict[str, Any]:
+        """Write ``.cv_seg`` blocks + manifest from a labelmap; drop legacy root NIfTI."""
+        from CollaborativeVersioningLib import SegmentationCubes
+
+        if labelmap_node is None:
+            raise ValueError("Segmentation labelmap is missing.")
+        grid = slicer.util.arrayFromVolume(labelmap_node)
+        geometry = SegmentationCubes.geometry_from_volume(labelmap_node)
+        stats = SegmentationCubes.write_store(folder, grid, geometry)
+        SegmentationCubes.remove_legacy_segmentation_file(folder, stem)
+        logging.info(
+            "Saved segmentation cubes in %s (written=%s reused=%s empty=%s)",
+            folder,
+            stats.get("written"),
+            stats.get("reused"),
+            stats.get("skipped_empty"),
+        )
+        return stats
+
+    def materialize_segmentation_cubes(self, folder: str, stem: str) -> str:
+        """Rebuild gitignored cache NIfTI from ``.cv_seg`` and return its path."""
+        from CollaborativeVersioningLib import SegmentationCubes
+
+        grid, geometry = SegmentationCubes.read_store(folder)
+        path = SegmentationCubes.cache_nifti_path(folder, stem)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        labelmap = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode",
+            "%s_segmentation" % ((stem or "project").strip() or "project"),
+        )
+        try:
+            slicer.util.updateVolumeFromArray(labelmap, grid)
+            SegmentationCubes.apply_geometry(labelmap, geometry)
+            self.save_volume(labelmap, path)
+        finally:
+            slicer.mrmlScene.RemoveNode(labelmap)
+        return path
 
     @staticmethod
     def _filename_is_segmentation(lower_name: str) -> bool:
