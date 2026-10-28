@@ -1,7 +1,6 @@
 """Small Qt accessors (split from CollaborativeVersioning.py)."""
 from __future__ import annotations
 
-import qt
 
 def _qt_combo_index(combo) -> int:
     value = combo.currentIndex
