@@ -8337,10 +8337,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Version saved: %s" % message)
         if cube_stats is not None:
             written = int(cube_stats.get("written") or 0)
-            if written == 1:
-                self._appendFeed("New segmentation cubes written: 1")
-            else:
-                self._appendFeed("New segmentation cubes written: %d" % written)
+            total = int(cube_stats.get("chunks") or 0)
+            self._appendFeed("New segmentation cubes written: %d/%d" % (written, total))
         if new_branch_slug:
             self._appendFeed(
                 "Saved on branch %s (local only until you Share)." % new_branch_slug
