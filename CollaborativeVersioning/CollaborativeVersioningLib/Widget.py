@@ -3704,17 +3704,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         write_volume: bool = True,
         write_segmentation: bool = True,
         write_ontology: bool = True,
-    ) -> str:
+    ) -> tuple[str, dict | None]:
         if not folder:
             raise GitHubAuthError("The project folder is missing.")
         if not (write_volume or write_segmentation or write_ontology):
             raise GitHubAuthError("No new changes to save.")
         manager = DataManager()
+        cube_stats = None
         if write_volume:
             self._saveNodeAsNifti(manager, volume_node, folder, "%s_volume.nii.gz" % stem)
         if write_segmentation:
             # Cubes + manifest under .cv_seg/ (not a versioned full NIfTI).
-            self._saveSegmentationAsCubes(
+            cube_stats = self._saveSegmentationAsCubes(
                 manager,
                 segmentation_node,
                 folder,
@@ -3724,7 +3725,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         ontology_path = os.path.join(folder, "%s_ontologie.json" % stem)
         if write_ontology:
             save_ontology_file(self._ontology_document, ontology_path)
-        return ontology_path
+        return ontology_path, cube_stats
 
     def _saveSegmentationAsCubes(
         self,
@@ -3760,12 +3761,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             slicer.mrmlScene.RemoveNode(labelmap)
 
     def _writeInitialProjectFiles(self, folder: str, volume_node, segmentation_node, project_name: str) -> str:
-        return self._writeProjectFiles(
+        ontology_path, _cube_stats = self._writeProjectFiles(
             folder,
             volume_node,
             segmentation_node,
             self._projectFileStem(project_name),
         )
+        return ontology_path
 
     def onPeople(self) -> None:
         if not self._canOpenPeople():
@@ -8292,10 +8294,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._appendFeed("Saving version…")
         self._openProgress("Save version", progress_label)
         version_id = None
+        cube_stats = None
         self._suppress_dirty += 1
         try:
             self._updateProgress(progress_label)
-            self._writeProjectFiles(
+            _ontology_path, cube_stats = self._writeProjectFiles(
                 local_path,
                 volume_node,
                 segmentation_node,
@@ -8332,6 +8335,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed("Version saved: %s — %s" % (version_id, message))
         else:
             self._appendFeed("Version saved: %s" % message)
+        if cube_stats is not None:
+            written = int(cube_stats.get("written") or 0)
+            if written == 1:
+                self._appendFeed("New segmentation cubes written: 1")
+            else:
+                self._appendFeed("New segmentation cubes written: %d" % written)
         if new_branch_slug:
             self._appendFeed(
                 "Saved on branch %s (local only until you Share)." % new_branch_slug
