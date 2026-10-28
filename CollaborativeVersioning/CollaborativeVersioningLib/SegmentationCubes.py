@@ -3,9 +3,10 @@
 Layout (versioned in Git except the cache):
   .cv_seg/
     manifest.json          # shape, geometry, chunk size, hash per cube key
-    blocks/ab/abcdef...    # immutable raw cube bytes (no extension)
+    blocks/ab/abcdef...    # immutable zlib-compressed cube bytes (no extension)
     cache/                 # gitignored NIfTI rebuilt for Slicer load/switch
 
+xxHash is always over the uncompressed uint16 cube bytes.
 Legacy ``*_segmentation.nii.gz`` at the project root is no longer written on Save.
 Open/Switch still loads it when no cube store exists (old commits).
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import zlib
 from typing import Any
 
 import numpy as np
@@ -32,7 +34,9 @@ BLOCKS_DIRNAME = "blocks"
 CACHE_DIRNAME = "cache"
 MANIFEST_NAME = "manifest.json"
 CHUNK_SIZE = 64
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+BLOCK_ENCODING = "zlib"
+ZLIB_LEVEL = 6
 GRID_DTYPE = np.dtype("<u2")  # little-endian uint16
 _GITIGNORE_CACHE_MARKER = ".cv_seg/cache/"
 _ZERO_HASH_CACHE: dict[tuple[int, int, int], str] = {}
@@ -244,6 +248,7 @@ def build_manifest(grid: np.ndarray, geometry: dict[str, Any] | None = None) -> 
         "chunk": CHUNK_SIZE,
         "shape": list(shape),
         "dtype": "uint16",
+        "block_encoding": BLOCK_ENCODING,
         "origin": list((geometry or {}).get("origin") or [0.0, 0.0, 0.0]),
         "spacing": list((geometry or {}).get("spacing") or [1.0, 1.0, 1.0]),
         "directions": list(
@@ -306,16 +311,29 @@ def ensure_cache_gitignored(folder: str) -> None:
         return
 
 
+def _compress_block_bytes(raw: bytes) -> bytes:
+    return zlib.compress(raw, ZLIB_LEVEL)
+
+
+def _decompress_block_bytes(payload: bytes) -> bytes:
+    try:
+        return zlib.decompress(payload)
+    except zlib.error as exc:
+        raise RuntimeError("Could not decompress segmentation cube (expected zlib).") from exc
+
+
 def _write_block_file(folder: str, digest: str, block: np.ndarray) -> bool:
-    """Write block bytes if absent. Returns True when a new file was created."""
+    """Write zlib-compressed block bytes if absent. Returns True when a new file was created."""
     path = block_file_path(folder, digest)
     if os.path.isfile(path):
         return False
     os.makedirs(os.path.dirname(path), exist_ok=True)
     arr = np.ascontiguousarray(block, dtype=GRID_DTYPE)
+    raw = arr.tobytes()
+    compressed = _compress_block_bytes(raw)
     tmp = path + ".tmp"
     with open(tmp, "wb") as handle:
-        handle.write(arr.tobytes())
+        handle.write(compressed)
     os.replace(tmp, path)
     return True
 
@@ -365,18 +383,18 @@ def write_store(
     }
 
 
-def _decode_cube(payload: bytes, expected_shape: tuple[int, int, int]) -> np.ndarray:
+def _decode_cube(raw: bytes, expected_shape: tuple[int, int, int]) -> np.ndarray:
     expected = int(expected_shape[0] * expected_shape[1] * expected_shape[2] * GRID_DTYPE.itemsize)
-    if len(payload) != expected:
+    if len(raw) != expected:
         raise RuntimeError(
             "Cube payload has the wrong size (got %d bytes, expected %d)."
-            % (len(payload), expected)
+            % (len(raw), expected)
         )
-    return np.frombuffer(payload, dtype=GRID_DTYPE).reshape(expected_shape).copy()
+    return np.frombuffer(raw, dtype=GRID_DTYPE).reshape(expected_shape).copy()
 
 
 def read_store(folder: str, manifest: dict[str, Any] | None = None) -> tuple[np.ndarray, dict[str, Any]]:
-    """Rebuild a full uint16 grid from manifest + block files."""
+    """Rebuild a full uint16 grid from manifest + zlib block files."""
     _require_xxhash()
     data = manifest if manifest is not None else load_manifest(folder)
     shape = tuple(int(v) for v in data["shape"])
@@ -398,8 +416,9 @@ def read_store(folder: str, manifest: dict[str, Any] | None = None) -> tuple[np.
             if not os.path.isfile(path):
                 raise RuntimeError("Missing segmentation cube %s." % key)
             with open(path, "rb") as handle:
-                payload = handle.read()
-            block = _decode_cube(payload, expected)
+                compressed = handle.read()
+            raw = _decompress_block_bytes(compressed)
+            block = _decode_cube(raw, expected)
             zsl, ysl, xsl = cube_slices(shape, key, chunk)
             grid[zsl, ysl, xsl] = block
         if index % 32 == 0:
