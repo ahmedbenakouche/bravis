@@ -9153,7 +9153,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._syncAssetDataObservers()
                 self._clearDirtyAssets()
                 after_manifest = SegmentationCubes.try_load_manifest(local_path)
-                cube_diff = SegmentationCubes.count_changed_chunks(
+                cube_diff = SegmentationCubes.diff_manifest_chunks(
                     before_manifest,
                     after_manifest,
                 )
@@ -9183,8 +9183,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if notify:
             self._appendFeed("Checked out %s." % display)
         if cube_diff is not None:
-            changed, total = cube_diff
+            changed = int(cube_diff.get("changed") or 0)
+            total = int(cube_diff.get("total") or 0)
             self._appendFeed("Segmentation cubes changed: %d/%d" % (changed, total))
+            if changed:
+                self._appendFeed(
+                    "Selon X : %s"
+                    % SegmentationCubes.format_voxel_intervals(cube_diff.get("x") or [])
+                )
+                self._appendFeed(
+                    "Selon Y : %s"
+                    % SegmentationCubes.format_voxel_intervals(cube_diff.get("y") or [])
+                )
+                self._appendFeed(
+                    "Selon Z : %s"
+                    % SegmentationCubes.format_voxel_intervals(cube_diff.get("z") or [])
+                )
         self._painted_ids_cache_key = None
         self._painted_ids_cache = set()
         self._scheduleAnatomyTreeCoverageRefresh()

@@ -288,14 +288,56 @@ def try_load_manifest(folder: str) -> dict[str, Any] | None:
         return None
 
 
-def count_changed_chunks(
+def _manifest_shape_chunk(manifest: dict[str, Any]) -> tuple[tuple[int, int, int] | None, int]:
+    raw = manifest.get("shape") or []
+    try:
+        shape = (int(raw[0]), int(raw[1]), int(raw[2]))
+    except (TypeError, ValueError, IndexError):
+        return None, CHUNK_SIZE
+    if shape[0] <= 0 or shape[1] <= 0 or shape[2] <= 0:
+        return None, CHUNK_SIZE
+    try:
+        chunk = int(manifest.get("chunk") or CHUNK_SIZE)
+    except (TypeError, ValueError):
+        chunk = CHUNK_SIZE
+    return shape, max(1, chunk)
+
+
+def _merge_inclusive_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    ordered = sorted((int(lo), int(hi)) for lo, hi in intervals)
+    merged: list[list[int]] = [[ordered[0][0], ordered[0][1]]]
+    for lo, hi in ordered[1:]:
+        if lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(a, b) for a, b in merged]
+
+
+def format_voxel_intervals(intervals: list[tuple[int, int]]) -> str:
+    """Human-readable inclusive ranges: ``[25, 70] puis [75, 96]``."""
+    if not intervals:
+        return "—"
+    return " puis ".join("[%d, %d]" % (lo, hi) for lo, hi in intervals)
+
+
+def diff_manifest_chunks(
     before: dict[str, Any] | None,
     after: dict[str, Any] | None,
-) -> tuple[int, int] | None:
-    """Compare two manifests: (changed cube count, total cube keys in the union).
+) -> dict[str, Any] | None:
+    """Compare two manifests: changed count + merged voxel intervals on X/Y/Z.
 
-    A cube counts as changed when its hash differs or it exists on only one side.
-    Returns None if either manifest is missing.
+    Returns ``None`` if either manifest is missing, else::
+
+        {
+          "changed": int,
+          "total": int,
+          "x": [(lo, hi), ...],  # inclusive voxel indices
+          "y": [...],
+          "z": [...],
+        }
     """
     if not isinstance(before, dict) or not isinstance(after, dict):
         return None
@@ -303,14 +345,58 @@ def count_changed_chunks(
     right = after.get("chunks") or {}
     if not isinstance(left, dict) or not isinstance(right, dict):
         return None
+    shape_before, chunk_before = _manifest_shape_chunk(before)
+    shape_after, chunk_after = _manifest_shape_chunk(after)
     keys = set(left) | set(right)
     if not keys:
-        return 0, 0
-    changed = 0
+        return {"changed": 0, "total": 0, "x": [], "y": [], "z": []}
+    changed_keys: list[str] = []
     for key in keys:
         if str(left.get(key) or "").strip().lower() != str(right.get(key) or "").strip().lower():
-            changed += 1
-    return changed, len(keys)
+            changed_keys.append(key)
+    x_intervals: list[tuple[int, int]] = []
+    y_intervals: list[tuple[int, int]] = []
+    z_intervals: list[tuple[int, int]] = []
+    for key in changed_keys:
+        # Prefer the destination layout; fall back to the source if needed.
+        if key in right and shape_after is not None:
+            shape, chunk = shape_after, chunk_after
+        elif key in left and shape_before is not None:
+            shape, chunk = shape_before, chunk_before
+        elif shape_after is not None:
+            shape, chunk = shape_after, chunk_after
+        elif shape_before is not None:
+            shape, chunk = shape_before, chunk_before
+        else:
+            continue
+        try:
+            zsl, ysl, xsl = cube_slices(shape, key, chunk)
+        except ValueError:
+            continue
+        if zsl.stop > zsl.start:
+            z_intervals.append((zsl.start, zsl.stop - 1))
+        if ysl.stop > ysl.start:
+            y_intervals.append((ysl.start, ysl.stop - 1))
+        if xsl.stop > xsl.start:
+            x_intervals.append((xsl.start, xsl.stop - 1))
+    return {
+        "changed": len(changed_keys),
+        "total": len(keys),
+        "x": _merge_inclusive_intervals(x_intervals),
+        "y": _merge_inclusive_intervals(y_intervals),
+        "z": _merge_inclusive_intervals(z_intervals),
+    }
+
+
+def count_changed_chunks(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> tuple[int, int] | None:
+    """Compare two manifests: (changed cube count, total cube keys in the union)."""
+    diff = diff_manifest_chunks(before, after)
+    if diff is None:
+        return None
+    return int(diff["changed"]), int(diff["total"])
 
 
 def save_manifest(folder: str, manifest: dict[str, Any]) -> str:
