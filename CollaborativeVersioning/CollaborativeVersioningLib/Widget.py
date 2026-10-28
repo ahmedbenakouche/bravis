@@ -9129,6 +9129,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 break
         display = self._versionDisplayTag(version_id)
         previous_id = self._currentVersionId
+        from CollaborativeVersioningLib import SegmentationCubes
+
+        # Snapshot cube manifest before checkout (for changed-cube feed line only).
+        before_manifest = SegmentationCubes.try_load_manifest(local_path)
+        cube_diff = None
         self._suppress_history_selection_signal = True
         try:
             self._currentVersionId = version_id
@@ -9147,6 +9152,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 )
                 self._syncAssetDataObservers()
                 self._clearDirtyAssets()
+                after_manifest = SegmentationCubes.try_load_manifest(local_path)
+                cube_diff = SegmentationCubes.count_changed_chunks(
+                    before_manifest,
+                    after_manifest,
+                )
             except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
                 self._currentVersionId = previous_id
                 self._updateActiveVersionIndicators()
@@ -9172,6 +9182,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._closeProgress()
         if notify:
             self._appendFeed("Checked out %s." % display)
+        if cube_diff is not None:
+            changed, total = cube_diff
+            self._appendFeed("Segmentation cubes changed: %d/%d" % (changed, total))
         self._painted_ids_cache_key = None
         self._painted_ids_cache = set()
         self._scheduleAnatomyTreeCoverageRefresh()

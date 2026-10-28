@@ -278,6 +278,41 @@ def load_manifest(folder: str) -> dict[str, Any]:
     return data
 
 
+def try_load_manifest(folder: str) -> dict[str, Any] | None:
+    """Return the cube manifest if present and valid; otherwise None."""
+    if not store_exists(folder):
+        return None
+    try:
+        return load_manifest(folder)
+    except RuntimeError:
+        return None
+
+
+def count_changed_chunks(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> tuple[int, int] | None:
+    """Compare two manifests: (changed cube count, total cube keys in the union).
+
+    A cube counts as changed when its hash differs or it exists on only one side.
+    Returns None if either manifest is missing.
+    """
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    left = before.get("chunks") or {}
+    right = after.get("chunks") or {}
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return None
+    keys = set(left) | set(right)
+    if not keys:
+        return 0, 0
+    changed = 0
+    for key in keys:
+        if str(left.get(key) or "").strip().lower() != str(right.get(key) or "").strip().lower():
+            changed += 1
+    return changed, len(keys)
+
+
 def save_manifest(folder: str, manifest: dict[str, Any]) -> str:
     path = manifest_path(folder)
     os.makedirs(os.path.dirname(path), exist_ok=True)
