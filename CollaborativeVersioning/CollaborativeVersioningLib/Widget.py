@@ -8981,27 +8981,73 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._suppress_asset_ui_updates += 1
             try:
                 if use_cubes:
+                    # In-memory path: cubes → labelmap RAM → segments (no cache NIfTI round-trip).
                     stem = self._savedProjectFileStem(folder)
-                    segmentation_path = manager.materialize_segmentation_cubes(folder, stem)
+                    if can_inject and manager.inject_segmentation_from_cubes(
+                        current_seg,
+                        folder,
+                    ):
+                        segmentation_node = current_seg
+                    elif can_inject:
+                        logging.warning(
+                            "In-memory cube inject failed; falling back to cache NIfTI"
+                        )
+                        segmentation_path = manager.materialize_segmentation_cubes(
+                            folder,
+                            stem,
+                        )
+                        if manager.inject_segmentation_from_file(
+                            current_seg,
+                            segmentation_path,
+                            isolate=False,
+                        ):
+                            segmentation_node = current_seg
+                        else:
+                            names_to_replace = {
+                                manager._basename_without_extension(segmentation_path)
+                            }
+                            manager.remove_scene_nodes_by_names(names_to_replace)
+                            segmentation_node = manager.load_segmentation(
+                                segmentation_path,
+                                isolate=False,
+                            )
+                    else:
+                        try:
+                            segmentation_node = manager.load_segmentation_from_cubes(
+                                folder,
+                                stem,
+                            )
+                        except Exception:
+                            logging.exception(
+                                "In-memory cube load failed; falling back to cache NIfTI"
+                            )
+                            segmentation_path = manager.materialize_segmentation_cubes(
+                                folder,
+                                stem,
+                            )
+                            segmentation_node = manager.load_segmentation(
+                                segmentation_path,
+                                isolate=False,
+                            )
                 else:
                     segmentation_path = legacy_segmentation_path
-                if can_inject and manager.inject_segmentation_from_file(
-                    current_seg,
-                    segmentation_path,
-                    isolate=False,
-                ):
-                    segmentation_node = current_seg
-                else:
-                    if can_inject:
-                        names_to_replace = {
-                            manager._basename_without_extension(segmentation_path)
-                        }
-                        manager.remove_scene_nodes_by_names(names_to_replace)
-                    # Load directly from the project file (no cv_load_ temp copy).
-                    segmentation_node = manager.load_segmentation(
+                    if can_inject and manager.inject_segmentation_from_file(
+                        current_seg,
                         segmentation_path,
                         isolate=False,
-                    )
+                    ):
+                        segmentation_node = current_seg
+                    else:
+                        if can_inject:
+                            names_to_replace = {
+                                manager._basename_without_extension(segmentation_path)
+                            }
+                            manager.remove_scene_nodes_by_names(names_to_replace)
+                        # Load directly from the project file (no cv_load_ temp copy).
+                        segmentation_node = manager.load_segmentation(
+                            segmentation_path,
+                            isolate=False,
+                        )
             finally:
                 self._suppress_asset_ui_updates -= 1
                 self._suppress_dirty -= 1

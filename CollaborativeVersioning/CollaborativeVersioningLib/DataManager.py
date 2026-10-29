@@ -559,20 +559,82 @@ class DataManager:
         )
         return stats
 
-    def materialize_segmentation_cubes(self, folder: str, stem: str) -> str:
-        """Rebuild gitignored cache NIfTI from ``.cv_seg`` and return its path."""
+    def _labelmap_from_cube_store(self, folder: str, name: str) -> Any:
+        """Rebuild cube store into a temporary labelmap node (RAM only, no cache file)."""
         from CollaborativeVersioningLib import SegmentationCubes
 
         grid, geometry = SegmentationCubes.read_store(folder)
-        path = SegmentationCubes.cache_nifti_path(folder, stem)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         labelmap = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLLabelMapVolumeNode",
-            "%s_segmentation" % ((stem or "project").strip() or "project"),
+            name or "segmentation",
         )
         try:
             slicer.util.updateVolumeFromArray(labelmap, grid)
             SegmentationCubes.apply_geometry(labelmap, geometry)
+        except Exception:
+            slicer.mrmlScene.RemoveNode(labelmap)
+            raise
+        return labelmap
+
+    def inject_segmentation_from_cubes(self, segmentation_node: Any, folder: str) -> bool:
+        """Load ``.cv_seg`` into an existing segmentation node without writing cache NIfTI."""
+        if segmentation_node is None or not segmentation_node.IsA("vtkMRMLSegmentationNode"):
+            return False
+        labelmap = None
+        try:
+            kept_colors = self._segment_colors_by_label(segmentation_node)
+            try:
+                segmentation_node.CreateDefaultDisplayNodes()
+            except Exception:
+                pass
+            segmentation = segmentation_node.GetSegmentation()
+            if segmentation is None:
+                return False
+            labelmap = self._labelmap_from_cube_store(
+                folder,
+                "%s_labelmap" % (segmentation_node.GetName() or "segmentation"),
+            )
+            segmentation.RemoveAllSegments()
+            with _SlicerProgressPopupGuard():
+                ok = bool(
+                    slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                        labelmap,
+                        segmentation_node,
+                    )
+                )
+            if not ok:
+                return False
+            self._ensure_segment_id_names(segmentation_node)
+            self._apply_kept_segment_colors(segmentation_node, kept_colors)
+            self._prepare_segmentation_display(segmentation_node)
+            return True
+        except Exception:
+            logging.exception("Could not inject segmentation cubes from %s", folder)
+            return False
+        finally:
+            if labelmap is not None:
+                try:
+                    slicer.mrmlScene.RemoveNode(labelmap)
+                except Exception:
+                    pass
+
+    def load_segmentation_from_cubes(self, folder: str, stem: str = "project") -> Any:
+        """Create a segmentation node from ``.cv_seg`` in memory (no cache NIfTI)."""
+        name = "%s_segmentation" % ((stem or "project").strip() or "project")
+        labelmap = self._labelmap_from_cube_store(folder, name)
+        return self._as_segmentation_node(labelmap, name)
+
+    def materialize_segmentation_cubes(self, folder: str, stem: str) -> str:
+        """Rebuild gitignored cache NIfTI from ``.cv_seg`` and return its path (fallback / debug)."""
+        from CollaborativeVersioningLib import SegmentationCubes
+
+        path = SegmentationCubes.cache_nifti_path(folder, stem)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        labelmap = self._labelmap_from_cube_store(
+            folder,
+            "%s_segmentation" % ((stem or "project").strip() or "project"),
+        )
+        try:
             self.save_volume(labelmap, path)
         finally:
             slicer.mrmlScene.RemoveNode(labelmap)
