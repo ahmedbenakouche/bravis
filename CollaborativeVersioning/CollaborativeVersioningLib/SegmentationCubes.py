@@ -1,10 +1,12 @@
 """Chunked segmentation store: 64^3 cubes named by xxHash64 content.
 
-Layout (versioned in Git except the cache):
+Layout (versioned in Git):
   .cv_seg/
     manifest.json          # shape, geometry, chunk size, hash per cube key
     blocks/ab/abcdef...    # immutable zlib-compressed cube bytes (no extension)
-    cache/                 # gitignored NIfTI rebuilt for Slicer load/switch
+
+Open/Switch rebuilds a labelmap in RAM and imports it into the segmentation node
+(no gitignored NIfTI cache).
 
 xxHash is always over the uncompressed uint16 cube bytes.
 Legacy ``*_segmentation.nii.gz`` at the project root is no longer written on Save.
@@ -31,14 +33,12 @@ else:
 
 STORE_DIRNAME = ".cv_seg"
 BLOCKS_DIRNAME = "blocks"
-CACHE_DIRNAME = "cache"
 MANIFEST_NAME = "manifest.json"
 CHUNK_SIZE = 64
 FORMAT_VERSION = 2
 BLOCK_ENCODING = "zlib"
 ZLIB_LEVEL = 6
 GRID_DTYPE = np.dtype("<u2")  # little-endian uint16
-_GITIGNORE_CACHE_MARKER = ".cv_seg/cache/"
 _ZERO_HASH_CACHE: dict[tuple[int, int, int], str] = {}
 
 
@@ -60,15 +60,6 @@ def manifest_path(folder: str) -> str:
 
 def blocks_dir(folder: str) -> str:
     return os.path.join(store_dir(folder), BLOCKS_DIRNAME)
-
-
-def cache_dir(folder: str) -> str:
-    return os.path.join(store_dir(folder), CACHE_DIRNAME)
-
-
-def cache_nifti_path(folder: str, stem: str = "project") -> str:
-    safe = (stem or "project").strip() or "project"
-    return os.path.join(cache_dir(folder), "%s_segmentation.nii.gz" % safe)
 
 
 def block_file_path(folder: str, digest: str) -> str:
@@ -408,30 +399,6 @@ def save_manifest(folder: str, manifest: dict[str, Any]) -> str:
     return path
 
 
-def ensure_cache_gitignored(folder: str) -> None:
-    """Append ``.cv_seg/cache/`` to the project ``.gitignore`` if missing."""
-    if not folder or not os.path.isdir(folder):
-        return
-    gitignore = os.path.join(folder, ".gitignore")
-    marker = _GITIGNORE_CACHE_MARKER
-    try:
-        existing = ""
-        if os.path.isfile(gitignore):
-            with open(gitignore, encoding="utf-8") as handle:
-                existing = handle.read()
-        lines = existing.splitlines()
-        if any(line.strip() == marker for line in lines):
-            return
-        suffix = "" if (not existing or existing.endswith("\n")) else "\n"
-        with open(gitignore, "a", encoding="utf-8") as handle:
-            handle.write(
-                "%s# Collaborative Versioning — rebuilt segmentation cache\n%s\n"
-                % (suffix, marker)
-            )
-    except OSError:
-        return
-
-
 def _compress_block_bytes(raw: bytes) -> bytes:
     return zlib.compress(raw, ZLIB_LEVEL)
 
@@ -493,7 +460,6 @@ def write_store(
             _keep_ui_alive()
     manifest["chunks"] = chunks
     save_manifest(folder, manifest)
-    ensure_cache_gitignored(folder)
     return {
         "shape": list(shape),
         "chunks": len(chunks),

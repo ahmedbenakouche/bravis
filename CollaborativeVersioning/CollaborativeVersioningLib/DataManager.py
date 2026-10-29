@@ -624,22 +624,6 @@ class DataManager:
         labelmap = self._labelmap_from_cube_store(folder, name)
         return self._as_segmentation_node(labelmap, name)
 
-    def materialize_segmentation_cubes(self, folder: str, stem: str) -> str:
-        """Rebuild gitignored cache NIfTI from ``.cv_seg`` and return its path (fallback / debug)."""
-        from CollaborativeVersioningLib import SegmentationCubes
-
-        path = SegmentationCubes.cache_nifti_path(folder, stem)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        labelmap = self._labelmap_from_cube_store(
-            folder,
-            "%s_segmentation" % ((stem or "project").strip() or "project"),
-        )
-        try:
-            self.save_volume(labelmap, path)
-        finally:
-            slicer.mrmlScene.RemoveNode(labelmap)
-        return path
-
     @staticmethod
     def _filename_is_segmentation(lower_name: str) -> bool:
         return (
