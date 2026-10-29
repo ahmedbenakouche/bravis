@@ -912,7 +912,6 @@ class DataManager:
                 except Exception:
                     pass
             if not ok:
-                timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
                 return False, timings
             t3 = time.perf_counter()
             self._ensure_segment_id_names(segmentation_node)
@@ -925,8 +924,7 @@ class DataManager:
             logging.exception("Could not inject segmentation cubes from %s", folder)
             return False, timings
         finally:
-            # resumeRender was AFTER total_ms before → stopwatch >> feed TOTAL.
-            # Measure it: this is when slice overlays actually redraw.
+            # Include slice redraw in TOTAL (pauseRender defers it until here).
             if render_paused:
                 t_resume = time.perf_counter()
                 try:

@@ -379,17 +379,6 @@ def diff_manifest_chunks(
     }
 
 
-def count_changed_chunks(
-    before: dict[str, Any] | None,
-    after: dict[str, Any] | None,
-) -> tuple[int, int] | None:
-    """Compare two manifests: (changed cube count, total cube keys in the union)."""
-    diff = diff_manifest_chunks(before, after)
-    if diff is None:
-        return None
-    return int(diff["changed"]), int(diff["total"])
-
-
 def save_manifest(folder: str, manifest: dict[str, Any]) -> str:
     path = manifest_path(folder)
     os.makedirs(os.path.dirname(path), exist_ok=True)
