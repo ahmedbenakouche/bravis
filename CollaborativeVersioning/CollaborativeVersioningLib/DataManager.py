@@ -588,12 +588,188 @@ class DataManager:
             raise
         return labelmap
 
+    def _find_segment_id_for_label(self, segmentation_node: Any, label: int) -> str | None:
+        """Return existing segment ID for ontology label, or None if absent."""
+        segmentation = segmentation_node.GetSegmentation()
+        if segmentation is None or int(label) <= 0:
+            return None
+        want = "Segment_%d" % int(label)
+        if segmentation.GetSegment(want) is not None:
+            return want
+        by_name = getattr(segmentation, "GetSegmentIdBySegmentName", None)
+        if callable(by_name):
+            try:
+                found = str(by_name(want) or "").strip()
+                if found and segmentation.GetSegment(found) is not None:
+                    return found
+            except Exception:
+                pass
+        for index in range(int(segmentation.GetNumberOfSegments())):
+            segment_id = segmentation.GetNthSegmentID(index)
+            segment = segmentation.GetSegment(segment_id)
+            if segment is None:
+                continue
+            name = (segment.GetName() or "").strip()
+            match = _SEGMENT_ID_NAME.match(name)
+            if match and int(match.group(1)) == int(label):
+                return str(segment_id)
+            value = self._segment_label_value(segmentation_node, segment, segment_id)
+            if value == int(label):
+                return str(segment_id)
+        return None
+
+    def _prepare_updated_segment_import(
+        self,
+        labelmap: Any,
+        segmentation_node: Any,
+    ) -> tuple[Any, list[int]]:
+        """Remap ontology voxels → 1..N and build updatedSegmentIDs for Import update.
+
+        Returns ``(vtkStringArray ids, ontology_labels ordered)``.
+        """
+        import numpy as np
+        import vtk
+
+        grid = slicer.util.arrayFromVolume(labelmap)
+        labels = sorted({int(v) for v in np.unique(grid) if int(v) > 0})
+        ids = vtk.vtkStringArray()
+        if not labels:
+            return ids, []
+        max_lab = int(labels[-1])
+        lut = np.zeros(max_lab + 1, dtype=grid.dtype)
+        for index, label in enumerate(labels):
+            lut[int(label)] = index + 1
+            existing = self._find_segment_id_for_label(segmentation_node, int(label))
+            ids.InsertNextValue(existing if existing else ("Segment_%d" % int(label)))
+        slicer.util.updateVolumeFromArray(labelmap, lut[grid])
+        return ids, labels
+
+    def _restore_ontology_segment_labels(
+        self,
+        segmentation_node: Any,
+        segment_ids: Any,
+        ontology_labels: list[int],
+    ) -> None:
+        """After update-Import, voxels are 1..N and LabelValue is 1..N.
+
+        Remap the shared binary labelmap back to ontology IDs, then set each
+        segment LabelValue/name to the ontology id. Without the voxel remap,
+        LabelValue (e.g. 896) no longer matches image values (1..N) and the
+        2D display collapses to a single wrong color (often all red).
+        """
+        import numpy as np
+
+        segmentation = segmentation_node.GetSegmentation()
+        if segmentation is None:
+            return
+        count = min(int(segment_ids.GetNumberOfValues()), len(ontology_labels))
+        if count <= 0:
+            return
+
+        rep_name = slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        shared_image = None
+        for index in range(count):
+            segment = segmentation.GetSegment(str(segment_ids.GetValue(index)))
+            if segment is None:
+                continue
+            rep = segment.GetRepresentation(rep_name)
+            shared_image = slicer.vtkOrientedImageData.SafeDownCast(rep)
+            if shared_image is not None:
+                break
+
+        if shared_image is not None and shared_image.GetPointData() is not None:
+            scalars = shared_image.GetPointData().GetScalars()
+            if scalars is not None:
+                from vtk.util import numpy_support
+
+                max_ontology = max(int(v) for v in ontology_labels)
+                try:
+                    slicer.vtkOrientedImageDataResample.CastImageForValue(
+                        shared_image,
+                        max_ontology,
+                    )
+                except Exception:
+                    logging.exception("Could not cast shared labelmap for ontology ids")
+                # Slicer 5.10 has no slicer.util.arrayFromImage — use VTK numpy bridge.
+                scalars = shared_image.GetPointData().GetScalars()
+                if scalars is None:
+                    raise RuntimeError("Shared labelmap has no scalars after cast.")
+                arr = numpy_support.vtk_to_numpy(scalars)
+                flat_max = int(arr.max()) if arr.size else 0
+                lut = np.zeros(max(flat_max, count) + 1, dtype=np.uint16)
+                for index, label in enumerate(ontology_labels[:count]):
+                    if index + 1 < len(lut):
+                        lut[index + 1] = int(label)
+                idx = np.clip(arr.astype(np.int64, copy=False), 0, len(lut) - 1)
+                remapped = lut[idx].astype(arr.dtype, copy=False)
+                arr[:] = remapped
+                scalars.Modified()
+                shared_image.Modified()
+
+        for index in range(count):
+            segment_id = str(segment_ids.GetValue(index))
+            label = int(ontology_labels[index])
+            segment = segmentation.GetSegment(segment_id)
+            if segment is None:
+                continue
+            try:
+                segment.SetName("Segment_%d" % label)
+            except Exception:
+                pass
+            setter = getattr(segment, "SetLabelValue", None)
+            if callable(setter):
+                try:
+                    setter(label)
+                except Exception:
+                    pass
+        try:
+            segmentation.Modified()
+        except Exception:
+            pass
+        try:
+            segmentation_node.Modified()
+        except Exception:
+            pass
+
+    def _remove_segments_absent_from_labels(
+        self,
+        segmentation_node: Any,
+        keep_labels: set[int],
+    ) -> int:
+        """Remove segments whose ontology id is not in keep_labels. Returns remove count."""
+        segmentation = segmentation_node.GetSegmentation()
+        if segmentation is None:
+            return 0
+        to_remove: list[str] = []
+        for index in range(int(segmentation.GetNumberOfSegments())):
+            segment_id = segmentation.GetNthSegmentID(index)
+            segment = segmentation.GetSegment(segment_id)
+            if segment is None:
+                continue
+            name = (segment.GetName() or "").strip()
+            match = _SEGMENT_ID_NAME.match(name)
+            if match:
+                value = int(match.group(1))
+            else:
+                value = self._segment_label_value(segmentation_node, segment, segment_id)
+            if value <= 0 or value not in keep_labels:
+                to_remove.append(str(segment_id))
+        for segment_id in to_remove:
+            try:
+                segmentation.RemoveSegment(segment_id)
+            except Exception:
+                logging.exception("Could not remove obsolete segment %s", segment_id)
+        return len(to_remove)
+
     def inject_segmentation_from_cubes(
         self,
         segmentation_node: Any,
         folder: str,
     ) -> tuple[bool, dict[str, float]]:
         """Load ``.cv_seg`` into an existing segmentation node (RAM only).
+
+        Prefers Import + ``updatedSegmentIDs`` (update/create in place, no RemoveAll).
+        Falls back to RemoveAll + Import add if the update path fails.
 
         Returns ``(ok, timings_ms)`` with per-step durations for Switch profiling.
         """
@@ -620,9 +796,15 @@ class DataManager:
                 timings=timings,
             )
 
+            t_remap = time.perf_counter()
+            updated_ids, ontology_labels = self._prepare_updated_segment_import(
+                labelmap,
+                segmentation_node,
+            )
+            timings["RemapLabels_ms"] = (time.perf_counter() - t_remap) * 1000.0
+            keep_labels = set(ontology_labels)
+
             # Batch MRML / segment events and pause slice redraws (2D overlays too).
-            # RemoveAllSegments removes one-by-one and fires SegmentRemoved each time;
-            # without this, Subject Hierarchy + slice displays update per segment.
             try:
                 slicer.app.pauseRender()
                 render_paused = True
@@ -631,6 +813,7 @@ class DataManager:
             modify = segmentation_node.StartModify()
             was_segment_modified = True
             ok = False
+            used_update = False
             setter = getattr(segmentation, "SetSegmentModifiedEnabled", None)
             if callable(setter):
                 try:
@@ -638,18 +821,86 @@ class DataManager:
                 except Exception:
                     was_segment_modified = True
             try:
-                t1 = time.perf_counter()
-                segmentation.RemoveAllSegments()
-                timings["RemoveAllSegments_ms"] = (time.perf_counter() - t1) * 1000.0
-                t2 = time.perf_counter()
-                with _SlicerProgressPopupGuard():
-                    ok = bool(
-                        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                            labelmap,
-                            segmentation_node,
-                        )
+                if ontology_labels:
+                    t2 = time.perf_counter()
+                    with _SlicerProgressPopupGuard():
+                        try:
+                            ok = bool(
+                                slicer.vtkSlicerSegmentationsModuleLogic.ImportLabelmapToSegmentationNode(
+                                    labelmap,
+                                    segmentation_node,
+                                    updated_ids,
+                                )
+                            )
+                        except TypeError:
+                            ok = bool(
+                                slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                                    labelmap,
+                                    segmentation_node,
+                                    updated_ids,
+                                )
+                            )
+                    timings["ImportLabelmap_ms"] = (time.perf_counter() - t2) * 1000.0
+                    if ok:
+                        try:
+                            self._restore_ontology_segment_labels(
+                                segmentation_node,
+                                updated_ids,
+                                ontology_labels,
+                            )
+                            t_rm = time.perf_counter()
+                            removed = self._remove_segments_absent_from_labels(
+                                segmentation_node,
+                                keep_labels,
+                            )
+                            timings["RemoveObsolete_ms"] = (time.perf_counter() - t_rm) * 1000.0
+                            timings["RemoveObsolete_count"] = float(removed)
+                            used_update = True
+                        except Exception as restore_exc:
+                            # Keep same node: fall through to RemoveAll+Import below.
+                            ok = False
+                            used_update = False
+                            timings["_inject_error"] = "restore/obsolete: %s" % restore_exc
+                            logging.exception(
+                                "Ontology restore after update-import failed (%s)",
+                                folder,
+                            )
+                else:
+                    t1 = time.perf_counter()
+                    segmentation.RemoveAllSegments()
+                    timings["RemoveAllSegments_ms"] = (time.perf_counter() - t1) * 1000.0
+                    ok = True
+
+                if not ok:
+                    # Fallback on the SAME node (do not create a second segmentation).
+                    logging.warning(
+                        "Segment update import failed; falling back to RemoveAll+Import (%s)",
+                        folder,
                     )
-                timings["ImportLabelmap_ms"] = (time.perf_counter() - t2) * 1000.0
+                    if "_inject_error" not in timings:
+                        timings["_inject_error"] = "update ImportLabelmap returned false"
+                    try:
+                        slicer.mrmlScene.RemoveNode(labelmap)
+                    except Exception:
+                        pass
+                    labelmap = self._labelmap_from_cube_store(
+                        folder,
+                        "%s_labelmap" % (segmentation_node.GetName() or "segmentation"),
+                        timings=None,
+                    )
+                    t1 = time.perf_counter()
+                    segmentation.RemoveAllSegments()
+                    timings["RemoveAllSegments_ms"] = (time.perf_counter() - t1) * 1000.0
+                    t2 = time.perf_counter()
+                    with _SlicerProgressPopupGuard():
+                        ok = bool(
+                            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                                labelmap,
+                                segmentation_node,
+                            )
+                        )
+                    timings["ImportLabelmap_ms"] = (time.perf_counter() - t2) * 1000.0
+                    used_update = False
             finally:
                 if callable(setter):
                     try:
@@ -668,27 +919,30 @@ class DataManager:
             self._apply_kept_segment_colors(segmentation_node, kept_colors)
             self._prepare_segmentation_display(segmentation_node)
             timings["finalize_ms"] = (time.perf_counter() - t3) * 1000.0
-            timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+            timings["inject_update"] = 1.0 if used_update else 0.0
             return True, timings
         except Exception:
             logging.exception("Could not inject segmentation cubes from %s", folder)
-            timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
             return False, timings
         finally:
+            # resumeRender was AFTER total_ms before → stopwatch >> feed TOTAL.
+            # Measure it: this is when slice overlays actually redraw.
             if render_paused:
+                t_resume = time.perf_counter()
                 try:
                     slicer.app.resumeRender()
+                    slicer.app.processEvents()
                 except Exception:
                     pass
+                timings["resumeRender_ms"] = (time.perf_counter() - t_resume) * 1000.0
             if labelmap is not None:
                 try:
                     t4 = time.perf_counter()
                     slicer.mrmlScene.RemoveNode(labelmap)
                     timings["cleanup_labelmap_ms"] = (time.perf_counter() - t4) * 1000.0
-                    if "total_ms" in timings:
-                        timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
                 except Exception:
                     pass
+            timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
 
     def load_segmentation_from_cubes(
         self,
