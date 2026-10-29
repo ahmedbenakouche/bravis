@@ -1,0 +1,151 @@
+NOTES — Tentative Switch par injection des cubes changés (ROI)
+================================================================
+Date approx. : octobre 2026
+Statut       : ABANDONNÉ pour l’instant (revenu à RemoveAll + ImportLabelmap)
+Objectif de ce fichier : documenter ce qu’on a essayé pour y revenir plus tard.
+
+
+1. Problème de départ
+---------------------
+Au Switch, même si peu de cubes .cv_seg changent (ex. 9/280 ou 36/280),
+le chemin actuel reconstruit toute la grille B puis :
+  RemoveAllSegments + ImportLabelmapToSegmentationNode
+Timings typiques (beaucoup de segments) : RemoveAll ~1–5 s, Import ~1–3 s,
+total souvent ~3–10 s. Le goulot est Slicer (segments), pas la lecture des cubes.
+
+
+2. Idée retenue (solution ROI)
+------------------------------
+Garder le même nœud segmentation à l’écran.
+Pour chaque cube changé entre A (avant Switch) et B (après checkout) :
+  - peindre seulement cette zone
+  - sans RemoveAll / sans Import total
+
+API Slicer ciblée :
+  vtkSlicerSegmentationsModuleLogic.SetBinaryLabelmapToSegment(
+      masque, segmentationNode, segmentId, MODE_REPLACE [, extent]
+  )
+C’est l’outil interne du Segment Editor (peinture dans une ROI).
+
+Ne PAS utiliser pour ce flux :
+  - ImportLabelmap + updatedSegmentIDs
+    (labels forcés 1..N, ClearSegment du segment entier, pas une vraie ROI cubes)
+  - masque plein volume par label (trop lourd en haute résolution)
+
+
+3. Contrat métier convenu
+-------------------------
+- Diff manifests → liste des clés de cubes changés.
+- Lire / décompresser SEULEMENT ces cubes de B (pas toute la grille pour les masques).
+- Pour un cube changé : labels à traiter = labels présents dans le contenu A
+  de CE cube OU dans le contenu B de CE cube
+  (sinon on peint le nouveau sans effacer l’ancien dans la case).
+- Segment hors cubes changés → ne pas le toucher (≠ « supprimé »).
+- Segment vraiment vide après patches → RemoveSegment (sinon reste dans la liste).
+- Label nouveau → AddEmptySegment une fois puis peindre.
+- Fallback si géométrie/chunk différente, pas de seg à l’écran, diff impossible,
+  ou échec ROI → ancien RemoveAll + Import.
+
+
+4. Piège important : contenu A après checkout
+---------------------------------------------
+Après git checkout, le disque est B. Les blocs hash de A peuvent avoir disparu.
+Donc le contenu A des cubes changés doit venir de la segmentation EN MÉMOIRE
+(avant de la modifier), pas du store disque.
+
+
+5. Première implémentation (échouée / trop lente)
+-------------------------------------------------
+a) Snapshot A : GenerateMergedLabelmapInReferenceGeometry PAR cube
+   → ex. 9 cubes × merge de tous les segments ≈ 12 s (roi_snapshot_a).
+   Avec beaucoup de segments → hang / plantage.
+
+b) Pour chaque cube × chaque label :
+   SeparateSegmentLabelmap si couche partagée, puis
+   SetBinaryLabelmapToSegment(petit masque cube, MODE_REPLACE, extent).
+
+Problèmes :
+- SeparateSegmentLabelmap sur couches partagées (souvent le cas après Import)
+  duplique de grosses labelmaps → risque OOM / crash.
+- MODE_REPLACE *par cube* : chaque appel peut remplacer TOUT le segment
+  par le contenu de ce seul cube → efface le reste du segment hors cube.
+- Sur couches partagées, Slicer peut transformer MODE_REPLACE en
+  ClearSegment (segment entier) + MODE_MERGE_MASK → encore pire pour une ROI.
+
+
+6. Deuxième implémentation (corrigée en partie, puis abandonnée)
+----------------------------------------------------------------
+a) Snapshot A : UN SEUL GenerateMergedLabelmap sur la bbox UNION des cubes
+   changés, puis découpe numpy → cubes A.
+   → snapshot ~1.2 s au lieu de ~12 s (mieux).
+
+b) Lecture cubes B depuis le store (rapide, ~10–20 ms).
+
+c) UN SetBinary par LABEL (pas par cube) :
+   - récupérer le masque binaire actuel du segment
+   - écraser seulement les régions des cubes changés avec B
+   - SetBinaryLabelmapToSegment(masque_complet_mis_à_jour, MODE_REPLACE)
+   Ainsi on ne wipe pas le reste du segment.
+
+d) Plus de SeparateSegmentLabelmap dans ce second jet.
+
+
+7. Bug bloquant observé (Python VTK)
+------------------------------------
+roi_error: TypeError: GetExtent() takes exactly 0 arguments (1 given)
+
+Cause : code style C++ :
+  ext = [0, -1, ...]
+  current.GetExtent(ext)   # invalide en Python
+
+Correct en Python Slicer :
+  ext = current.GetExtent()  # tuple (x0,x1,y0,y1,z0,z1)
+
+Conséquence du test :
+  snapshot ROI (~1.2 s) + read B OK, puis crash au patch → fallback full import
+  → TOTAL = coût ROI raté + RemoveAll + Import ≈ PLUS LENT que l’ancien système seul.
+
+
+8. Fichiers touchés pendant la tentative (puis restaurés à la main)
+-------------------------------------------------------------------
+- CollaborativeVersioningLib/DataManager.py
+    inject_segmentation_from_cubes(..., before_manifest=...)
+    helpers ROI (_snapshot_a_changed_cubes, _replace_segment_from_changed_cubes, …)
+- CollaborativeVersioningLib/Widget.py
+    cube_before_manifest passé au Switch ; timings feed roi_*
+- CollaborativeVersioningLib/SegmentationCubes.py
+    diff_manifest_chunks["keys"], read_cube(), manifest_geometry()
+
+État au moment où ce fichier est écrit : code ROI retiré ; retour à
+RemoveAll + Import + timings profiling + feed « cubes changed » / intervals.
+
+
+9. Si on revient plus tard — checklist minimale
+-----------------------------------------------
+1. Diff → changed keys (réajouter "keys" dans diff_manifest_chunks si besoin).
+2. Avant peinture : snapshot A des cubes changés (idéalement 1× merge union,
+   ou mieux : éviter GenerateMergedLabelmap si on trouve plus léger).
+3. Lire cubes B via read_cube (à réintroduire).
+4. Un update par label avec masque = (ancien segment) patché dans les cubes B ;
+   un seul SetBinaryLabelmapToSegment par label.
+5. GetExtent() SANS argument en Python.
+6. Ne pas appeler SetBinary MODE_REPLACE une fois par cube sur le même segment.
+7. Méfiance SeparateSegmentLabelmap (mémoire) et ClearSegment implicite
+   sur labelmaps partagées.
+8. Afficher roi_error dans le feed ; ne pas compter un succès ROI tant que
+   le mode n’est pas roi_cubes sans fallback.
+9. Comparer timings UNIQUEMENT quand mode=roi_cubes aboutit (sinon le
+   total est artificiellement pire que l’ancien chemin).
+
+
+10. Références Slicer utiles
+----------------------------
+- vtkSlicerSegmentationsModuleLogic::SetBinaryLabelmapToSegment
+- vtkSlicerSegmentationsModuleLogic::ImportLabelmapToSegmentationNode
+  (+ surcharge updatedSegmentIDs : update 1..N, pas ROI cubes)
+- vtkSegmentation::SeparateSegmentLabelmap / ClearSegment / RemoveSegment
+- vtkOrientedImageDataResample::CopyImage / MergeImage (extent)
+- GenerateMergedLabelmapInReferenceGeometry (coûteux si répété)
+
+
+Fin du document.
