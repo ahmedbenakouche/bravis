@@ -2080,6 +2080,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _onAssetDataModified(self, caller=None, event=None) -> None:
         if self._collecting_coverage:
             return
+        # Switch/Open inject fires SegmentRemoved/Added per segment; skip all side work.
+        if getattr(self, "_suppress_dirty", 0):
+            return
+        if getattr(self, "_suppress_asset_ui_updates", 0):
+            return
+        if getattr(self, "_ignore_data_modified", False):
+            return
         kind = self._callerAssetKind(caller)
         if kind:
             self._markAssetDirty(kind)

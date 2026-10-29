@@ -602,6 +602,7 @@ class DataManager:
         if segmentation_node is None or not segmentation_node.IsA("vtkMRMLSegmentationNode"):
             return False, timings
         labelmap = None
+        render_paused = False
         try:
             t0 = time.perf_counter()
             kept_colors = self._segment_colors_by_label(segmentation_node)
@@ -618,18 +619,47 @@ class DataManager:
                 "%s_labelmap" % (segmentation_node.GetName() or "segmentation"),
                 timings=timings,
             )
-            t1 = time.perf_counter()
-            segmentation.RemoveAllSegments()
-            timings["RemoveAllSegments_ms"] = (time.perf_counter() - t1) * 1000.0
-            t2 = time.perf_counter()
-            with _SlicerProgressPopupGuard():
-                ok = bool(
-                    slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                        labelmap,
-                        segmentation_node,
+
+            # Batch MRML / segment events and pause slice redraws (2D overlays too).
+            # RemoveAllSegments removes one-by-one and fires SegmentRemoved each time;
+            # without this, Subject Hierarchy + slice displays update per segment.
+            try:
+                slicer.app.pauseRender()
+                render_paused = True
+            except Exception:
+                render_paused = False
+            modify = segmentation_node.StartModify()
+            was_segment_modified = True
+            ok = False
+            setter = getattr(segmentation, "SetSegmentModifiedEnabled", None)
+            if callable(setter):
+                try:
+                    was_segment_modified = bool(setter(False))
+                except Exception:
+                    was_segment_modified = True
+            try:
+                t1 = time.perf_counter()
+                segmentation.RemoveAllSegments()
+                timings["RemoveAllSegments_ms"] = (time.perf_counter() - t1) * 1000.0
+                t2 = time.perf_counter()
+                with _SlicerProgressPopupGuard():
+                    ok = bool(
+                        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                            labelmap,
+                            segmentation_node,
+                        )
                     )
-                )
-            timings["ImportLabelmap_ms"] = (time.perf_counter() - t2) * 1000.0
+                timings["ImportLabelmap_ms"] = (time.perf_counter() - t2) * 1000.0
+            finally:
+                if callable(setter):
+                    try:
+                        setter(was_segment_modified)
+                    except Exception:
+                        pass
+                try:
+                    segmentation_node.EndModify(modify)
+                except Exception:
+                    pass
             if not ok:
                 timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
                 return False, timings
@@ -645,6 +675,11 @@ class DataManager:
             timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
             return False, timings
         finally:
+            if render_paused:
+                try:
+                    slicer.app.resumeRender()
+                except Exception:
+                    pass
             if labelmap is not None:
                 try:
                     t4 = time.perf_counter()
