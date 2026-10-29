@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from enum import Enum
 from typing import Any
 
@@ -559,29 +560,50 @@ class DataManager:
         )
         return stats
 
-    def _labelmap_from_cube_store(self, folder: str, name: str) -> Any:
+    def _labelmap_from_cube_store(
+        self,
+        folder: str,
+        name: str,
+        timings: dict[str, float] | None = None,
+    ) -> Any:
         """Rebuild cube store into a temporary labelmap node (RAM only, no cache file)."""
         from CollaborativeVersioningLib import SegmentationCubes
 
+        t0 = time.perf_counter()
         grid, geometry = SegmentationCubes.read_store(folder)
+        if timings is not None:
+            timings["read_store_ms"] = (time.perf_counter() - t0) * 1000.0
         labelmap = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLLabelMapVolumeNode",
             name or "segmentation",
         )
         try:
+            t1 = time.perf_counter()
             slicer.util.updateVolumeFromArray(labelmap, grid)
             SegmentationCubes.apply_geometry(labelmap, geometry)
+            if timings is not None:
+                timings["labelmap_fill_ms"] = (time.perf_counter() - t1) * 1000.0
         except Exception:
             slicer.mrmlScene.RemoveNode(labelmap)
             raise
         return labelmap
 
-    def inject_segmentation_from_cubes(self, segmentation_node: Any, folder: str) -> bool:
-        """Load ``.cv_seg`` into an existing segmentation node without writing cache NIfTI."""
+    def inject_segmentation_from_cubes(
+        self,
+        segmentation_node: Any,
+        folder: str,
+    ) -> tuple[bool, dict[str, float]]:
+        """Load ``.cv_seg`` into an existing segmentation node (RAM only).
+
+        Returns ``(ok, timings_ms)`` with per-step durations for Switch profiling.
+        """
+        timings: dict[str, float] = {}
+        total_t0 = time.perf_counter()
         if segmentation_node is None or not segmentation_node.IsA("vtkMRMLSegmentationNode"):
-            return False
+            return False, timings
         labelmap = None
         try:
+            t0 = time.perf_counter()
             kept_colors = self._segment_colors_by_label(segmentation_node)
             try:
                 segmentation_node.CreateDefaultDisplayNodes()
@@ -589,12 +611,17 @@ class DataManager:
                 pass
             segmentation = segmentation_node.GetSegmentation()
             if segmentation is None:
-                return False
+                return False, timings
+            timings["prepare_ms"] = (time.perf_counter() - t0) * 1000.0
             labelmap = self._labelmap_from_cube_store(
                 folder,
                 "%s_labelmap" % (segmentation_node.GetName() or "segmentation"),
+                timings=timings,
             )
+            t1 = time.perf_counter()
             segmentation.RemoveAllSegments()
+            timings["RemoveAllSegments_ms"] = (time.perf_counter() - t1) * 1000.0
+            t2 = time.perf_counter()
             with _SlicerProgressPopupGuard():
                 ok = bool(
                     slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
@@ -602,27 +629,47 @@ class DataManager:
                         segmentation_node,
                     )
                 )
+            timings["ImportLabelmap_ms"] = (time.perf_counter() - t2) * 1000.0
             if not ok:
-                return False
+                timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+                return False, timings
+            t3 = time.perf_counter()
             self._ensure_segment_id_names(segmentation_node)
             self._apply_kept_segment_colors(segmentation_node, kept_colors)
             self._prepare_segmentation_display(segmentation_node)
-            return True
+            timings["finalize_ms"] = (time.perf_counter() - t3) * 1000.0
+            timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+            return True, timings
         except Exception:
             logging.exception("Could not inject segmentation cubes from %s", folder)
-            return False
+            timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+            return False, timings
         finally:
             if labelmap is not None:
                 try:
+                    t4 = time.perf_counter()
                     slicer.mrmlScene.RemoveNode(labelmap)
+                    timings["cleanup_labelmap_ms"] = (time.perf_counter() - t4) * 1000.0
+                    if "total_ms" in timings:
+                        timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
                 except Exception:
                     pass
 
-    def load_segmentation_from_cubes(self, folder: str, stem: str = "project") -> Any:
+    def load_segmentation_from_cubes(
+        self,
+        folder: str,
+        stem: str = "project",
+    ) -> tuple[Any, dict[str, float]]:
         """Create a segmentation node from ``.cv_seg`` in memory (no cache NIfTI)."""
+        timings: dict[str, float] = {}
+        total_t0 = time.perf_counter()
         name = "%s_segmentation" % ((stem or "project").strip() or "project")
-        labelmap = self._labelmap_from_cube_store(folder, name)
-        return self._as_segmentation_node(labelmap, name)
+        labelmap = self._labelmap_from_cube_store(folder, name, timings=timings)
+        t0 = time.perf_counter()
+        node = self._as_segmentation_node(labelmap, name)
+        timings["ImportLabelmap_ms"] = (time.perf_counter() - t0) * 1000.0
+        timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+        return node, timings
 
     @staticmethod
     def _filename_is_segmentation(lower_name: str) -> bool:

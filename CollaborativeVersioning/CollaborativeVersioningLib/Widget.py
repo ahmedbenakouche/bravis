@@ -8983,23 +8983,29 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if use_cubes:
                     # Cubes → labelmap RAM → segments (no cache NIfTI).
                     stem = self._savedProjectFileStem(folder)
-                    if can_inject and manager.inject_segmentation_from_cubes(
-                        current_seg,
-                        folder,
-                    ):
-                        segmentation_node = current_seg
-                    else:
-                        if can_inject:
+                    cube_timings: dict = {}
+                    if can_inject:
+                        ok, cube_timings = manager.inject_segmentation_from_cubes(
+                            current_seg,
+                            folder,
+                        )
+                        if ok:
+                            segmentation_node = current_seg
+                        else:
                             names_to_replace = {
                                 manager._basename_without_extension(
                                     "%s_segmentation.nii.gz" % stem
                                 )
                             }
                             manager.remove_scene_nodes_by_names(names_to_replace)
-                        segmentation_node = manager.load_segmentation_from_cubes(
-                            folder,
-                            stem,
+                            segmentation_node, cube_timings = (
+                                manager.load_segmentation_from_cubes(folder, stem)
+                            )
+                    else:
+                        segmentation_node, cube_timings = (
+                            manager.load_segmentation_from_cubes(folder, stem)
                         )
+                    self._appendCubeLoadTimings(cube_timings)
                 else:
                     segmentation_path = legacy_segmentation_path
                     if can_inject and manager.inject_segmentation_from_file(
@@ -9412,6 +9418,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 feed.setHtml("")
             except (RuntimeError, ValueError, TypeError):
                 return
+
+    def _appendCubeLoadTimings(self, timings: dict | None) -> None:
+        """Temporary Switch profiling: show cube→segment step durations in the feed."""
+        if not timings:
+            return
+        order = (
+            ("read_store_ms", "read_store (cubes→grid)"),
+            ("labelmap_fill_ms", "labelmap_fill (array→node)"),
+            ("prepare_ms", "prepare (colors/display)"),
+            ("RemoveAllSegments_ms", "RemoveAllSegments"),
+            ("ImportLabelmap_ms", "ImportLabelmapToSegmentationNode"),
+            ("finalize_ms", "finalize (names/colors)"),
+            ("cleanup_labelmap_ms", "cleanup temp labelmap"),
+            ("total_ms", "TOTAL loading segmentation"),
+        )
+        self._appendFeed("Seg load timing (cube path):")
+        for key, label in order:
+            if key not in timings:
+                continue
+            self._appendFeed("  %s: %.1f ms" % (label, float(timings[key])))
 
     def _appendFeed(self, message: str, error: bool = False, *, force: bool = False) -> None:
         # Unify technical offline/DNS errors into one readable feed line.
