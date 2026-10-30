@@ -1551,6 +1551,41 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.exec_()
         return box.clickedButton() == share_btn
 
+    def _askMergeChoice(self, source: str, target: str) -> str | None:
+        """Merge dialog: Merge now / Compare… / Cancel. Returns 'merge', 'compare', or None."""
+        src = str(source or "").strip() or "?"
+        dst = str(target or "").strip() or "?"
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Merge")
+        box.setIcon(qt.QMessageBox.Question)
+        box.setText("Merge branch %s onto %s?" % (src, dst))
+        box.setInformativeText(
+            "Merge now publishes the branch tip onto %s (same as today).\n"
+            "Compare lets you review both tips side by side first "
+            "(coming next)."
+            % dst
+        )
+        merge_btn = box.addButton("Merge now", qt.QMessageBox.AcceptRole)
+        compare_btn = box.addButton("Compare…", qt.QMessageBox.ActionRole)
+        box.addButton("Cancel", qt.QMessageBox.RejectRole)
+        box.setDefaultButton(merge_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == merge_btn:
+            return "merge"
+        if clicked == compare_btn:
+            return "compare"
+        return None
+
+    def _onMergeComparePlaceholder(self, source: str, target: str) -> None:
+        """Compare path stub until side-by-side review is implemented."""
+        src = str(source or "").strip() or "?"
+        dst = str(target or "").strip() or "?"
+        self._appendFeed(
+            "Compare %s vs %s — coming soon (visual review before merge)."
+            % (src, dst)
+        )
+
     def _githubLogin(self) -> str:
         session = getattr(self, "_github_session", None) or {}
         login = str(session.get("login") or "").strip()
@@ -7518,12 +7553,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 error=True,
             )
             return
-        confirmed = slicer.util.confirmYesNoDisplay(
-            "Merge branch %s onto %s and publish it to the shared project?"
-            % (slug, parent),
-            windowTitle="Merge",
-        )
-        if not confirmed:
+        choice = self._askMergeChoice(slug, parent)
+        if choice == "compare":
+            self._onMergeComparePlaceholder(slug, parent)
+            return
+        if choice != "merge":
             return
         local_path = str(getattr(self, "_local_project_path", None) or "").strip()
         if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
@@ -7594,11 +7628,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
             return
         task = self._activeTaskForBranchSlug(slug)
-        confirmed = slicer.util.confirmYesNoDisplay(
-            "Merge branch %s onto main and publish it to the shared project?" % slug,
-            windowTitle="Merge",
-        )
-        if not confirmed:
+        choice = self._askMergeChoice(slug, "main")
+        if choice == "compare":
+            self._onMergeComparePlaceholder(slug, "main")
+            return
+        if choice != "merge":
             return
         # DIY Merge: same gate as Share — refuse when shared is ahead / tips diverged.
         if task is None:
