@@ -204,6 +204,7 @@ from CollaborativeVersioningLib.Dialogs import (
 )
 from CollaborativeVersioningLib.DataManager import DataManager
 from CollaborativeVersioningLib.Logic import CollaborativeVersioningLogic
+from CollaborativeVersioningLib import MergeCompare
 
 _STYLE_EXPORTS = (
     "ACCENT_ICE",
@@ -1561,8 +1562,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.setText("Merge branch %s onto %s?" % (src, dst))
         box.setInformativeText(
             "Merge now publishes the branch tip onto %s (same as today).\n"
-            "Compare lets you review both tips side by side first "
-            "(coming next)."
+            "Compare opens a side-by-side review of both tips (no merge yet)."
             % dst
         )
         merge_btn = box.addButton("Merge now", qt.QMessageBox.AcceptRole)
@@ -1578,13 +1578,265 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return None
 
     def _onMergeComparePlaceholder(self, source: str, target: str) -> None:
-        """Compare path stub until side-by-side review is implemented."""
-        src = str(source or "").strip() or "?"
-        dst = str(target or "").strip() or "?"
-        self._appendFeed(
-            "Compare %s vs %s — coming soon (visual review before merge)."
-            % (src, dst)
+        """Merge dialog Compare… → side-by-side tips (no fusion yet)."""
+        self._startMergeCompare(source_lane=source, target_lane=target)
+
+    def _shaAndLaneForVersion(self, version_id: str) -> tuple[str, str]:
+        vid = str(version_id or "").strip()
+        if not vid:
+            return "", "main"
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        sha = str((bundle.get("sha_by_id") or {}).get(vid) or "").strip()
+        lane = "main"
+        for spec in bundle.get("version_specs") or []:
+            if str((spec or {}).get("id") or "") == vid:
+                lane = str((spec or {}).get("branch") or "main") or "main"
+                break
+        return sha, lane
+
+    def _compareNodeStem(self, version_id: str) -> str:
+        raw = str(version_id or "version").strip() or "version"
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw)
+        return "CVCompare_%s" % safe
+
+    def _removeCompareSegmentationNodes(self) -> None:
+        scene = slicer.mrmlScene
+        for index in range(scene.GetNumberOfNodesByClass("vtkMRMLSegmentationNode") - 1, -1, -1):
+            node = scene.GetNthNodeByClass(index, "vtkMRMLSegmentationNode")
+            if node is None:
+                continue
+            name = str(node.GetName() or "")
+            if name.startswith("CVCompare_"):
+                scene.RemoveNode(node)
+
+    def _loadCompareSegmentationAtVersion(self, version_id: str):
+        """Checkout tip files briefly and build a new CVCompare_* segmentation node."""
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        sha, lane = self._shaAndLaneForVersion(version_id)
+        if not local_path or not sha:
+            raise RuntimeError("Could not resolve %s." % self._versionDisplayTag(version_id))
+        checkout_local_version(local_path, sha, lane)
+        manager = DataManager()
+        files = manager.discover_project_files(local_path)
+        stem = self._compareNodeStem(version_id)
+        # Drop a leftover node with the same compare name before recreating.
+        manager.remove_scene_nodes_by_names(
+            {
+                stem,
+                "%s_segmentation" % stem,
+                manager._basename_without_extension("%s_segmentation.nii.gz" % stem),
+            }
         )
+        if files.get("segmentation_store"):
+            node, _timings = manager.load_segmentation_from_cubes(local_path, stem=stem)
+            return node
+        seg_path = files.get("segmentation")
+        if seg_path:
+            node = manager.load_segmentation(seg_path, isolate=False)
+            if node is not None:
+                node.SetName("%s_segmentation" % stem)
+            return node
+        raise RuntimeError(
+            "No segmentation at %s." % self._versionDisplayTag(version_id)
+        )
+
+    def _startMergeCompare(self, source_lane: str, target_lane: str) -> None:
+        """Load target+source tips into temp nodes, show 2-row linked compare layout."""
+        if getattr(self, "_merge_compare_session", None):
+            self._appendFeed("Compare is already open — quit it first.", error=True)
+            return
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
+            self._appendFeed("Open the project first.", error=True)
+            return
+        if not self._projectDataIsLoaded():
+            self._appendFeed("Open the project first.", error=True)
+            return
+        source_lane = normalize_lane_path(source_lane) or str(source_lane or "").strip()
+        target_lane = normalize_lane_path(target_lane) or str(target_lane or "").strip() or "main"
+        if self._isMainHistoryLane(target_lane):
+            target_lane = "main"
+        source_vid = self._tipVersionIdForLane(source_lane)
+        target_vid = self._tipVersionIdForLane(target_lane)
+        if not source_vid or not target_vid:
+            self._appendFeed(
+                "Could not find tips to compare (%s vs %s)."
+                % (source_lane or "?", target_lane or "?"),
+                error=True,
+            )
+            return
+        source_label = self._versionDisplayTag(source_vid)
+        target_label = self._versionDisplayTag(target_vid)
+        restore_vid = str(getattr(self, "_currentVersionId", None) or "").strip()
+        restore_sha, restore_lane = self._shaAndLaneForVersion(restore_vid)
+        if not restore_sha:
+            # Fall back to whatever HEAD is after compare loads.
+            restore_sha = ""
+            restore_lane = restore_lane or "main"
+        volume_node = self._selectorCurrentNode("volumeSelector")
+        work_seg = self._selectorCurrentNode("segmentationSelector")
+        target_node = None
+        source_node = None
+        self._openProgress("Compare", "Loading %s…" % target_label)
+        try:
+            self._updateProgress("Loading %s…" % target_label)
+            target_node = self._loadCompareSegmentationAtVersion(target_vid)
+            self._updateProgress("Loading %s…" % source_label)
+            source_node = self._loadCompareSegmentationAtVersion(source_vid)
+            # Work seg stayed in the scene — only put Git/files back on the user's tip.
+            self._updateProgress("Restoring your version…")
+            if restore_sha:
+                checkout_local_version(local_path, restore_sha, restore_lane)
+            if target_node is None or source_node is None:
+                raise RuntimeError("Could not load both segmentations for compare.")
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            # Best-effort restore worktree + cleanup of partial compare nodes.
+            try:
+                if restore_sha:
+                    checkout_local_version(local_path, restore_sha, restore_lane)
+            except Exception:
+                pass
+            self._removeCompareSegmentationNodes()
+            self._showGithubError(error, box=True)
+            return
+        self._closeProgress()
+
+        # Hide the working segmentation while compare views are active.
+        if work_seg is not None:
+            try:
+                display = work_seg.GetDisplayNode()
+                if display is not None:
+                    display.SetVisibility(False)
+            except Exception:
+                pass
+
+        previous_layout = MergeCompare.apply_compare_layout(target_label, source_label)
+        MergeCompare.assign_volume_and_segmentations(
+            volume_node, target_node, source_node
+        )
+        names = MergeCompare.union_segment_names(target_node, source_node)
+        panel = MergeCompare.MergeComparePanel(
+            slicer.util.mainWindow(),
+            target_label,
+            source_label,
+            on_prev=self._mergeComparePrev,
+            on_next=self._mergeCompareNext,
+        )
+        panel.finished.connect(lambda *_args: self._exitMergeCompare())
+        self._merge_compare_session = {
+            "target_node_id": target_node.GetID(),
+            "source_node_id": source_node.GetID(),
+            "work_seg_id": work_seg.GetID() if work_seg is not None else "",
+            "volume_id": volume_node.GetID() if volume_node is not None else "",
+            "target_version": target_vid,
+            "source_version": source_vid,
+            "segment_names": names,
+            "segment_index": 0,
+            "previous_layout": previous_layout,
+            "panel": panel,
+        }
+        if names:
+            self._mergeCompareFocusIndex(0)
+        else:
+            MergeCompare.show_all_segments(target_node)
+            MergeCompare.show_all_segments(source_node)
+            panel.set_segment_label("", 0, 0)
+        panel.show()
+        self._appendFeed("Compare: %s (top) vs %s (bottom)." % (target_label, source_label))
+
+    def _mergeCompareNodes(self):
+        session = getattr(self, "_merge_compare_session", None) or {}
+        target = slicer.mrmlScene.GetNodeByID(session.get("target_node_id") or "")
+        source = slicer.mrmlScene.GetNodeByID(session.get("source_node_id") or "")
+        return target, source
+
+    def _mergeCompareFocusIndex(self, index: int) -> None:
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        names = list(session.get("segment_names") or [])
+        if not names:
+            return
+        index = max(0, min(int(index), len(names) - 1))
+        session["segment_index"] = index
+        name = names[index]
+        target, source = self._mergeCompareNodes()
+        MergeCompare.focus_segment_name(target, name)
+        MergeCompare.focus_segment_name(source, name)
+        panel = session.get("panel")
+        if panel is not None:
+            try:
+                panel.set_segment_label(name, index, len(names))
+            except Exception:
+                pass
+
+    def _mergeComparePrev(self) -> None:
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        names = list(session.get("segment_names") or [])
+        if not names:
+            return
+        index = int(session.get("segment_index") or 0) - 1
+        if index < 0:
+            index = len(names) - 1
+        self._mergeCompareFocusIndex(index)
+
+    def _mergeCompareNext(self) -> None:
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        names = list(session.get("segment_names") or [])
+        if not names:
+            return
+        index = int(session.get("segment_index") or 0) + 1
+        if index >= len(names):
+            index = 0
+        self._mergeCompareFocusIndex(index)
+
+    def _exitMergeCompare(self) -> None:
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        # Prevent re-entry from panel.finished while we tear down.
+        self._merge_compare_session = None
+        panel = session.get("panel")
+        if panel is not None:
+            try:
+                panel.finished.disconnect()
+            except Exception:
+                pass
+            try:
+                panel.hide()
+                panel.deleteLater()
+            except Exception:
+                pass
+        MergeCompare.restore_layout(session.get("previous_layout"))
+        MergeCompare.set_linked_2d(False)
+        self._removeCompareSegmentationNodes()
+        work_seg = slicer.mrmlScene.GetNodeByID(session.get("work_seg_id") or "")
+        volume = slicer.mrmlScene.GetNodeByID(session.get("volume_id") or "")
+        if work_seg is None:
+            work_seg = self._selectorCurrentNode("segmentationSelector")
+        if volume is None:
+            volume = self._selectorCurrentNode("volumeSelector")
+        if work_seg is not None:
+            try:
+                display = work_seg.GetDisplayNode()
+                if display is not None:
+                    display.SetVisibility(True)
+                    try:
+                        display.RemoveAllViewNodeIDs()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            DataManager().present_in_slice_views(volume, work_seg)
+        except Exception:
+            logging.exception("Could not restore slice views after Compare")
+        self._appendFeed("Quit Compare.")
 
     def _githubLogin(self) -> str:
         session = getattr(self, "_github_session", None) or {}
