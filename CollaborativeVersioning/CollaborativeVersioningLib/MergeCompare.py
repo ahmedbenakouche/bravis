@@ -7,9 +7,15 @@ import qt
 import slicer
 
 from CollaborativeVersioningLib.UiStyles import (
-    BTN_SECONDARY,
-    BTN_SAVE_VERSION,
+    ACCENT_ICE,
+    ACCENT_ICE_HOVER,
+    ACCENT_INDIGO,
+    ACCENT_INDIGO_HOVER,
+    ACCENT_MINT,
+    ACCENT_RED,
+    BTN_DELETE,
     TEXT_MUTED,
+    TEXT_ON_ICE,
 )
 
 # Layout: both 3D views on top; each version's Axial|Sagittal|Coronal below.
@@ -384,24 +390,51 @@ def segment_names(segmentation_node) -> list[str]:
 
 
 def union_segment_names(target_node, source_node) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for name in segment_names(target_node) + segment_names(source_node):
-        key = name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        ordered.append(name)
+    return [
+        row["name"]
+        for row in segment_presence_rows(target_node, source_node, "", "")
+    ]
 
-    def sort_key(value: str):
-        text = str(value or "").strip()
-        try:
-            return (0, int(text))
-        except ValueError:
-            return (1, text.lower())
 
-    ordered.sort(key=sort_key)
-    return ordered
+def segment_presence_rows(
+    target_node,
+    source_node,
+    target_label: str,
+    source_label: str,
+) -> list[dict]:
+    """Union of segment names with presence status for the Compare list."""
+    target_set = {n.lower(): n for n in segment_names(target_node)}
+    source_set = {n.lower(): n for n in segment_names(source_node)}
+
+    def _sort_key(key: str):
+        name = str(target_set.get(key) or source_set.get(key) or key).strip()
+        if name.isdigit():
+            return (0, int(name))
+        return (1, name.lower())
+
+    keys = sorted(set(target_set) | set(source_set), key=_sort_key)
+    top = str(target_label or "target").strip() or "target"
+    bottom = str(source_label or "source").strip() or "source"
+    rows: list[dict] = []
+    for key in keys:
+        in_target = key in target_set
+        in_source = key in source_set
+        name = target_set.get(key) or source_set.get(key) or key
+        if in_target and in_source:
+            status = "both"
+        elif in_target:
+            status = "%s only" % top
+        else:
+            status = "%s only" % bottom
+        rows.append(
+            {
+                "name": name,
+                "status": status,
+                "in_target": in_target,
+                "in_source": in_source,
+            }
+        )
+    return rows
 
 
 def _find_segment_id_by_name(segmentation_node, name: str) -> str:
@@ -491,37 +524,114 @@ def show_all_segments(segmentation_node) -> None:
     display.SetAllSegmentsVisibility(True)
 
 
+def _nav_button_style(color: str, hover: str) -> str:
+    on_ice = TEXT_ON_ICE or "#0f172a"
+    return (
+        "QPushButton {"
+        "  background-color: palette(button);"
+        "  color: %s;"
+        "  border: 1px solid %s;"
+        "  font-weight: 700;"
+        "  border-radius: 4px;"
+        "  padding: 8px;"
+        "}"
+        "QPushButton:hover {"
+        "  background-color: %s;"
+        "  color: %s;"
+        "}"
+        % (color, color, hover, on_ice)
+    )
+
+
 class MergeComparePanel(qt.QWidget):
-    """Embedded left-panel controls: Prev/Next, Show 3D, Quit Compare."""
+    """Embedded left-panel: version names, segment list + status, Prev/Next, Quit."""
 
     def __init__(self, parent=None) -> None:
         qt.QWidget.__init__(self, parent)
+        muted = TEXT_MUTED or "#888888"
+        accent = ACCENT_ICE or "#5b9fd4"
+        ice = ACCENT_ICE or "#5b9fd4"
+        ice_hover = ACCENT_ICE_HOVER or ice
+        indigo = ACCENT_INDIGO or "#818cf8"
+        indigo_hover = ACCENT_INDIGO_HOVER or indigo
+        mint = ACCENT_MINT or "#6ee7b7"
+        red = ACCENT_RED or "#f87171"
+        self._rows: list[dict] = []
+        self._suppress_list = False
+
         layout = qt.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
-        self.headerLabel = qt.QLabel("Compare")
-        self.headerLabel.setTextFormat(qt.Qt.RichText)
-        self.headerLabel.setWordWrap(True)
-        self.headerLabel.setStyleSheet("color: %s;" % (TEXT_MUTED or "#888888"))
-        layout.addWidget(self.headerLabel)
+        versions = qt.QFrame()
+        versions.setObjectName("cvCompareVersions")
+        versions.setStyleSheet(
+            "#cvCompareVersions {"
+            "  background-color: palette(button);"
+            "  border: 1px solid palette(mid);"
+            "  border-left: 3px solid %s;"
+            "  border-radius: 6px;"
+            "}" % accent
+        )
+        versions_layout = qt.QVBoxLayout(versions)
+        versions_layout.setContentsMargins(10, 8, 10, 8)
+        versions_layout.setSpacing(6)
+        self.upperVersionLabel = qt.QLabel("—")
+        self.lowerVersionLabel = qt.QLabel("—")
+        for label in (self.upperVersionLabel, self.lowerVersionLabel):
+            label.setTextFormat(qt.Qt.RichText)
+            label.setWordWrap(True)
+            label.setStyleSheet(
+                "color: palette(window-text); font-size: 12px; font-weight: 600;"
+            )
+            versions_layout.addWidget(label)
+        layout.addWidget(versions)
 
-        hint = qt.QLabel("Finish Compare before saving or switching versions.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: %s; font-size: 10px;" % (TEXT_MUTED or "#888888"))
-        layout.addWidget(hint)
+        header = qt.QHBoxLayout()
+        seg_title = qt.QLabel("SEGMENTS")
+        seg_title.setStyleSheet(
+            "color: %s; font-size: 10px; font-weight: 600; letter-spacing: 1px;" % accent
+        )
+        header.addWidget(seg_title, 1)
+        self.segmentCountLabel = qt.QLabel("")
+        self.segmentCountLabel.setStyleSheet("color: %s; font-size: 10px;" % muted)
+        header.addWidget(self.segmentCountLabel, 0)
+        layout.addLayout(header)
 
-        row = qt.QHBoxLayout()
-        self.segmentLabel = qt.QLabel("Segment: —")
-        self.segmentLabel.setStyleSheet("color: palette(window-text);")
-        row.addWidget(self.segmentLabel, 1)
+        self.segmentList = qt.QListWidget()
+        self.segmentList.setMinimumHeight(140)
+        self.segmentList.setMaximumHeight(220)
+        self.segmentList.setStyleSheet(
+            "QListWidget {"
+            "  background-color: palette(base);"
+            "  border: 1px solid palette(mid);"
+            "  border-radius: 4px;"
+            "  outline: none;"
+            "}"
+            "QListWidget::item { padding: 6px 8px; }"
+            "QListWidget::item:selected {"
+            "  background-color: %s;"
+            "  color: %s;"
+            "}" % (ice, TEXT_ON_ICE or "#0f172a")
+        )
+        layout.addWidget(self.segmentList)
+
+        nav = qt.QHBoxLayout()
+        nav.setSpacing(6)
         self.prevButton = qt.QPushButton("◀ Prev")
         self.nextButton = qt.QPushButton("Next ▶")
-        self.prevButton.setStyleSheet(BTN_SECONDARY)
-        self.nextButton.setStyleSheet(BTN_SECONDARY)
-        row.addWidget(self.prevButton)
-        row.addWidget(self.nextButton)
-        layout.addLayout(row)
+        self.prevButton.setStyleSheet(_nav_button_style(ice, ice_hover))
+        self.nextButton.setStyleSheet(_nav_button_style(indigo, indigo_hover))
+        for btn in (self.prevButton, self.nextButton):
+            btn.setMinimumHeight(30)
+            btn.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+            nav.addWidget(btn)
+        layout.addLayout(nav)
+
+        self.statusLabel = qt.QLabel("")
+        self.statusLabel.setWordWrap(True)
+        self.statusLabel.setStyleSheet("color: %s; font-size: 11px;" % muted)
+        layout.addWidget(self.statusLabel)
 
         self.show3dCheck = qt.QCheckBox("Show 3D")
         self.show3dCheck.setChecked(False)
@@ -531,27 +641,86 @@ class MergeComparePanel(qt.QWidget):
         )
         layout.addWidget(self.show3dCheck)
 
-        self.quitButton = qt.QPushButton("Quit Compare")
-        self.quitButton.setStyleSheet(BTN_SAVE_VERSION)
+        self.quitButton = qt.QPushButton("Quit")
+        self.quitButton.setToolTip("Leave Compare and restore the normal layout")
+        self.quitButton.setStyleSheet(BTN_DELETE)
+        self.quitButton.setMinimumHeight(32)
         layout.addWidget(self.quitButton)
 
+        # Keep color refs used only for status text styling helpers.
+        self._status_colors = {
+            "both": mint,
+            "only": red,
+            "muted": muted,
+        }
+
     def set_version_labels(self, target_label: str, source_label: str) -> None:
-        self.headerLabel.setText(
-            "Target: <b>%s</b> (left 3D, upper 2D)<br>"
-            "Source: <b>%s</b> (right 3D, lower 2D)"
-            % (
-                html.escape(str(target_label or "")),
-                html.escape(str(source_label or "")),
-            )
+        muted = self._status_colors["muted"]
+        self.upperVersionLabel.setText(
+            "%s<br><span style='color:%s;font-size:10px;font-weight:500;'>"
+            "left 3D · upper 2D</span>"
+            % (html.escape(str(target_label or "—")), muted)
+        )
+        self.lowerVersionLabel.setText(
+            "%s<br><span style='color:%s;font-size:10px;font-weight:500;'>"
+            "right 3D · lower 2D</span>"
+            % (html.escape(str(source_label or "—")), muted)
         )
 
-    def set_segment_label(self, name: str, index: int, total: int) -> None:
+    def set_segments(self, rows: list[dict]) -> None:
+        self._rows = list(rows or [])
+        self._suppress_list = True
+        try:
+            self.segmentList.clear()
+            for row in self._rows:
+                name = str(row.get("name") or "")
+                status = str(row.get("status") or "")
+                item = qt.QListWidgetItem("%s    %s" % (name, status))
+                item.setData(qt.Qt.UserRole, name)
+                # Soft emphasis when not in both versions.
+                if status != "both":
+                    item.setForeground(qt.QColor(self._status_colors["only"]))
+                else:
+                    item.setForeground(qt.QColor(self._status_colors["both"]))
+                self.segmentList.addItem(item)
+            total = len(self._rows)
+            self.segmentCountLabel.setText("" if total <= 0 else "%d" % total)
+            if total <= 0:
+                self.statusLabel.setText("No segments to compare.")
+            else:
+                self.statusLabel.setText("")
+        finally:
+            self._suppress_list = False
+
+    def set_current_index(self, index: int) -> None:
+        total = len(self._rows)
         if total <= 0:
-            self.segmentLabel.setText("Segment: (none)")
+            self.statusLabel.setText("No segments to compare.")
             return
-        self.segmentLabel.setText(
-            "Segment: %s  (%d / %d)" % (name or "—", index + 1, total)
-        )
+        index = max(0, min(int(index), total - 1))
+        self._suppress_list = True
+        try:
+            self.segmentList.setCurrentRow(index)
+            item = self.segmentList.item(index)
+            if item is not None:
+                self.segmentList.scrollToItem(item)
+        finally:
+            self._suppress_list = False
+        row = self._rows[index]
+        status = str(row.get("status") or "")
+        name = str(row.get("name") or "")
+        if status == "both":
+            self.statusLabel.setText("Present in both · %d / %d" % (index + 1, total))
+            self.statusLabel.setStyleSheet(
+                "color: %s; font-size: 11px;" % self._status_colors["both"]
+            )
+        else:
+            self.statusLabel.setText(
+                "%s · %s · %d / %d" % (name, status, index + 1, total)
+            )
+            self.statusLabel.setStyleSheet(
+                "color: %s; font-size: 11px;" % self._status_colors["only"]
+            )
 
     def reset_controls(self) -> None:
         self.show3dCheck.blockSignals(True)
@@ -559,4 +728,13 @@ class MergeComparePanel(qt.QWidget):
             self.show3dCheck.setChecked(False)
         finally:
             self.show3dCheck.blockSignals(False)
-        self.set_segment_label("", 0, 0)
+        self._rows = []
+        self._suppress_list = True
+        try:
+            self.segmentList.clear()
+        finally:
+            self._suppress_list = False
+        self.segmentCountLabel.setText("")
+        self.statusLabel.setText("")
+        self.upperVersionLabel.setText("—")
+        self.lowerVersionLabel.setText("—")

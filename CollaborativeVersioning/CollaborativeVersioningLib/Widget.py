@@ -405,6 +405,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         connexionButton = ctk.ctkCollapsibleButton()
         connexionButton.text = "Connection"
         connexionButton.collapsed = False
+        self.connexionButton = connexionButton
         self.layout.addWidget(connexionButton)
         connexionLayout = qt.QVBoxLayout(connexionButton)
         connexionLayout.setSpacing(8)
@@ -589,7 +590,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
         # Compare mode replaces Active project in the left panel (hidden until Compare).
         self.compareButton = ctk.ctkCollapsibleButton()
-        self.compareButton.text = "Merge Compare"
+        self.compareButton.text = "Compare"
         self.compareButton.collapsed = False
         self.compareButton.setVisible(False)
         self.layout.addWidget(self.compareButton)
@@ -601,6 +602,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.comparePanel.nextButton.clicked.connect(self._mergeCompareNext)
         self.comparePanel.show3dCheck.toggled.connect(self._mergeCompareSetShow3d)
         self.comparePanel.quitButton.clicked.connect(self._exitMergeCompare)
+        self.comparePanel.segmentList.currentRowChanged.connect(
+            self._mergeCompareListRowChanged
+        )
         compareLayout.addWidget(self.comparePanel)
 
         self._buildMessagesSection()
@@ -1726,17 +1730,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if target_node is None or source_node is None:
                 raise RuntimeError("Could not load both segmentations for compare.")
 
-            names = MergeCompare.union_segment_names(target_node, source_node)
+            rows = MergeCompare.segment_presence_rows(
+                target_node, source_node, target_label, source_label
+            )
+            names = [str(row.get("name") or "") for row in rows]
             panel = getattr(self, "comparePanel", None)
             if panel is not None:
                 panel.reset_controls()
                 panel.set_version_labels(target_label, source_label)
+                panel.set_segments(rows)
             self._merge_compare_session = {
                 "target_node_id": target_node.GetID(),
                 "source_node_id": source_node.GetID(),
                 "work_seg_id": work_seg.GetID() if work_seg is not None else "",
                 "volume_id": volume_node.GetID() if volume_node is not None else "",
                 "segment_names": names,
+                "segment_rows": rows,
                 "segment_index": 0,
                 "show_3d": False,
                 "previous_layout": previous_layout,
@@ -1750,8 +1759,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._mergeCompareFocusIndex(0)
             else:
                 MergeCompare.assign_volume_only(volume_node)
-                if panel is not None:
-                    panel.set_segment_label("", 0, 0)
             self._setCompareModeUi(True)
             compare_ok = True
         except Exception as error:
@@ -1795,19 +1802,43 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return True
 
     def _setCompareModeUi(self, active: bool) -> None:
-        """Left: hide Active project / show Compare. Right: keep only Activity feed."""
+        """Left: only Merge Compare. Right: only Activity feed."""
         active = bool(active)
-        project = getattr(self, "projectButton", None)
         compare = getattr(self, "compareButton", None)
-        if _qt_widget_is_valid(project):
-            project.setVisible(not active)
-        if _qt_widget_is_valid(compare):
-            compare.setVisible(active)
-            if active:
+        left_normal = (
+            getattr(self, "connexionButton", None),
+            getattr(self, "projectButton", None),
+            getattr(self, "messagesTaskButton", None),
+            getattr(self, "messagesButton", None),
+            getattr(self, "messagesBody", None),
+        )
+        if active:
+            for widget in left_normal:
+                if _qt_widget_is_valid(widget):
+                    widget.setVisible(False)
+            messages_btn = getattr(self, "messagesButton", None)
+            if _qt_widget_is_valid(messages_btn):
+                try:
+                    messages_btn.blockSignals(True)
+                    messages_btn.setChecked(False)
+                    messages_btn.blockSignals(False)
+                except Exception:
+                    pass
+            if _qt_widget_is_valid(compare):
+                compare.setVisible(True)
                 try:
                     compare.collapsed = False
                 except Exception:
                     pass
+        else:
+            if _qt_widget_is_valid(compare):
+                compare.setVisible(False)
+            for widget in left_normal:
+                if widget is getattr(self, "messagesBody", None):
+                    continue  # stay collapsed until user opens Messages
+                if _qt_widget_is_valid(widget):
+                    widget.setVisible(True)
+
         # Right dock exploration + history (Activity feed stays visible).
         hide_on_compare = (
             getattr(self, "_dockGraphsTitle", None),
@@ -1824,7 +1855,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if _qt_widget_is_valid(widget):
                     widget.setVisible(False)
             return
-        # Leave Compare: restore graph/history chrome; table/placeholder via history refresh.
         for widget in (
             getattr(self, "_dockGraphsTitle", None),
             getattr(self, "btnDependencyGraph", None),
@@ -1862,9 +1892,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         panel = session.get("panel")
         if panel is not None:
             try:
-                panel.set_segment_label(name, index, len(names))
+                panel.set_current_index(index)
             except Exception:
                 pass
+
+    def _mergeCompareListRowChanged(self, row: int) -> None:
+        panel = getattr(self, "comparePanel", None)
+        if panel is not None and getattr(panel, "_suppress_list", False):
+            return
+        if row < 0:
+            return
+        self._mergeCompareFocusIndex(int(row))
 
     def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
         session = getattr(self, "_merge_compare_session", None)
