@@ -5,7 +5,9 @@ import html
 
 import qt
 import slicer
+import vtk
 
+from CollaborativeVersioningLib import SegmentationCubes
 from CollaborativeVersioningLib.UiStyles import (
     ACCENT_ICE,
     ACCENT_ICE_HOVER,
@@ -29,6 +31,302 @@ _COLORS = ("#F34A33", "#4AF333", "#F3E833")
 # Forced Compare review colors (one segment at a time). RGB 0..1.
 COMPARE_COLOR_TARGET = (0.20, 0.85, 0.35)  # green = target / upper
 COMPARE_COLOR_SOURCE = (0.95, 0.22, 0.18)  # red = source / lower
+# Cube-diff rectangle overlay (display RGB 0..1).
+CUBE_DIFF_COLOR = (1.0, 0.85, 0.15)
+CUBE_DIFF_LINE_WIDTH = 2.0
+
+
+def _geometry_ijk_to_ras_matrix(geometry: dict | None) -> vtk.vtkMatrix4x4:
+    """Build IJK→RAS from manifest/volume geometry (origin, spacing, directions)."""
+    geo = dict(geometry or {})
+    origin = [float(v) for v in (geo.get("origin") or [0.0, 0.0, 0.0])][:3]
+    while len(origin) < 3:
+        origin.append(0.0)
+    spacing = [float(v) for v in (geo.get("spacing") or [1.0, 1.0, 1.0])][:3]
+    while len(spacing) < 3:
+        spacing.append(1.0)
+    directions = list(geo.get("directions") or [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    if len(directions) != 9:
+        directions = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    matrix = vtk.vtkMatrix4x4()
+    matrix.Identity()
+    for col in range(3):
+        for row in range(3):
+            matrix.SetElement(
+                row, col, float(directions[row * 3 + col]) * float(spacing[col])
+            )
+    for row in range(3):
+        matrix.SetElement(row, 3, float(origin[row]))
+    return matrix
+
+
+def _ijk_to_ras(matrix: vtk.vtkMatrix4x4, i: float, j: float, k: float) -> tuple[float, float, float]:
+    point = [float(i), float(j), float(k), 1.0]
+    out = [0.0, 0.0, 0.0, 0.0]
+    matrix.MultiplyPoint(point, out)
+    return float(out[0]), float(out[1]), float(out[2])
+
+
+def changed_cube_bounds(
+    target_manifest: dict | None,
+    source_manifest: dict | None,
+) -> list[dict]:
+    """IJK AABBs for cubes whose manifest hash differs (no voxel load)."""
+    if not isinstance(target_manifest, dict) or not isinstance(source_manifest, dict):
+        return []
+    left = target_manifest.get("chunks") or {}
+    right = source_manifest.get("chunks") or {}
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return []
+    shape_t, chunk_t = SegmentationCubes._manifest_shape_chunk(target_manifest)
+    shape_s, chunk_s = SegmentationCubes._manifest_shape_chunk(source_manifest)
+    keys = set(left) | set(right)
+    cubes: list[dict] = []
+    for key in keys:
+        if str(left.get(key) or "").strip().lower() == str(right.get(key) or "").strip().lower():
+            continue
+        if key in right and shape_s is not None:
+            shape, chunk = shape_s, chunk_s
+        elif key in left and shape_t is not None:
+            shape, chunk = shape_t, chunk_t
+        elif shape_s is not None:
+            shape, chunk = shape_s, chunk_s
+        elif shape_t is not None:
+            shape, chunk = shape_t, chunk_t
+        else:
+            continue
+        try:
+            zsl, ysl, xsl = SegmentationCubes.cube_slices(shape, key, chunk)
+        except ValueError:
+            continue
+        cubes.append(
+            {
+                "key": str(key),
+                "i0": int(xsl.start),
+                "i1": int(xsl.stop),
+                "j0": int(ysl.start),
+                "j1": int(ysl.stop),
+                "k0": int(zsl.start),
+                "k1": int(zsl.stop),
+            }
+        )
+    return cubes
+
+
+def manifest_geometry(manifest: dict | None, volume_node=None) -> dict:
+    """Prefer manifest geometry; fall back to the background volume."""
+    if isinstance(manifest, dict):
+        geo = {
+            "origin": list(manifest.get("origin") or [0.0, 0.0, 0.0]),
+            "spacing": list(manifest.get("spacing") or [1.0, 1.0, 1.0]),
+            "directions": list(
+                manifest.get("directions")
+                or [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+            ),
+        }
+        if geo["directions"] and len(geo["directions"]) == 9:
+            return geo
+    if volume_node is not None:
+        return SegmentationCubes.geometry_from_volume(volume_node)
+    return {
+        "origin": [0.0, 0.0, 0.0],
+        "spacing": [1.0, 1.0, 1.0],
+        "directions": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    }
+
+
+CUBE_DIFF_MODEL_NAME = "CVCompare_CubeDiffs"
+
+
+class CubeDiffOverlay:
+    """Outline changed cubes via a light wireframe model (2D slice intersections).
+
+    Not a dense labelmap: only line edges in RAS. Slicer draws the cut on each
+    Compare slice automatically when the plane hits a cube.
+    """
+
+    def __init__(self) -> None:
+        self._cubes: list[dict] = []
+        self._ijk_to_ras: vtk.vtkMatrix4x4 | None = None
+        self._enabled = True
+        self._model_node_id = ""
+
+    @property
+    def cube_count(self) -> int:
+        return len(self._cubes)
+
+    def configure(
+        self,
+        target_manifest: dict | None,
+        source_manifest: dict | None,
+        volume_node=None,
+    ) -> int:
+        self._cubes = changed_cube_bounds(target_manifest, source_manifest)
+        matrix = vtk.vtkMatrix4x4()
+        if volume_node is not None:
+            try:
+                volume_node.GetIJKToRASMatrix(matrix)
+            except Exception:
+                geo = manifest_geometry(source_manifest or target_manifest, volume_node)
+                matrix = _geometry_ijk_to_ras_matrix(geo)
+        else:
+            geo = manifest_geometry(source_manifest or target_manifest, None)
+            matrix = _geometry_ijk_to_ras_matrix(geo)
+        self._ijk_to_ras = matrix
+        return len(self._cubes)
+
+    def start(self, *, enabled: bool = True) -> None:
+        self.stop()
+        self._enabled = bool(enabled)
+        if not self._cubes or self._ijk_to_ras is None:
+            return
+        poly = self._build_wireframe_polydata()
+        if poly is None or int(poly.GetNumberOfPoints()) <= 0:
+            return
+        model = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", CUBE_DIFF_MODEL_NAME)
+        model.SetName(CUBE_DIFF_MODEL_NAME)
+        model.SetAndObservePolyData(poly)
+        model.CreateDefaultDisplayNodes()
+        display = model.GetDisplayNode()
+        if display is not None:
+            try:
+                display.SetVisibility(bool(self._enabled))
+                display.SetVisibility2D(True)
+                display.SetVisibility3D(False)
+                display.SetColor(*CUBE_DIFF_COLOR)
+                # Keep 3D fill off; 2D slice intersection draws the cube cut (rectangle).
+                display.SetOpacity(0.0)
+                try:
+                    display.SetSliceIntersectionVisibility(True)
+                except Exception:
+                    pass
+                try:
+                    display.SetSliceIntersectionOpacity(0.9)
+                except Exception:
+                    pass
+                try:
+                    display.SetSliceIntersectionThickness(int(max(2, int(CUBE_DIFF_LINE_WIDTH))))
+                except Exception:
+                    pass
+                try:
+                    display.SetLineWidth(float(CUBE_DIFF_LINE_WIDTH))
+                except Exception:
+                    pass
+                # Restrict to Compare 2D views only.
+                display.RemoveAllViewNodeIDs()
+                layout = slicer.app.layoutManager()
+                for tag in TARGET_SLICE_TAGS + SOURCE_SLICE_TAGS:
+                    widget = layout.sliceWidget(tag)
+                    if widget is None:
+                        continue
+                    try:
+                        display.AddViewNodeID(widget.mrmlSliceNode().GetID())
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        self._model_node_id = model.GetID()
+        self._apply_visibility()
+
+    def stop(self) -> None:
+        node_id = str(self._model_node_id or "")
+        self._model_node_id = ""
+        if not node_id:
+            # Also sweep by name in case of a leftover.
+            self._remove_named_models()
+            return
+        node = slicer.mrmlScene.GetNodeByID(node_id)
+        if node is not None:
+            try:
+                slicer.mrmlScene.RemoveNode(node)
+            except Exception:
+                pass
+        self._remove_named_models()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+        if not self._model_node_id and enabled and self._cubes:
+            self.start(enabled=True)
+            return
+        self._apply_visibility()
+
+    def _apply_visibility(self) -> None:
+        node = slicer.mrmlScene.GetNodeByID(str(self._model_node_id or ""))
+        if node is None:
+            return
+        display = node.GetDisplayNode()
+        if display is None:
+            return
+        try:
+            display.SetVisibility(bool(self._enabled))
+            display.SetVisibility2D(bool(self._enabled))
+        except Exception:
+            pass
+
+    def _build_wireframe_polydata(self) -> vtk.vtkPolyData | None:
+        """Closed box faces per changed cube — slice cut = rectangle on 2D views."""
+        matrix = self._ijk_to_ras
+        if matrix is None or not self._cubes:
+            return None
+        points = vtk.vtkPoints()
+        polys = vtk.vtkCellArray()
+        # Corner index quads (i,j,k min/max combinations).
+        faces = (
+            (0, 1, 3, 2),  # k0
+            (4, 5, 7, 6),  # k1
+            (0, 1, 5, 4),  # j0
+            (2, 3, 7, 6),  # j1
+            (0, 2, 6, 4),  # i0
+            (1, 3, 7, 5),  # i1
+        )
+        for cube in self._cubes:
+            i0, i1 = float(cube["i0"]), float(cube["i1"])
+            j0, j1 = float(cube["j0"]), float(cube["j1"])
+            k0, k1 = float(cube["k0"]), float(cube["k1"])
+            # Avoid zero-thickness if a bound collapsed.
+            if abs(i1 - i0) < 1e-6:
+                i1 = i0 + 1.0
+            if abs(j1 - j0) < 1e-6:
+                j1 = j0 + 1.0
+            if abs(k1 - k0) < 1e-6:
+                k1 = k0 + 1.0
+            corners_ijk = (
+                (i0, j0, k0),
+                (i1, j0, k0),
+                (i0, j1, k0),
+                (i1, j1, k0),
+                (i0, j0, k1),
+                (i1, j0, k1),
+                (i0, j1, k1),
+                (i1, j1, k1),
+            )
+            ids = []
+            for i, j, k in corners_ijk:
+                ras = _ijk_to_ras(matrix, i, j, k)
+                ids.append(points.InsertNextPoint(ras[0], ras[1], ras[2]))
+            for a, b, c, d in faces:
+                polys.InsertNextCell(4)
+                polys.InsertCellPoint(ids[a])
+                polys.InsertCellPoint(ids[b])
+                polys.InsertCellPoint(ids[c])
+                polys.InsertCellPoint(ids[d])
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(points)
+        poly.SetPolys(polys)
+        return poly
+
+    @staticmethod
+    def _remove_named_models() -> None:
+        scene = slicer.mrmlScene
+        for index in range(scene.GetNumberOfNodesByClass("vtkMRMLModelNode") - 1, -1, -1):
+            node = scene.GetNthNodeByClass(index, "vtkMRMLModelNode")
+            if node is None:
+                continue
+            if str(node.GetName() or "") == CUBE_DIFF_MODEL_NAME:
+                try:
+                    scene.RemoveNode(node)
+                except Exception:
+                    pass
 
 
 def _slice_views_xml(slice_tags: tuple[str, ...], prefix: str) -> list[str]:
@@ -746,6 +1044,13 @@ class MergeComparePanel(qt.QWidget):
         )
         layout.addWidget(self.showAllCheck)
 
+        self.showCubeDiffsCheck = qt.QCheckBox("Show cube diffs")
+        self.showCubeDiffsCheck.setChecked(True)
+        self.showCubeDiffsCheck.setToolTip(
+            "Outline changed segmentation cubes (manifest hash ≠) on the 2D Compare views."
+        )
+        layout.addWidget(self.showCubeDiffsCheck)
+
         self.show3dCheck = qt.QCheckBox("Show 3D")
         self.show3dCheck.setChecked(False)
         self.show3dCheck.setToolTip(
@@ -837,12 +1142,15 @@ class MergeComparePanel(qt.QWidget):
 
     def reset_controls(self) -> None:
         self.showAllCheck.blockSignals(True)
+        self.showCubeDiffsCheck.blockSignals(True)
         self.show3dCheck.blockSignals(True)
         try:
             self.showAllCheck.setChecked(False)
+            self.showCubeDiffsCheck.setChecked(True)
             self.show3dCheck.setChecked(False)
         finally:
             self.showAllCheck.blockSignals(False)
+            self.showCubeDiffsCheck.blockSignals(False)
             self.show3dCheck.blockSignals(False)
         self._rows = []
         self._suppress_list = True

@@ -205,6 +205,7 @@ from CollaborativeVersioningLib.Dialogs import (
 from CollaborativeVersioningLib.DataManager import DataManager
 from CollaborativeVersioningLib.Logic import CollaborativeVersioningLogic
 from CollaborativeVersioningLib import MergeCompare
+from CollaborativeVersioningLib import SegmentationCubes
 
 _STYLE_EXPORTS = (
     "ACCENT_ICE",
@@ -601,6 +602,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.comparePanel.prevButton.clicked.connect(self._mergeComparePrev)
         self.comparePanel.nextButton.clicked.connect(self._mergeCompareNext)
         self.comparePanel.showAllCheck.toggled.connect(self._mergeCompareSetShowAll)
+        self.comparePanel.showCubeDiffsCheck.toggled.connect(
+            self._mergeCompareSetShowCubeDiffs
+        )
         self.comparePanel.show3dCheck.toggled.connect(self._mergeCompareSetShow3d)
         self.comparePanel.quitButton.clicked.connect(self._exitMergeCompare)
         self.comparePanel.segmentList.currentRowChanged.connect(
@@ -1693,9 +1697,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         reuse_source = bool(work_seg is not None and restore_vid and restore_vid == source_vid)
         target_node = work_seg if reuse_target else None
         source_node = work_seg if reuse_source else None
+        target_manifest = None
+        source_manifest = None
         need_checkout_restore = False
         previous_layout = None
         compare_ok = False
+        cube_overlay = None
 
         # Hide overlays first. Do NOT pauseRender for the whole load — that leaves
         # black views (1st open) or a stale framebuffer with an old segment (2nd open).
@@ -1711,14 +1718,33 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             except Exception:
                 pass
 
-            if not reuse_target:
+            if reuse_target:
+                target_manifest = SegmentationCubes.try_load_manifest(local_path)
+            else:
                 target_node = self._loadCompareSegmentationAtVersion(target_vid)
+                target_manifest = SegmentationCubes.try_load_manifest(local_path)
                 MergeCompare.hide_all_scene_segmentations()
                 need_checkout_restore = True
-            if not reuse_source:
+
+            if reuse_source:
+                source_node = work_seg
+                if reuse_target and target_vid == source_vid:
+                    source_manifest = target_manifest
+                elif not reuse_target:
+                    # Disk is still at target tip — brief checkout to read source manifest.
+                    src_sha, src_lane = self._shaAndLaneForVersion(source_vid)
+                    if src_sha:
+                        checkout_local_version(local_path, src_sha, src_lane)
+                        need_checkout_restore = True
+                    source_manifest = SegmentationCubes.try_load_manifest(local_path)
+                else:
+                    source_manifest = SegmentationCubes.try_load_manifest(local_path)
+            else:
                 source_node = self._loadCompareSegmentationAtVersion(source_vid)
+                source_manifest = SegmentationCubes.try_load_manifest(local_path)
                 MergeCompare.hide_all_scene_segmentations()
                 need_checkout_restore = True
+
             if need_checkout_restore and restore_sha:
                 checkout_local_version(local_path, restore_sha, restore_lane)
             MergeCompare.hide_all_scene_segmentations()
@@ -1736,10 +1762,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
             names = [str(row.get("name") or "") for row in rows]
             panel = getattr(self, "comparePanel", None)
+            show_cube_diffs = True
             if panel is not None:
                 panel.reset_controls()
                 panel.set_version_labels(target_label, source_label)
                 panel.set_segments(rows)
+                show_cube_diffs = bool(panel.showCubeDiffsCheck.isChecked())
+            cube_overlay = MergeCompare.CubeDiffOverlay()
+            cube_count = cube_overlay.configure(
+                target_manifest, source_manifest, volume_node
+            )
             self._merge_compare_session = {
                 "target_node_id": target_node.GetID(),
                 "source_node_id": source_node.GetID(),
@@ -1750,6 +1782,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "segment_index": 0,
                 "show_3d": False,
                 "show_all": False,
+                "show_cube_diffs": show_cube_diffs,
+                "cube_overlay": cube_overlay,
+                "cube_diff_count": cube_count,
                 "previous_layout": previous_layout,
                 "panel": panel,
             }
@@ -1761,6 +1796,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._mergeCompareFocusIndex(0)
             else:
                 MergeCompare.assign_volume_only(volume_node)
+            cube_overlay.start(enabled=show_cube_diffs)
             self._setCompareModeUi(True)
             compare_ok = True
         except Exception as error:
@@ -1769,6 +1805,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     checkout_local_version(local_path, restore_sha, restore_lane)
             except Exception:
                 pass
+            if cube_overlay is not None:
+                try:
+                    cube_overlay.stop()
+                except Exception:
+                    pass
             self._removeCompareSegmentationNodes()
             MergeCompare.hide_all_scene_segmentations()
             MergeCompare.reset_compare_slice_views()
@@ -1791,6 +1832,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not compare_ok:
             return
         self._appendFeed("Compare: %s (top) vs %s (bottom)." % (target_label, source_label))
+        cube_n = int((getattr(self, "_merge_compare_session", None) or {}).get("cube_diff_count") or 0)
+        if cube_n > 0:
+            self._appendFeed("Cube diffs: %d changed cube(s)." % cube_n)
+        elif target_manifest is None and source_manifest is None:
+            self._appendFeed("Cube diffs: no manifests (legacy segmentation?).")
+        else:
+            self._appendFeed("Cube diffs: none (identical cube hashes).")
 
     def _blockIfMergeCompare(self, action: str = "This action") -> bool:
         """True when Compare is open — refuse Save / Switch / Version tree."""
@@ -1936,6 +1984,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             MergeCompare.clear_segment_color_overrides(target)
             MergeCompare.clear_segment_color_overrides(source)
 
+    def _mergeCompareSetShowCubeDiffs(self, checked: bool = False) -> None:
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        session["show_cube_diffs"] = bool(checked)
+        overlay = session.get("cube_overlay")
+        if overlay is not None:
+            try:
+                overlay.set_enabled(bool(checked))
+            except Exception:
+                logging.exception("Could not toggle cube-diff overlay")
+
     def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
         session = getattr(self, "_merge_compare_session", None)
         if not session:
@@ -1983,6 +2043,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._merge_compare_session = None
         self._openProgress("Compare", "Leaving Compare…")
         try:
+            overlay = session.get("cube_overlay")
+            if overlay is not None:
+                try:
+                    overlay.stop()
+                except Exception:
+                    logging.exception("Could not stop cube-diff overlay")
             panel = session.get("panel") or getattr(self, "comparePanel", None)
             if panel is not None:
                 try:
