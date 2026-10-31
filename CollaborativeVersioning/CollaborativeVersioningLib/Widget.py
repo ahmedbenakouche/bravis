@@ -1684,41 +1684,33 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         source_node = work_seg if reuse_source else None
         need_checkout_restore = False
         previous_layout = None
+        compare_ok = False
 
+        # Hide current overlays BEFORE layout switch (otherwise they flash / stick).
+        MergeCompare.hide_all_scene_segmentations()
         self._openProgress("Compare", "Opening comparison views…")
         try:
             previous_layout = MergeCompare.apply_compare_layout(target_label, source_label)
-            # Show volume in the new views right away (segs come in the next step).
-            MergeCompare.assign_volume_and_segmentations(volume_node, None, None)
+            MergeCompare.assign_volume_only(volume_node)
             try:
                 slicer.app.processEvents()
             except Exception:
                 pass
 
-            self._updateProgress("Preparing segmentations…")
             if not reuse_target:
                 target_node = self._loadCompareSegmentationAtVersion(target_vid)
+                MergeCompare.hide_all_scene_segmentations()
                 need_checkout_restore = True
             if not reuse_source:
                 source_node = self._loadCompareSegmentationAtVersion(source_vid)
+                MergeCompare.hide_all_scene_segmentations()
                 need_checkout_restore = True
             if need_checkout_restore and restore_sha:
                 checkout_local_version(local_path, restore_sha, restore_lane)
             if target_node is None or source_node is None:
                 raise RuntimeError("Could not load both segmentations for compare.")
+            MergeCompare.assign_volume_only(volume_node)
 
-            # Hide work seg only when it is NOT one of the compare sides.
-            if work_seg is not None and work_seg not in (target_node, source_node):
-                try:
-                    display = work_seg.GetDisplayNode()
-                    if display is not None:
-                        display.SetVisibility(False)
-                except Exception:
-                    pass
-
-            MergeCompare.assign_volume_and_segmentations(
-                volume_node, target_node, source_node
-            )
             names = MergeCompare.union_segment_names(target_node, source_node)
             panel = MergeCompare.MergeComparePanel(
                 slicer.util.mainWindow(),
@@ -1740,31 +1732,38 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "previous_layout": previous_layout,
                 "panel": panel,
             }
+            MergeCompare.assign_volume_and_segmentations(
+                volume_node, target_node, source_node
+            )
             if names:
                 self._mergeCompareFocusIndex(0)
             else:
-                MergeCompare.show_all_segments(target_node)
-                MergeCompare.show_all_segments(source_node)
+                MergeCompare.assign_volume_only(volume_node)
                 panel.set_segment_label("", 0, 0)
-        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            self._closeProgress()
+            compare_ok = True
+        except Exception as error:
             try:
                 if restore_sha and need_checkout_restore:
                     checkout_local_version(local_path, restore_sha, restore_lane)
             except Exception:
                 pass
             self._removeCompareSegmentationNodes()
+            self._merge_compare_session = None
             if previous_layout is not None:
                 MergeCompare.restore_layout(previous_layout)
                 MergeCompare.set_linked_2d(False)
                 try:
+                    if work_seg is not None:
+                        MergeCompare.show_all_segments(work_seg)
                     DataManager().present_in_slice_views(volume_node, work_seg)
                 except Exception:
                     pass
             self._showGithubError(error, box=True)
-            return
+        finally:
+            self._closeProgress()
 
-        self._closeProgress()
+        if not compare_ok:
+            return
         panel = (getattr(self, "_merge_compare_session", None) or {}).get("panel")
         if panel is not None:
             panel.show()

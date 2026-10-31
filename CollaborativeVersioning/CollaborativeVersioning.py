@@ -24,6 +24,7 @@ _LIB_MODULE_NAMES = (
     "CollaborativeVersioningLib.QtHelpers",
     "CollaborativeVersioningLib.Helpers",
     "CollaborativeVersioningLib.Dialogs",
+    "CollaborativeVersioningLib.MergeCompare",
     "CollaborativeVersioningLib.Widget",
     "CollaborativeVersioningLib.Logic",
     "CollaborativeVersioningLib",

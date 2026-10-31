@@ -9,7 +9,6 @@ import slicer
 from CollaborativeVersioningLib.UiStyles import (
     BTN_SECONDARY,
     BTN_SAVE_VERSION,
-    FIELD_STYLE,
     TEXT_MUTED,
 )
 
@@ -69,8 +68,18 @@ def restore_layout(previous_arrangement: int | None) -> None:
         pass
 
 
+def _nodes_by_class(class_name: str):
+    """``getNodesByClass`` returns a dict in Slicer — iterate values, not keys."""
+    nodes = slicer.util.getNodesByClass(class_name)
+    if isinstance(nodes, dict):
+        return list(nodes.values())
+    if isinstance(nodes, (list, tuple)):
+        return list(nodes)
+    return []
+
+
 def set_linked_2d(enabled: bool) -> None:
-    for composite in slicer.util.getNodesByClass("vtkMRMLSliceCompositeNode"):
+    for composite in _nodes_by_class("vtkMRMLSliceCompositeNode"):
         try:
             composite.SetLinkedControl(bool(enabled))
         except Exception:
@@ -78,8 +87,12 @@ def set_linked_2d(enabled: bool) -> None:
 
 
 def _clear_segmentation_views(segmentation_node) -> None:
-    if segmentation_node is None:
+    if segmentation_node is None or not hasattr(segmentation_node, "GetDisplayNode"):
         return
+    try:
+        segmentation_node.CreateDefaultDisplayNodes()
+    except Exception:
+        pass
     display = segmentation_node.GetDisplayNode()
     if display is None:
         return
@@ -87,10 +100,53 @@ def _clear_segmentation_views(segmentation_node) -> None:
         display.RemoveAllViewNodeIDs()
     except Exception:
         pass
+    # Empty ViewNodeIDs = show in ALL views — force off.
     try:
         display.SetVisibility(False)
     except Exception:
         pass
+    try:
+        display.SetVisibility2D(False)
+    except Exception:
+        pass
+    try:
+        display.SetVisibility3D(False)
+    except Exception:
+        pass
+
+
+def hide_all_scene_segmentations() -> None:
+    """Hide every segmentation overlay (volume-only compare start)."""
+    for node in _nodes_by_class("vtkMRMLSegmentationNode"):
+        _clear_segmentation_views(node)
+
+
+def assign_volume_only(volume_node) -> None:
+    """Compare views: background volume only, no segmentation overlays."""
+    layout = slicer.app.layoutManager()
+    volume_id = volume_node.GetID() if volume_node is not None else ""
+    for tag in TARGET_TAGS + SOURCE_TAGS:
+        widget = layout.sliceWidget(tag)
+        if widget is None:
+            continue
+        try:
+            composite = widget.sliceLogic().GetSliceCompositeNode()
+            if volume_id:
+                composite.SetBackgroundVolumeID(volume_id)
+            # Keep label/foreground empty so only the raw volume shows.
+            try:
+                composite.SetLabelVolumeID("")
+            except Exception:
+                pass
+            try:
+                composite.SetForegroundVolumeID("")
+            except Exception:
+                pass
+            widget.sliceController().fitSliceToBackground()
+        except Exception:
+            pass
+    hide_all_scene_segmentations()
+    set_linked_2d(True)
 
 
 def _assign_segmentation_to_tags(segmentation_node, tags: tuple[str, ...]) -> None:
@@ -118,7 +174,16 @@ def _assign_segmentation_to_tags(segmentation_node, tags: tuple[str, ...]) -> No
         pass
     for view_id in view_ids:
         display.AddViewNodeID(view_id)
+    # Restore flags cleared by hide_all / volume-only mode.
     display.SetVisibility(True)
+    try:
+        display.SetVisibility2D(True)
+    except Exception:
+        pass
+    try:
+        display.SetVisibility3D(False)
+    except Exception:
+        pass
     display.SetVisibility2DFill(True)
     display.SetVisibility2DOutline(True)
     display.SetOpacity2DFill(0.5)
@@ -131,6 +196,10 @@ def assign_volume_and_segmentations(
     source_segmentation,
 ) -> None:
     """Put volume in all compare slices; each seg only in its row."""
+    try:
+        slicer.app.processEvents()
+    except Exception:
+        pass
     layout = slicer.app.layoutManager()
     volume_id = volume_node.GetID() if volume_node is not None else ""
     for tag in TARGET_TAGS + SOURCE_TAGS:
@@ -144,8 +213,6 @@ def assign_volume_and_segmentations(
             widget.sliceController().fitSliceToBackground()
         except Exception:
             pass
-    _clear_segmentation_views(target_segmentation)
-    _clear_segmentation_views(source_segmentation)
     _assign_segmentation_to_tags(target_segmentation, TARGET_TAGS)
     _assign_segmentation_to_tags(source_segmentation, SOURCE_TAGS)
     set_linked_2d(True)
@@ -211,16 +278,30 @@ def focus_segment_name(segmentation_node, name: str) -> bool:
     """Show only ``name`` on this node; hide all if missing. Returns True if found."""
     if segmentation_node is None:
         return False
+    try:
+        segmentation_node.CreateDefaultDisplayNodes()
+    except Exception:
+        pass
     display = segmentation_node.GetDisplayNode()
     if display is None:
         return False
+    try:
+        display.SetVisibility(True)
+        display.SetVisibility2D(True)
+    except Exception:
+        pass
     found_id = _find_segment_id_by_name(segmentation_node, name)
     display.SetAllSegmentsVisibility(False)
     if not found_id:
         return False
     display.SetSegmentVisibility(found_id, True)
     display.SetSegmentOpacity(found_id, 1.0)
-    display.SetSegmentOpacity2DFill(found_id, 1.0)
+    try:
+        display.SetSegmentOpacity2DFill(found_id, 1.0)
+        display.SetSegmentVisibility2DFill(found_id, True)
+        display.SetSegmentVisibility2DOutline(found_id, True)
+    except Exception:
+        pass
     return True
 
 
@@ -258,12 +339,13 @@ class MergeComparePanel(qt.QDialog):
             )
         )
         header.setTextFormat(qt.Qt.RichText)
-        header.setStyleSheet(TEXT_MUTED)
+        # TEXT_MUTED is a color hex, not a full stylesheet.
+        header.setStyleSheet("color: %s;" % (TEXT_MUTED or "#888888"))
         layout.addWidget(header)
 
         row = qt.QHBoxLayout()
         self.segmentLabel = qt.QLabel("Segment: —")
-        self.segmentLabel.setStyleSheet(FIELD_STYLE)
+        self.segmentLabel.setStyleSheet("color: palette(window-text);")
         row.addWidget(self.segmentLabel, 1)
         self.prevButton = qt.QPushButton("◀ Prev")
         self.nextButton = qt.QPushButton("Next ▶")
