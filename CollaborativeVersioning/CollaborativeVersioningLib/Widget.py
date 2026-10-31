@@ -600,6 +600,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.comparePanel = MergeCompare.MergeComparePanel()
         self.comparePanel.prevButton.clicked.connect(self._mergeComparePrev)
         self.comparePanel.nextButton.clicked.connect(self._mergeCompareNext)
+        self.comparePanel.showAllCheck.toggled.connect(self._mergeCompareSetShowAll)
         self.comparePanel.show3dCheck.toggled.connect(self._mergeCompareSetShow3d)
         self.comparePanel.quitButton.clicked.connect(self._exitMergeCompare)
         self.comparePanel.segmentList.currentRowChanged.connect(
@@ -1748,6 +1749,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "segment_rows": rows,
                 "segment_index": 0,
                 "show_3d": False,
+                "show_all": False,
                 "previous_layout": previous_layout,
                 "panel": panel,
             }
@@ -1884,6 +1886,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         index = max(0, min(int(index), len(names) - 1))
         session["segment_index"] = index
+        panel = session.get("panel")
+        if panel is not None:
+            try:
+                panel.set_current_index(index)
+            except Exception:
+                pass
+        # Overview mode: keep all segments / true colors; only move list highlight.
+        if bool(session.get("show_all")):
+            return
         name = names[index]
         show_3d = bool(session.get("show_3d"))
         target, source = self._mergeCompareNodes()
@@ -1899,12 +1910,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             show_3d=show_3d,
             override_color=MergeCompare.COMPARE_COLOR_SOURCE,
         )
-        panel = session.get("panel")
-        if panel is not None:
-            try:
-                panel.set_current_index(index)
-            except Exception:
-                pass
 
     def _mergeCompareListRowChanged(self, row: int) -> None:
         panel = getattr(self, "comparePanel", None)
@@ -1914,12 +1919,32 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self._mergeCompareFocusIndex(int(row))
 
+    def _mergeCompareSetShowAll(self, checked: bool = False) -> None:
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        session["show_all"] = bool(checked)
+        target, source = self._mergeCompareNodes()
+        show_3d = bool(session.get("show_3d"))
+        if checked:
+            MergeCompare.show_all_segments_both(target, source, show_3d=show_3d)
+            return
+        names = list(session.get("segment_names") or [])
+        if names:
+            self._mergeCompareFocusIndex(int(session.get("segment_index") or 0))
+        else:
+            MergeCompare.clear_segment_color_overrides(target)
+            MergeCompare.clear_segment_color_overrides(source)
+
     def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
         session = getattr(self, "_merge_compare_session", None)
         if not session:
             return
         session["show_3d"] = bool(checked)
         target, source = self._mergeCompareNodes()
+        if bool(session.get("show_all")):
+            MergeCompare.show_all_segments_both(target, source, show_3d=bool(checked))
+            return
         MergeCompare.set_segmentations_show_3d(target, source, bool(checked))
         # Re-apply current segment so 3D visibility matches Prev/Next focus.
         names = list(session.get("segment_names") or [])

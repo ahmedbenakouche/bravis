@@ -574,13 +574,59 @@ def focus_segment_name(
     return True
 
 
-def show_all_segments(segmentation_node) -> None:
+def show_all_segments(
+    segmentation_node,
+    *,
+    show_3d: bool = False,
+) -> None:
+    """Show every segment with node colors (no green/red override)."""
     if segmentation_node is None:
         return
+    try:
+        segmentation_node.CreateDefaultDisplayNodes()
+    except Exception:
+        pass
+    clear_segment_color_overrides(segmentation_node)
     display = segmentation_node.GetDisplayNode()
     if display is None:
         return
+    try:
+        display.SetVisibility(True)
+        display.SetVisibility2D(True)
+        display.SetVisibility3D(bool(show_3d))
+    except Exception:
+        pass
     display.SetAllSegmentsVisibility(True)
+    try:
+        display.SetVisibility2DFill(True)
+        display.SetVisibility2DOutline(True)
+    except Exception:
+        pass
+    if show_3d:
+        try:
+            segmentation_node.CreateClosedSurfaceRepresentation()
+        except Exception:
+            pass
+        segmentation = segmentation_node.GetSegmentation()
+        if segmentation is not None:
+            for index in range(int(segmentation.GetNumberOfSegments())):
+                segment_id = segmentation.GetNthSegmentID(index)
+                if not segment_id:
+                    continue
+                try:
+                    display.SetSegmentVisibility3D(segment_id, True)
+                except Exception:
+                    continue
+
+
+def show_all_segments_both(
+    target_segmentation,
+    source_segmentation,
+    *,
+    show_3d: bool = False,
+) -> None:
+    show_all_segments(target_segmentation, show_3d=show_3d)
+    show_all_segments(source_segmentation, show_3d=show_3d)
 
 
 def _nav_button_style(color: str, hover: str) -> str:
@@ -692,10 +738,18 @@ class MergeComparePanel(qt.QWidget):
         self.statusLabel.setStyleSheet("color: %s; font-size: 11px;" % muted)
         layout.addWidget(self.statusLabel)
 
+        self.showAllCheck = qt.QCheckBox("Show all segments")
+        self.showAllCheck.setChecked(False)
+        self.showAllCheck.setToolTip(
+            "Show every segment with its real colors. "
+            "Off = one segment at a time (green target / red source)."
+        )
+        layout.addWidget(self.showAllCheck)
+
         self.show3dCheck = qt.QCheckBox("Show 3D")
         self.show3dCheck.setChecked(False)
         self.show3dCheck.setToolTip(
-            "Build and show closed-surface 3D for the current segment "
+            "Build and show closed-surface 3D "
             "(off by default — faster)."
         )
         layout.addWidget(self.show3dCheck)
@@ -782,10 +836,13 @@ class MergeComparePanel(qt.QWidget):
             )
 
     def reset_controls(self) -> None:
+        self.showAllCheck.blockSignals(True)
         self.show3dCheck.blockSignals(True)
         try:
+            self.showAllCheck.setChecked(False)
             self.show3dCheck.setChecked(False)
         finally:
+            self.showAllCheck.blockSignals(False)
             self.show3dCheck.blockSignals(False)
         self._rows = []
         self._suppress_list = True
