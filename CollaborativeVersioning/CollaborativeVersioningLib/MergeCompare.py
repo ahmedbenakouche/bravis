@@ -26,6 +26,10 @@ SOURCE_SLICE_TAGS = ("R CVCmpS", "G CVCmpS", "Y CVCmpS")
 _ORIENT = ("Axial", "Sagittal", "Coronal")
 _COLORS = ("#F34A33", "#4AF333", "#F3E833")
 
+# Forced Compare review colors (one segment at a time). RGB 0..1.
+COMPARE_COLOR_TARGET = (0.20, 0.85, 0.35)  # green = target / upper
+COMPARE_COLOR_SOURCE = (0.95, 0.22, 0.18)  # red = source / lower
+
 
 def _slice_views_xml(slice_tags: tuple[str, ...], prefix: str) -> list[str]:
     parts = ['    <layout type="horizontal" split="true">']
@@ -475,13 +479,64 @@ def _center_cameras_on_segment(segmentation_node, segment_id: str) -> None:
             continue
 
 
+def clear_segment_color_overrides(segmentation_node) -> None:
+    """Drop display-node color overrides (needed when work seg is reused in Compare)."""
+    if segmentation_node is None:
+        return
+    display = segmentation_node.GetDisplayNode()
+    if display is None:
+        return
+    unset = getattr(display, "UnsetSegmentOverrideColor", None)
+    if not callable(unset):
+        return
+    segmentation = segmentation_node.GetSegmentation()
+    if segmentation is None:
+        return
+    for index in range(int(segmentation.GetNumberOfSegments())):
+        segment_id = segmentation.GetNthSegmentID(index)
+        if not segment_id:
+            continue
+        try:
+            unset(segment_id)
+        except Exception:
+            continue
+
+
+def _paint_segment_compare_color(segmentation_node, segment_id: str, rgb: tuple) -> None:
+    """Force segment tint for Compare. Prefer display override (non-destructive)."""
+    if segmentation_node is None or not segment_id or not rgb:
+        return
+    r, g, b = float(rgb[0]), float(rgb[1]), float(rgb[2])
+    display = segmentation_node.GetDisplayNode()
+    if display is not None:
+        setter = getattr(display, "SetSegmentOverrideColor", None)
+        if callable(setter):
+            try:
+                setter(segment_id, r, g, b)
+                return
+            except Exception:
+                pass
+    # Fallback: mutate segment color (temp CVCompare_* nodes only in practice).
+    try:
+        segmentation = segmentation_node.GetSegmentation()
+        segment = segmentation.GetSegment(segment_id) if segmentation is not None else None
+        if segment is not None:
+            segment.SetColor(r, g, b)
+    except Exception:
+        pass
+
+
 def focus_segment_name(
     segmentation_node,
     name: str,
     *,
     show_3d: bool = False,
+    override_color: tuple | None = None,
 ) -> bool:
-    """Show only ``name`` on this node; 3D only if show_3d. Returns True if found."""
+    """Show only ``name`` on this node; 3D only if show_3d. Returns True if found.
+
+    ``override_color`` is RGB 0..1 (e.g. COMPARE_COLOR_TARGET / COMPARE_COLOR_SOURCE).
+    """
     if segmentation_node is None:
         return False
     try:
@@ -499,8 +554,12 @@ def focus_segment_name(
         pass
     found_id = _find_segment_id_by_name(segmentation_node, name)
     display.SetAllSegmentsVisibility(False)
+    if override_color is not None:
+        clear_segment_color_overrides(segmentation_node)
     if not found_id:
         return False
+    if override_color is not None:
+        _paint_segment_compare_color(segmentation_node, found_id, override_color)
     display.SetSegmentVisibility(found_id, True)
     display.SetSegmentOpacity(found_id, 1.0)
     try:

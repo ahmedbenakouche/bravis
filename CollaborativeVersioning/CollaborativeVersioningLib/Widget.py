@@ -1887,8 +1887,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         name = names[index]
         show_3d = bool(session.get("show_3d"))
         target, source = self._mergeCompareNodes()
-        MergeCompare.focus_segment_name(target, name, show_3d=show_3d)
-        MergeCompare.focus_segment_name(source, name, show_3d=show_3d)
+        MergeCompare.focus_segment_name(
+            target,
+            name,
+            show_3d=show_3d,
+            override_color=MergeCompare.COMPARE_COLOR_TARGET,
+        )
+        MergeCompare.focus_segment_name(
+            source,
+            name,
+            show_3d=show_3d,
+            override_color=MergeCompare.COMPARE_COLOR_SOURCE,
+        )
         panel = session.get("panel")
         if panel is not None:
             try:
@@ -1953,6 +1963,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             except Exception:
                 pass
         self._setCompareModeUi(False)
+        # Clear green/red overrides on reused work seg before dropping temp nodes.
+        for node_id in (
+            session.get("target_node_id"),
+            session.get("source_node_id"),
+            session.get("work_seg_id"),
+        ):
+            node = slicer.mrmlScene.GetNodeByID(str(node_id or ""))
+            if node is not None:
+                MergeCompare.clear_segment_color_overrides(node)
         # Drop temp segs and wipe compare singletons before leaving the layout
         # (those slice nodes are reused next Compare and otherwise keep old overlays).
         self._removeCompareSegmentationNodes()
