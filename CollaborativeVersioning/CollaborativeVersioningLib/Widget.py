@@ -1981,55 +1981,59 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         # Prevent re-entry while we tear down.
         self._merge_compare_session = None
-        panel = session.get("panel") or getattr(self, "comparePanel", None)
-        if panel is not None:
-            try:
-                panel.reset_controls()
-            except Exception:
-                pass
-        self._setCompareModeUi(False)
-        # Clear green/red overrides on reused work seg before dropping temp nodes.
-        for node_id in (
-            session.get("target_node_id"),
-            session.get("source_node_id"),
-            session.get("work_seg_id"),
-        ):
-            node = slicer.mrmlScene.GetNodeByID(str(node_id or ""))
-            if node is not None:
-                MergeCompare.clear_segment_color_overrides(node)
-        # Drop temp segs and wipe compare singletons before leaving the layout
-        # (those slice nodes are reused next Compare and otherwise keep old overlays).
-        self._removeCompareSegmentationNodes()
-        MergeCompare.hide_all_scene_segmentations()
-        MergeCompare.reset_compare_slice_views()
-        MergeCompare.restore_layout(session.get("previous_layout"))
-        MergeCompare.set_linked_2d(False)
-        MergeCompare.set_linked_3d(False)
-        work_seg = slicer.mrmlScene.GetNodeByID(session.get("work_seg_id") or "")
-        volume = slicer.mrmlScene.GetNodeByID(session.get("volume_id") or "")
-        if work_seg is None:
-            work_seg = self._selectorCurrentNode("segmentationSelector")
-        if volume is None:
-            volume = self._selectorCurrentNode("volumeSelector")
-        if work_seg is not None:
-            try:
-                MergeCompare.show_all_segments(work_seg)
-                display = work_seg.GetDisplayNode()
-                if display is not None:
-                    display.SetVisibility(True)
-                    # Empty ViewNodeIDs = show in ALL views (including dormant compare
-                    # slices). Clear then let present_in_slice_views reattach defaults.
-                    try:
-                        display.RemoveAllViewNodeIDs()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        self._openProgress("Compare", "Leaving Compare…")
         try:
-            DataManager().present_in_slice_views(volume, work_seg)
-        except Exception:
-            logging.exception("Could not restore slice views after Compare")
-        self._appendFeed("Quit Compare.")
+            panel = session.get("panel") or getattr(self, "comparePanel", None)
+            if panel is not None:
+                try:
+                    panel.reset_controls()
+                except Exception:
+                    pass
+            self._setCompareModeUi(False)
+            # Clear green/red overrides on reused work seg before dropping temp nodes.
+            for node_id in (
+                session.get("target_node_id"),
+                session.get("source_node_id"),
+                session.get("work_seg_id"),
+            ):
+                node = slicer.mrmlScene.GetNodeByID(str(node_id or ""))
+                if node is not None:
+                    MergeCompare.clear_segment_color_overrides(node)
+            # Drop temp segs and wipe compare singletons before leaving the layout
+            # (those slice nodes are reused next Compare and otherwise keep old overlays).
+            self._removeCompareSegmentationNodes()
+            MergeCompare.hide_all_scene_segmentations()
+            MergeCompare.reset_compare_slice_views()
+            MergeCompare.restore_layout(session.get("previous_layout"))
+            MergeCompare.set_linked_2d(False)
+            MergeCompare.set_linked_3d(False)
+            work_seg = slicer.mrmlScene.GetNodeByID(session.get("work_seg_id") or "")
+            volume = slicer.mrmlScene.GetNodeByID(session.get("volume_id") or "")
+            if work_seg is None:
+                work_seg = self._selectorCurrentNode("segmentationSelector")
+            if volume is None:
+                volume = self._selectorCurrentNode("volumeSelector")
+            if work_seg is not None:
+                try:
+                    MergeCompare.show_all_segments(work_seg)
+                    display = work_seg.GetDisplayNode()
+                    if display is not None:
+                        display.SetVisibility(True)
+                        # Empty ViewNodeIDs = show in ALL views (including dormant compare
+                        # slices). Clear then let present_in_slice_views reattach defaults.
+                        try:
+                            display.RemoveAllViewNodeIDs()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            try:
+                DataManager().present_in_slice_views(volume, work_seg)
+            except Exception:
+                logging.exception("Could not restore slice views after Compare")
+            self._appendFeed("Quit Compare.")
+        finally:
+            self._closeProgress()
 
     def _githubLogin(self) -> str:
         session = getattr(self, "_github_session", None) or {}
