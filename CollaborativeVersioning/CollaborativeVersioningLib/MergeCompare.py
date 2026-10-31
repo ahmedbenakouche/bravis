@@ -218,6 +218,28 @@ def _set_compare_background_volume(volume_node, *, clear_overlays: bool = False)
             pass
 
 
+def reset_compare_slice_views() -> None:
+    """Clear backgrounds/overlays on compare slice singletons (they survive layout changes)."""
+    layout = slicer.app.layoutManager()
+    for tag in TARGET_SLICE_TAGS + SOURCE_SLICE_TAGS:
+        widget = layout.sliceWidget(tag)
+        if widget is None:
+            continue
+        try:
+            composite = widget.sliceLogic().GetSliceCompositeNode()
+            composite.SetBackgroundVolumeID("")
+            try:
+                composite.SetForegroundVolumeID("")
+            except Exception:
+                pass
+            try:
+                composite.SetLabelVolumeID("")
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+
 def assign_volume_only(volume_node) -> None:
     """Compare views: background volume only, no segmentation overlays."""
     _set_compare_background_volume(volume_node, clear_overlays=True)
@@ -232,8 +254,9 @@ def _assign_segmentation_to_row(
     threed_tag: str,
     *,
     show_3d: bool = False,
+    reveal: bool = False,
 ) -> None:
-    """Show this seg in its 2D slices (+ 3D view id); 3D render only if show_3d."""
+    """Bind this seg to its 2D (+ 3D) views; keep hidden until Prev/Next focus unless reveal."""
     if segmentation_node is None:
         return
     try:
@@ -261,24 +284,29 @@ def _assign_segmentation_to_row(
         pass
     for view_id in view_ids:
         display.AddViewNodeID(view_id)
-    display.SetVisibility(True)
+    # Never flash the full labelmap: start with every segment off.
+    try:
+        display.SetAllSegmentsVisibility(False)
+    except Exception:
+        pass
+    display.SetVisibility2DFill(True)
+    display.SetVisibility2DOutline(True)
+    display.SetOpacity2DFill(0.5)
+    display.SetOpacity2DOutline(0.5)
     try:
         display.SetVisibility2D(True)
     except Exception:
         pass
     try:
-        display.SetVisibility3D(bool(show_3d))
+        display.SetVisibility3D(bool(show_3d) if reveal else False)
     except Exception:
         pass
-    if show_3d:
+    if show_3d and reveal:
         try:
             segmentation_node.CreateClosedSurfaceRepresentation()
         except Exception:
             pass
-    display.SetVisibility2DFill(True)
-    display.SetVisibility2DOutline(True)
-    display.SetOpacity2DFill(0.5)
-    display.SetOpacity2DOutline(0.5)
+    display.SetVisibility(bool(reveal))
 
 
 def assign_volume_and_segmentations(
@@ -287,18 +315,27 @@ def assign_volume_and_segmentations(
     source_segmentation,
     *,
     show_3d: bool = False,
+    reveal: bool = False,
 ) -> None:
-    """Put volume in compare slices; each seg in its column (2D; 3D optional)."""
+    """Bind volume + segs to compare views. reveal=False avoids a full-seg flash."""
     try:
         slicer.app.processEvents()
     except Exception:
         pass
     _set_compare_background_volume(volume_node, clear_overlays=False)
     _assign_segmentation_to_row(
-        target_segmentation, TARGET_SLICE_TAGS, TARGET_3D_TAG, show_3d=show_3d
+        target_segmentation,
+        TARGET_SLICE_TAGS,
+        TARGET_3D_TAG,
+        show_3d=show_3d,
+        reveal=reveal,
     )
     _assign_segmentation_to_row(
-        source_segmentation, SOURCE_SLICE_TAGS, SOURCE_3D_TAG, show_3d=show_3d
+        source_segmentation,
+        SOURCE_SLICE_TAGS,
+        SOURCE_3D_TAG,
+        show_3d=show_3d,
+        reveal=reveal,
     )
     set_linked_2d(True)
     set_linked_3d(True)
@@ -454,36 +491,25 @@ def show_all_segments(segmentation_node) -> None:
     display.SetAllSegmentsVisibility(True)
 
 
-class MergeComparePanel(qt.QDialog):
-    """Non-modal bar: segment Prev/Next, optional Show 3D, Quit Compare."""
+class MergeComparePanel(qt.QWidget):
+    """Embedded left-panel controls: Prev/Next, Show 3D, Quit Compare."""
 
-    def __init__(
-        self,
-        parent,
-        target_label: str,
-        source_label: str,
-        on_prev,
-        on_next,
-        on_show_3d=None,
-    ) -> None:
-        qt.QDialog.__init__(self, parent)
-        self.setWindowTitle("Merge Compare")
-        self.setModal(False)
-        self.setMinimumWidth(420)
+    def __init__(self, parent=None) -> None:
+        qt.QWidget.__init__(self, parent)
         layout = qt.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        header = qt.QLabel(
-            "Target: <b>%s</b> (left 3D, upper 2D)<br>"
-            "Source: <b>%s</b> (right 3D, lower 2D)"
-            % (
-                html.escape(str(target_label or "")),
-                html.escape(str(source_label or "")),
-            )
-        )
-        header.setTextFormat(qt.Qt.RichText)
-        # TEXT_MUTED is a color hex, not a full stylesheet.
-        header.setStyleSheet("color: %s;" % (TEXT_MUTED or "#888888"))
-        layout.addWidget(header)
+
+        self.headerLabel = qt.QLabel("Compare")
+        self.headerLabel.setTextFormat(qt.Qt.RichText)
+        self.headerLabel.setWordWrap(True)
+        self.headerLabel.setStyleSheet("color: %s;" % (TEXT_MUTED or "#888888"))
+        layout.addWidget(self.headerLabel)
+
+        hint = qt.QLabel("Finish Compare before saving or switching versions.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: %s; font-size: 10px;" % (TEXT_MUTED or "#888888"))
+        layout.addWidget(hint)
 
         row = qt.QHBoxLayout()
         self.segmentLabel = qt.QLabel("Segment: —")
@@ -493,8 +519,6 @@ class MergeComparePanel(qt.QDialog):
         self.nextButton = qt.QPushButton("Next ▶")
         self.prevButton.setStyleSheet(BTN_SECONDARY)
         self.nextButton.setStyleSheet(BTN_SECONDARY)
-        self.prevButton.clicked.connect(on_prev)
-        self.nextButton.clicked.connect(on_next)
         row.addWidget(self.prevButton)
         row.addWidget(self.nextButton)
         layout.addLayout(row)
@@ -505,15 +529,21 @@ class MergeComparePanel(qt.QDialog):
             "Build and show closed-surface 3D for the current segment "
             "(off by default — faster)."
         )
-        if callable(on_show_3d):
-            self.show3dCheck.toggled.connect(on_show_3d)
         layout.addWidget(self.show3dCheck)
 
         self.quitButton = qt.QPushButton("Quit Compare")
         self.quitButton.setStyleSheet(BTN_SAVE_VERSION)
-        # reject() → finished → Widget._exitMergeCompare (also window X).
-        self.quitButton.clicked.connect(self.reject)
         layout.addWidget(self.quitButton)
+
+    def set_version_labels(self, target_label: str, source_label: str) -> None:
+        self.headerLabel.setText(
+            "Target: <b>%s</b> (left 3D, upper 2D)<br>"
+            "Source: <b>%s</b> (right 3D, lower 2D)"
+            % (
+                html.escape(str(target_label or "")),
+                html.escape(str(source_label or "")),
+            )
+        )
 
     def set_segment_label(self, name: str, index: int, total: int) -> None:
         if total <= 0:
@@ -522,3 +552,11 @@ class MergeComparePanel(qt.QDialog):
         self.segmentLabel.setText(
             "Segment: %s  (%d / %d)" % (name or "—", index + 1, total)
         )
+
+    def reset_controls(self) -> None:
+        self.show3dCheck.blockSignals(True)
+        try:
+            self.show3dCheck.setChecked(False)
+        finally:
+            self.show3dCheck.blockSignals(False)
+        self.set_segment_label("", 0, 0)

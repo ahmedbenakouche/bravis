@@ -587,6 +587,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         actionsRow.addLayout(rightCol, 1)
         projectLayout.addLayout(actionsRow)
 
+        # Compare mode replaces Active project in the left panel (hidden until Compare).
+        self.compareButton = ctk.ctkCollapsibleButton()
+        self.compareButton.text = "Merge Compare"
+        self.compareButton.collapsed = False
+        self.compareButton.setVisible(False)
+        self.layout.addWidget(self.compareButton)
+        compareLayout = qt.QVBoxLayout(self.compareButton)
+        compareLayout.setSpacing(8)
+        compareLayout.setContentsMargins(8, 8, 8, 10)
+        self.comparePanel = MergeCompare.MergeComparePanel()
+        self.comparePanel.prevButton.clicked.connect(self._mergeComparePrev)
+        self.comparePanel.nextButton.clicked.connect(self._mergeCompareNext)
+        self.comparePanel.show3dCheck.toggled.connect(self._mergeCompareSetShow3d)
+        self.comparePanel.quitButton.clicked.connect(self._exitMergeCompare)
+        compareLayout.addWidget(self.comparePanel)
+
         self._buildMessagesSection()
 
         self.layout.addStretch(1)
@@ -1260,8 +1276,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
         self._dockActivityTitle = qt.QLabel("LIVE ACTIVITY FEED")
         self._dockActivityTitle.setStyleSheet(SECTION_TITLE_STYLE)
-        feedHeader = qt.QWidget()
-        feedHeaderLayout = qt.QHBoxLayout(feedHeader)
+        self._dockFeedHeader = qt.QWidget()
+        feedHeaderLayout = qt.QHBoxLayout(self._dockFeedHeader)
         feedHeaderLayout.setContentsMargins(0, 0, 0, 0)
         feedHeaderLayout.setSpacing(6)
         feedHeaderLayout.addWidget(self._dockActivityTitle, 1)
@@ -1270,7 +1286,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.feedClearButton.setStyleSheet(BTN_SECONDARY + " font-size: 9px; padding: 2px 8px;")
         self.feedClearButton.setSizePolicy(qt.QSizePolicy.Fixed, qt.QSizePolicy.Fixed)
         feedHeaderLayout.addWidget(self.feedClearButton, 0)
-        layout.addWidget(feedHeader)
+        layout.addWidget(self._dockFeedHeader)
 
         self.feedTextEdit = qt.QTextEdit()
         self.feedTextEdit.setReadOnly(True)
@@ -1676,8 +1692,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         previous_layout = None
         compare_ok = False
 
-        # Hide current overlays BEFORE layout switch (otherwise they flash / stick).
+        # Hide overlays first. Do NOT pauseRender for the whole load — that leaves
+        # black views (1st open) or a stale framebuffer with an old segment (2nd open).
+        # Compare slice singletons persist in Slicer across layout switches: reset them.
         MergeCompare.hide_all_scene_segmentations()
+        MergeCompare.reset_compare_slice_views()
         self._openProgress("Compare", "Opening comparison views…")
         try:
             previous_layout = MergeCompare.apply_compare_layout(target_label, source_label)
@@ -1689,28 +1708,29 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
             if not reuse_target:
                 target_node = self._loadCompareSegmentationAtVersion(target_vid)
+                MergeCompare.hide_all_scene_segmentations()
                 need_checkout_restore = True
             if not reuse_source:
                 source_node = self._loadCompareSegmentationAtVersion(source_vid)
-                need_checkout_restore = True
-            if need_checkout_restore:
-                # Loads turn overlays back on — keep volume-only until final attach.
                 MergeCompare.hide_all_scene_segmentations()
-                if restore_sha:
-                    checkout_local_version(local_path, restore_sha, restore_lane)
+                need_checkout_restore = True
+            if need_checkout_restore and restore_sha:
+                checkout_local_version(local_path, restore_sha, restore_lane)
+            MergeCompare.hide_all_scene_segmentations()
+            # Keep volume visible; strips any load-time overlay flash.
+            MergeCompare.assign_volume_only(volume_node)
+            try:
+                slicer.app.processEvents()
+            except Exception:
+                pass
             if target_node is None or source_node is None:
                 raise RuntimeError("Could not load both segmentations for compare.")
 
             names = MergeCompare.union_segment_names(target_node, source_node)
-            panel = MergeCompare.MergeComparePanel(
-                slicer.util.mainWindow(),
-                target_label,
-                source_label,
-                on_prev=self._mergeComparePrev,
-                on_next=self._mergeCompareNext,
-                on_show_3d=self._mergeCompareSetShow3d,
-            )
-            panel.finished.connect(lambda *_args: self._exitMergeCompare())
+            panel = getattr(self, "comparePanel", None)
+            if panel is not None:
+                panel.reset_controls()
+                panel.set_version_labels(target_label, source_label)
             self._merge_compare_session = {
                 "target_node_id": target_node.GetID(),
                 "source_node_id": source_node.GetID(),
@@ -1722,14 +1742,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "previous_layout": previous_layout,
                 "panel": panel,
             }
+            # Bind views while still hidden (no full-seg flash), then focus one label.
             MergeCompare.assign_volume_and_segmentations(
-                volume_node, target_node, source_node, show_3d=False
+                volume_node, target_node, source_node, show_3d=False, reveal=False
             )
             if names:
                 self._mergeCompareFocusIndex(0)
             else:
                 MergeCompare.assign_volume_only(volume_node)
-                panel.set_segment_label("", 0, 0)
+                if panel is not None:
+                    panel.set_segment_label("", 0, 0)
+            self._setCompareModeUi(True)
             compare_ok = True
         except Exception as error:
             try:
@@ -1738,7 +1761,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             except Exception:
                 pass
             self._removeCompareSegmentationNodes()
+            MergeCompare.hide_all_scene_segmentations()
+            MergeCompare.reset_compare_slice_views()
             self._merge_compare_session = None
+            self._setCompareModeUi(False)
             if previous_layout is not None:
                 MergeCompare.restore_layout(previous_layout)
                 MergeCompare.set_linked_2d(False)
@@ -1755,10 +1781,63 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
         if not compare_ok:
             return
-        panel = (getattr(self, "_merge_compare_session", None) or {}).get("panel")
-        if panel is not None:
-            panel.show()
         self._appendFeed("Compare: %s (top) vs %s (bottom)." % (target_label, source_label))
+
+    def _blockIfMergeCompare(self, action: str = "This action") -> bool:
+        """True when Compare is open — refuse Save / Switch / Version tree."""
+        if not getattr(self, "_merge_compare_session", None):
+            return False
+        self._appendFeed(
+            "Quit Compare first before %s."
+            % (str(action or "continuing").strip().lower() or "continuing"),
+            error=True,
+        )
+        return True
+
+    def _setCompareModeUi(self, active: bool) -> None:
+        """Left: hide Active project / show Compare. Right: keep only Activity feed."""
+        active = bool(active)
+        project = getattr(self, "projectButton", None)
+        compare = getattr(self, "compareButton", None)
+        if _qt_widget_is_valid(project):
+            project.setVisible(not active)
+        if _qt_widget_is_valid(compare):
+            compare.setVisible(active)
+            if active:
+                try:
+                    compare.collapsed = False
+                except Exception:
+                    pass
+        # Right dock exploration + history (Activity feed stays visible).
+        hide_on_compare = (
+            getattr(self, "_dockGraphsTitle", None),
+            getattr(self, "btnDependencyGraph", None),
+            getattr(self, "btnHistoryGraph", None),
+            getattr(self, "_dockHistoryTitle", None),
+            getattr(self, "checkedOutLabel", None),
+            getattr(self, "historyPlaceholder", None),
+            getattr(self, "historyTableWidget", None),
+            getattr(self, "_dockSeparator", None),
+        )
+        if active:
+            for widget in hide_on_compare:
+                if _qt_widget_is_valid(widget):
+                    widget.setVisible(False)
+            return
+        # Leave Compare: restore graph/history chrome; table/placeholder via history refresh.
+        for widget in (
+            getattr(self, "_dockGraphsTitle", None),
+            getattr(self, "btnDependencyGraph", None),
+            getattr(self, "btnHistoryGraph", None),
+            getattr(self, "_dockHistoryTitle", None),
+            getattr(self, "_dockSeparator", None),
+        ):
+            if _qt_widget_is_valid(widget):
+                widget.setVisible(True)
+        try:
+            self._updateCommitHistoryPanel()
+        except Exception:
+            pass
 
     def _mergeCompareNodes(self):
         session = getattr(self, "_merge_compare_session", None) or {}
@@ -1827,23 +1906,23 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         session = getattr(self, "_merge_compare_session", None)
         if not session:
             return
-        # Prevent re-entry from panel.finished while we tear down.
+        # Prevent re-entry while we tear down.
         self._merge_compare_session = None
-        panel = session.get("panel")
+        panel = session.get("panel") or getattr(self, "comparePanel", None)
         if panel is not None:
             try:
-                panel.finished.disconnect()
+                panel.reset_controls()
             except Exception:
                 pass
-            try:
-                panel.hide()
-                panel.deleteLater()
-            except Exception:
-                pass
+        self._setCompareModeUi(False)
+        # Drop temp segs and wipe compare singletons before leaving the layout
+        # (those slice nodes are reused next Compare and otherwise keep old overlays).
+        self._removeCompareSegmentationNodes()
+        MergeCompare.hide_all_scene_segmentations()
+        MergeCompare.reset_compare_slice_views()
         MergeCompare.restore_layout(session.get("previous_layout"))
         MergeCompare.set_linked_2d(False)
         MergeCompare.set_linked_3d(False)
-        self._removeCompareSegmentationNodes()
         work_seg = slicer.mrmlScene.GetNodeByID(session.get("work_seg_id") or "")
         volume = slicer.mrmlScene.GetNodeByID(session.get("volume_id") or "")
         if work_seg is None:
@@ -1856,6 +1935,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 display = work_seg.GetDisplayNode()
                 if display is not None:
                     display.SetVisibility(True)
+                    # Empty ViewNodeIDs = show in ALL views (including dormant compare
+                    # slices). Clear then let present_in_slice_views reattach defaults.
                     try:
                         display.RemoveAllViewNodeIDs()
                     except Exception:
@@ -8461,6 +8542,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return True
 
     def onSaveVersion(self) -> None:
+        if self._blockIfMergeCompare("saving"):
+            return
         if not self._hasWorkspaceSession():
             self._showConnectRequired()
             return
@@ -9435,6 +9518,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def onHistorySelectionChanged(self) -> None:
         if getattr(self, "_suppress_history_selection_signal", False):
             return
+        if self._blockIfMergeCompare("switching version"):
+            return
         selected_version_id = self._selectedVersionId()
         if not selected_version_id:
             return
@@ -9670,6 +9755,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.logic.openDependencyGraph()
 
     def onOpenHistoryGraph(self, pick_mode: bool = False, parent=None) -> None:
+        if self._blockIfMergeCompare("opening the version tree"):
+            return
         if not self._canOpenVersionTree():
             payload = self.getVersionTreePayload()
             self._appendFeed(payload["description"], error=True)
