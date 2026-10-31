@@ -1577,10 +1577,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return "compare"
         return None
 
-    def _onMergeComparePlaceholder(self, source: str, target: str) -> None:
-        """Merge dialog Compare… → side-by-side tips (no fusion yet)."""
-        self._startMergeCompare(source_lane=source, target_lane=target)
-
     def _shaAndLaneForVersion(self, version_id: str) -> tuple[str, str]:
         vid = str(version_id or "").strip()
         if not vid:
@@ -1620,13 +1616,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         files = manager.discover_project_files(local_path)
         stem = self._compareNodeStem(version_id)
         # Drop a leftover node with the same compare name before recreating.
-        manager.remove_scene_nodes_by_names(
-            {
-                stem,
-                "%s_segmentation" % stem,
-                manager._basename_without_extension("%s_segmentation.nii.gz" % stem),
-            }
-        )
+        manager.remove_scene_nodes_by_names({"%s_segmentation" % stem})
         if files.get("segmentation_store"):
             node, _timings = manager.load_segmentation_from_cubes(local_path, stem=stem)
             return node
@@ -1699,17 +1689,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
             if not reuse_target:
                 target_node = self._loadCompareSegmentationAtVersion(target_vid)
-                MergeCompare.hide_all_scene_segmentations()
                 need_checkout_restore = True
             if not reuse_source:
                 source_node = self._loadCompareSegmentationAtVersion(source_vid)
-                MergeCompare.hide_all_scene_segmentations()
                 need_checkout_restore = True
-            if need_checkout_restore and restore_sha:
-                checkout_local_version(local_path, restore_sha, restore_lane)
+            if need_checkout_restore:
+                # Loads turn overlays back on — keep volume-only until final attach.
+                MergeCompare.hide_all_scene_segmentations()
+                if restore_sha:
+                    checkout_local_version(local_path, restore_sha, restore_lane)
             if target_node is None or source_node is None:
                 raise RuntimeError("Could not load both segmentations for compare.")
-            MergeCompare.assign_volume_only(volume_node)
 
             names = MergeCompare.union_segment_names(target_node, source_node)
             panel = MergeCompare.MergeComparePanel(
@@ -1725,8 +1715,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "source_node_id": source_node.GetID(),
                 "work_seg_id": work_seg.GetID() if work_seg is not None else "",
                 "volume_id": volume_node.GetID() if volume_node is not None else "",
-                "target_version": target_vid,
-                "source_version": source_vid,
                 "segment_names": names,
                 "segment_index": 0,
                 "previous_layout": previous_layout,
@@ -7832,7 +7820,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         choice = self._askMergeChoice(slug, parent)
         if choice == "compare":
-            self._onMergeComparePlaceholder(slug, parent)
+            self._startMergeCompare(source_lane=slug, target_lane=parent)
             return
         if choice != "merge":
             return
@@ -7907,7 +7895,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         task = self._activeTaskForBranchSlug(slug)
         choice = self._askMergeChoice(slug, "main")
         if choice == "compare":
-            self._onMergeComparePlaceholder(slug, "main")
+            self._startMergeCompare(source_lane=slug, target_lane="main")
             return
         if choice != "merge":
             return

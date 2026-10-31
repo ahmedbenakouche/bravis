@@ -121,8 +121,8 @@ def hide_all_scene_segmentations() -> None:
         _clear_segmentation_views(node)
 
 
-def assign_volume_only(volume_node) -> None:
-    """Compare views: background volume only, no segmentation overlays."""
+def _set_compare_background_volume(volume_node, *, clear_overlays: bool = False) -> None:
+    """Set the shared volume on all compare slice views."""
     layout = slicer.app.layoutManager()
     volume_id = volume_node.GetID() if volume_node is not None else ""
     for tag in TARGET_TAGS + SOURCE_TAGS:
@@ -133,18 +133,23 @@ def assign_volume_only(volume_node) -> None:
             composite = widget.sliceLogic().GetSliceCompositeNode()
             if volume_id:
                 composite.SetBackgroundVolumeID(volume_id)
-            # Keep label/foreground empty so only the raw volume shows.
-            try:
-                composite.SetLabelVolumeID("")
-            except Exception:
-                pass
-            try:
-                composite.SetForegroundVolumeID("")
-            except Exception:
-                pass
+            if clear_overlays:
+                try:
+                    composite.SetLabelVolumeID("")
+                except Exception:
+                    pass
+                try:
+                    composite.SetForegroundVolumeID("")
+                except Exception:
+                    pass
             widget.sliceController().fitSliceToBackground()
         except Exception:
             pass
+
+
+def assign_volume_only(volume_node) -> None:
+    """Compare views: background volume only, no segmentation overlays."""
+    _set_compare_background_volume(volume_node, clear_overlays=True)
     hide_all_scene_segmentations()
     set_linked_2d(True)
 
@@ -200,19 +205,7 @@ def assign_volume_and_segmentations(
         slicer.app.processEvents()
     except Exception:
         pass
-    layout = slicer.app.layoutManager()
-    volume_id = volume_node.GetID() if volume_node is not None else ""
-    for tag in TARGET_TAGS + SOURCE_TAGS:
-        widget = layout.sliceWidget(tag)
-        if widget is None:
-            continue
-        try:
-            composite = widget.sliceLogic().GetSliceCompositeNode()
-            if volume_id:
-                composite.SetBackgroundVolumeID(volume_id)
-            widget.sliceController().fitSliceToBackground()
-        except Exception:
-            pass
+    _set_compare_background_volume(volume_node, clear_overlays=False)
     _assign_segmentation_to_tags(target_segmentation, TARGET_TAGS)
     _assign_segmentation_to_tags(source_segmentation, SOURCE_TAGS)
     set_linked_2d(True)
