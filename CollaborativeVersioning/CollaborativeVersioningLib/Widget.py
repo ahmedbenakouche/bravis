@@ -1708,6 +1708,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 source_label,
                 on_prev=self._mergeComparePrev,
                 on_next=self._mergeCompareNext,
+                on_show_3d=self._mergeCompareSetShow3d,
             )
             panel.finished.connect(lambda *_args: self._exitMergeCompare())
             self._merge_compare_session = {
@@ -1717,11 +1718,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "volume_id": volume_node.GetID() if volume_node is not None else "",
                 "segment_names": names,
                 "segment_index": 0,
+                "show_3d": False,
                 "previous_layout": previous_layout,
                 "panel": panel,
             }
             MergeCompare.assign_volume_and_segmentations(
-                volume_node, target_node, source_node
+                volume_node, target_node, source_node, show_3d=False
             )
             if names:
                 self._mergeCompareFocusIndex(0)
@@ -1740,6 +1742,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if previous_layout is not None:
                 MergeCompare.restore_layout(previous_layout)
                 MergeCompare.set_linked_2d(False)
+                MergeCompare.set_linked_3d(False)
                 try:
                     if work_seg is not None:
                         MergeCompare.show_all_segments(work_seg)
@@ -1773,15 +1776,28 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         index = max(0, min(int(index), len(names) - 1))
         session["segment_index"] = index
         name = names[index]
+        show_3d = bool(session.get("show_3d"))
         target, source = self._mergeCompareNodes()
-        MergeCompare.focus_segment_name(target, name)
-        MergeCompare.focus_segment_name(source, name)
+        MergeCompare.focus_segment_name(target, name, show_3d=show_3d)
+        MergeCompare.focus_segment_name(source, name, show_3d=show_3d)
         panel = session.get("panel")
         if panel is not None:
             try:
                 panel.set_segment_label(name, index, len(names))
             except Exception:
                 pass
+
+    def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        session["show_3d"] = bool(checked)
+        target, source = self._mergeCompareNodes()
+        MergeCompare.set_segmentations_show_3d(target, source, bool(checked))
+        # Re-apply current segment so 3D visibility matches Prev/Next focus.
+        names = list(session.get("segment_names") or [])
+        if names:
+            self._mergeCompareFocusIndex(int(session.get("segment_index") or 0))
 
     def _mergeComparePrev(self) -> None:
         session = getattr(self, "_merge_compare_session", None)
@@ -1826,6 +1842,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 pass
         MergeCompare.restore_layout(session.get("previous_layout"))
         MergeCompare.set_linked_2d(False)
+        MergeCompare.set_linked_3d(False)
         self._removeCompareSegmentationNodes()
         work_seg = slicer.mrmlScene.GetNodeByID(session.get("work_seg_id") or "")
         volume = slicer.mrmlScene.GetNodeByID(session.get("volume_id") or "")

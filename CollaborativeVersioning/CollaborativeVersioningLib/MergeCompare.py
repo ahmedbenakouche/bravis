@@ -12,34 +12,62 @@ from CollaborativeVersioningLib.UiStyles import (
     TEXT_MUTED,
 )
 
-# Slice singleton tags: top row = target, bottom row = source.
-TARGET_TAGS = ("R CVCmpT", "G CVCmpT", "Y CVCmpT")
-SOURCE_TAGS = ("R CVCmpS", "G CVCmpS", "Y CVCmpS")
+# Layout: both 3D views on top; each version's Axial|Sagittal|Coronal below.
+TARGET_3D_TAG = "CVCmpT"
+SOURCE_3D_TAG = "CVCmpS"
+TARGET_SLICE_TAGS = ("R CVCmpT", "G CVCmpT", "Y CVCmpT")
+SOURCE_SLICE_TAGS = ("R CVCmpS", "G CVCmpS", "Y CVCmpS")
 _ORIENT = ("Axial", "Sagittal", "Coronal")
 _COLORS = ("#F34A33", "#4AF333", "#F3E833")
 
 
+def _slice_views_xml(slice_tags: tuple[str, ...], prefix: str) -> list[str]:
+    parts = ['    <layout type="horizontal" split="true">']
+    for tag, orient, color in zip(slice_tags, _ORIENT, _COLORS):
+        short = {"Axial": "Ax", "Sagittal": "Sg", "Coronal": "Co"}[orient]
+        label = "%s %s" % (prefix, short)
+        parts.append(
+            "      <item><view class=\"vtkMRMLSliceNode\" singletontag=\"%s\">\n"
+            "        <property name=\"orientation\" action=\"default\">%s</property>\n"
+            "        <property name=\"viewlabel\" action=\"default\">%s</property>\n"
+            "        <property name=\"viewcolor\" action=\"default\">%s</property>\n"
+            "      </view></item>"
+            % (tag, orient, label, color)
+        )
+    parts.append("    </layout>")
+    return parts
+
+
 def layout_xml(target_label: str, source_label: str) -> str:
-    """Two rows: target on top, source below; each Axial | Sagittal | Coronal."""
+    """Top: target 3D | source 3D. Then target 2Ds, then source 2Ds (stacked)."""
     top = str(target_label or "target").strip() or "target"
     bottom = str(source_label or "source").strip() or "source"
     parts = ['<layout type="vertical" split="true">']
-    for tags, prefix in ((TARGET_TAGS, top), (SOURCE_TAGS, bottom)):
-        parts.append("  <item>")
-        parts.append('    <layout type="horizontal" split="true">')
-        for tag, orient, color in zip(tags, _ORIENT, _COLORS):
-            short = {"Axial": "Ax", "Sagittal": "Sg", "Coronal": "Co"}[orient]
-            label = "%s %s" % (prefix, short)
-            parts.append(
-                "      <item><view class=\"vtkMRMLSliceNode\" singletontag=\"%s\">\n"
-                "        <property name=\"orientation\" action=\"default\">%s</property>\n"
-                "        <property name=\"viewlabel\" action=\"default\">%s</property>\n"
-                "        <property name=\"viewcolor\" action=\"default\">%s</property>\n"
-                "      </view></item>"
-                % (tag, orient, label, color)
-            )
-        parts.append("    </layout>")
-        parts.append("  </item>")
+    # 1) Both 3D views side by side.
+    parts.append("  <item>")
+    parts.append('    <layout type="horizontal" split="true">')
+    parts.append(
+        "      <item><view class=\"vtkMRMLViewNode\" singletontag=\"%s\">\n"
+        "        <property name=\"viewlabel\" action=\"default\">%s 3D</property>\n"
+        "      </view></item>"
+        % (TARGET_3D_TAG, top)
+    )
+    parts.append(
+        "      <item><view class=\"vtkMRMLViewNode\" singletontag=\"%s\">\n"
+        "        <property name=\"viewlabel\" action=\"default\">%s 3D</property>\n"
+        "      </view></item>"
+        % (SOURCE_3D_TAG, bottom)
+    )
+    parts.append("    </layout>")
+    parts.append("  </item>")
+    # 2) Target orthogonal slices.
+    parts.append("  <item>")
+    parts.extend(_slice_views_xml(TARGET_SLICE_TAGS, top))
+    parts.append("  </item>")
+    # 3) Source orthogonal slices (below target).
+    parts.append("  <item>")
+    parts.extend(_slice_views_xml(SOURCE_SLICE_TAGS, bottom))
+    parts.append("  </item>")
     parts.append("</layout>")
     return "\n".join(parts)
 
@@ -86,6 +114,49 @@ def set_linked_2d(enabled: bool) -> None:
             pass
 
 
+def set_linked_3d(enabled: bool) -> None:
+    layout = slicer.app.layoutManager()
+    for index in range(int(layout.threeDViewCount)):
+        try:
+            layout.threeDWidget(index).threeDView().mrmlViewNode().SetLinkedControl(
+                bool(enabled)
+            )
+        except Exception:
+            pass
+
+
+def _three_d_view_node(tag: str):
+    """Find a 3D view node by singleton tag / name."""
+    want = str(tag or "").strip()
+    if not want:
+        return None
+    layout = slicer.app.layoutManager()
+    try:
+        widget = layout.threeDWidget(want)
+        if widget is not None:
+            return widget.threeDView().mrmlViewNode()
+    except Exception:
+        pass
+    for index in range(int(layout.threeDViewCount)):
+        try:
+            view_node = layout.threeDWidget(index).threeDView().mrmlViewNode()
+        except Exception:
+            continue
+        if view_node is None:
+            continue
+        name = str(view_node.GetName() or "")
+        singleton = ""
+        getter = getattr(view_node, "GetSingletonTag", None)
+        if callable(getter):
+            try:
+                singleton = str(getter() or "")
+            except Exception:
+                singleton = ""
+        if name == want or singleton == want:
+            return view_node
+    return None
+
+
 def _clear_segmentation_views(segmentation_node) -> None:
     if segmentation_node is None or not hasattr(segmentation_node, "GetDisplayNode"):
         return
@@ -125,7 +196,7 @@ def _set_compare_background_volume(volume_node, *, clear_overlays: bool = False)
     """Set the shared volume on all compare slice views."""
     layout = slicer.app.layoutManager()
     volume_id = volume_node.GetID() if volume_node is not None else ""
-    for tag in TARGET_TAGS + SOURCE_TAGS:
+    for tag in TARGET_SLICE_TAGS + SOURCE_SLICE_TAGS:
         widget = layout.sliceWidget(tag)
         if widget is None:
             continue
@@ -152,9 +223,17 @@ def assign_volume_only(volume_node) -> None:
     _set_compare_background_volume(volume_node, clear_overlays=True)
     hide_all_scene_segmentations()
     set_linked_2d(True)
+    set_linked_3d(True)
 
 
-def _assign_segmentation_to_tags(segmentation_node, tags: tuple[str, ...]) -> None:
+def _assign_segmentation_to_row(
+    segmentation_node,
+    slice_tags: tuple[str, ...],
+    threed_tag: str,
+    *,
+    show_3d: bool = False,
+) -> None:
+    """Show this seg in its 2D slices (+ 3D view id); 3D render only if show_3d."""
     if segmentation_node is None:
         return
     try:
@@ -166,29 +245,36 @@ def _assign_segmentation_to_tags(segmentation_node, tags: tuple[str, ...]) -> No
         return
     layout = slicer.app.layoutManager()
     view_ids = []
-    for tag in tags:
+    for tag in slice_tags:
         widget = layout.sliceWidget(tag)
         if widget is None:
             continue
         view_node = widget.mrmlSliceNode()
         if view_node is not None:
             view_ids.append(view_node.GetID())
+    threed = _three_d_view_node(threed_tag)
+    if threed is not None:
+        view_ids.append(threed.GetID())
     try:
         display.RemoveAllViewNodeIDs()
     except Exception:
         pass
     for view_id in view_ids:
         display.AddViewNodeID(view_id)
-    # Restore flags cleared by hide_all / volume-only mode.
     display.SetVisibility(True)
     try:
         display.SetVisibility2D(True)
     except Exception:
         pass
     try:
-        display.SetVisibility3D(False)
+        display.SetVisibility3D(bool(show_3d))
     except Exception:
         pass
+    if show_3d:
+        try:
+            segmentation_node.CreateClosedSurfaceRepresentation()
+        except Exception:
+            pass
     display.SetVisibility2DFill(True)
     display.SetVisibility2DOutline(True)
     display.SetOpacity2DFill(0.5)
@@ -199,16 +285,47 @@ def assign_volume_and_segmentations(
     volume_node,
     target_segmentation,
     source_segmentation,
+    *,
+    show_3d: bool = False,
 ) -> None:
-    """Put volume in all compare slices; each seg only in its row."""
+    """Put volume in compare slices; each seg in its column (2D; 3D optional)."""
     try:
         slicer.app.processEvents()
     except Exception:
         pass
     _set_compare_background_volume(volume_node, clear_overlays=False)
-    _assign_segmentation_to_tags(target_segmentation, TARGET_TAGS)
-    _assign_segmentation_to_tags(source_segmentation, SOURCE_TAGS)
+    _assign_segmentation_to_row(
+        target_segmentation, TARGET_SLICE_TAGS, TARGET_3D_TAG, show_3d=show_3d
+    )
+    _assign_segmentation_to_row(
+        source_segmentation, SOURCE_SLICE_TAGS, SOURCE_3D_TAG, show_3d=show_3d
+    )
     set_linked_2d(True)
+    set_linked_3d(True)
+
+
+def set_segmentations_show_3d(target_segmentation, source_segmentation, enabled: bool) -> None:
+    """Toggle 3D segment render (closed surface only when enabling)."""
+    enabled = bool(enabled)
+    for node in (target_segmentation, source_segmentation):
+        if node is None:
+            continue
+        try:
+            node.CreateDefaultDisplayNodes()
+        except Exception:
+            pass
+        display = node.GetDisplayNode()
+        if display is None:
+            continue
+        if enabled:
+            try:
+                node.CreateClosedSurfaceRepresentation()
+            except Exception:
+                pass
+        try:
+            display.SetVisibility3D(enabled)
+        except Exception:
+            pass
 
 
 def segment_names(segmentation_node) -> list[str]:
@@ -267,8 +384,34 @@ def _find_segment_id_by_name(segmentation_node, name: str) -> str:
     return ""
 
 
-def focus_segment_name(segmentation_node, name: str) -> bool:
-    """Show only ``name`` on this node; hide all if missing. Returns True if found."""
+def _center_cameras_on_segment(segmentation_node, segment_id: str) -> None:
+    """Point compare 3D cameras at the segment center (Prev/Next navigation)."""
+    if segmentation_node is None or not segment_id:
+        return
+    try:
+        center = segmentation_node.GetSegmentCenterRAS(segment_id)
+    except Exception:
+        return
+    if center is None:
+        return
+    layout = slicer.app.layoutManager()
+    for index in range(int(layout.threeDViewCount)):
+        try:
+            view_node = layout.threeDWidget(index).threeDView().mrmlViewNode()
+            camera = slicer.modules.cameras.logic().GetViewActiveCameraNode(view_node)
+            if camera is not None:
+                camera.SetFocalPoint(center)
+        except Exception:
+            continue
+
+
+def focus_segment_name(
+    segmentation_node,
+    name: str,
+    *,
+    show_3d: bool = False,
+) -> bool:
+    """Show only ``name`` on this node; 3D only if show_3d. Returns True if found."""
     if segmentation_node is None:
         return False
     try:
@@ -281,6 +424,7 @@ def focus_segment_name(segmentation_node, name: str) -> bool:
     try:
         display.SetVisibility(True)
         display.SetVisibility2D(True)
+        display.SetVisibility3D(bool(show_3d))
     except Exception:
         pass
     found_id = _find_segment_id_by_name(segmentation_node, name)
@@ -293,8 +437,11 @@ def focus_segment_name(segmentation_node, name: str) -> bool:
         display.SetSegmentOpacity2DFill(found_id, 1.0)
         display.SetSegmentVisibility2DFill(found_id, True)
         display.SetSegmentVisibility2DOutline(found_id, True)
+        display.SetSegmentVisibility3D(found_id, bool(show_3d))
     except Exception:
         pass
+    if show_3d:
+        _center_cameras_on_segment(segmentation_node, found_id)
     return True
 
 
@@ -308,7 +455,7 @@ def show_all_segments(segmentation_node) -> None:
 
 
 class MergeComparePanel(qt.QDialog):
-    """Non-modal bar: segment Prev/Next + Quit Compare."""
+    """Non-modal bar: segment Prev/Next, optional Show 3D, Quit Compare."""
 
     def __init__(
         self,
@@ -317,6 +464,7 @@ class MergeComparePanel(qt.QDialog):
         source_label: str,
         on_prev,
         on_next,
+        on_show_3d=None,
     ) -> None:
         qt.QDialog.__init__(self, parent)
         self.setWindowTitle("Merge Compare")
@@ -325,7 +473,8 @@ class MergeComparePanel(qt.QDialog):
         layout = qt.QVBoxLayout(self)
         layout.setSpacing(8)
         header = qt.QLabel(
-            "Top: <b>%s</b><br>Bottom: <b>%s</b>"
+            "Target: <b>%s</b> (left 3D, upper 2D)<br>"
+            "Source: <b>%s</b> (right 3D, lower 2D)"
             % (
                 html.escape(str(target_label or "")),
                 html.escape(str(source_label or "")),
@@ -349,6 +498,16 @@ class MergeComparePanel(qt.QDialog):
         row.addWidget(self.prevButton)
         row.addWidget(self.nextButton)
         layout.addLayout(row)
+
+        self.show3dCheck = qt.QCheckBox("Show 3D")
+        self.show3dCheck.setChecked(False)
+        self.show3dCheck.setToolTip(
+            "Build and show closed-surface 3D for the current segment "
+            "(off by default — faster)."
+        )
+        if callable(on_show_3d):
+            self.show3dCheck.toggled.connect(on_show_3d)
+        layout.addWidget(self.show3dCheck)
 
         self.quitButton = qt.QPushButton("Quit Compare")
         self.quitButton.setStyleSheet(BTN_SAVE_VERSION)
