@@ -1675,35 +1675,48 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             restore_lane = restore_lane or "main"
         volume_node = self._selectorCurrentNode("volumeSelector")
         work_seg = self._selectorCurrentNode("segmentationSelector")
-        target_node = None
-        source_node = None
-        self._openProgress("Compare", "Loading %s…" % target_label)
+        # Reuse the already-loaded work seg when it IS the tip we need (no clone/reload).
+        reuse_target = bool(work_seg is not None and restore_vid and restore_vid == target_vid)
+        reuse_source = bool(work_seg is not None and restore_vid and restore_vid == source_vid)
+        target_node = work_seg if reuse_target else None
+        source_node = work_seg if reuse_source else None
+        need_checkout_restore = False
+        opened_progress = False
         try:
-            self._updateProgress("Loading %s…" % target_label)
-            target_node = self._loadCompareSegmentationAtVersion(target_vid)
-            self._updateProgress("Loading %s…" % source_label)
-            source_node = self._loadCompareSegmentationAtVersion(source_vid)
-            # Work seg stayed in the scene — only put Git/files back on the user's tip.
-            self._updateProgress("Restoring your version…")
-            if restore_sha:
+            if not reuse_target or not reuse_source:
+                first = target_label if not reuse_target else source_label
+                self._openProgress("Compare", "Loading %s…" % first)
+                opened_progress = True
+            if not reuse_target:
+                self._updateProgress("Loading %s…" % target_label)
+                target_node = self._loadCompareSegmentationAtVersion(target_vid)
+                need_checkout_restore = True
+            if not reuse_source:
+                self._updateProgress("Loading %s…" % source_label)
+                source_node = self._loadCompareSegmentationAtVersion(source_vid)
+                need_checkout_restore = True
+            # After any compare checkout, put Git/files back on the user's tip.
+            if need_checkout_restore and restore_sha:
+                self._updateProgress("Restoring your version…")
                 checkout_local_version(local_path, restore_sha, restore_lane)
             if target_node is None or source_node is None:
                 raise RuntimeError("Could not load both segmentations for compare.")
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            self._closeProgress()
-            # Best-effort restore worktree + cleanup of partial compare nodes.
+            if opened_progress:
+                self._closeProgress()
             try:
-                if restore_sha:
+                if restore_sha and need_checkout_restore:
                     checkout_local_version(local_path, restore_sha, restore_lane)
             except Exception:
                 pass
             self._removeCompareSegmentationNodes()
             self._showGithubError(error, box=True)
             return
-        self._closeProgress()
+        if opened_progress:
+            self._closeProgress()
 
-        # Hide the working segmentation while compare views are active.
-        if work_seg is not None:
+        # Hide work seg only when it is NOT one of the compare sides.
+        if work_seg is not None and work_seg not in (target_node, source_node):
             try:
                 display = work_seg.GetDisplayNode()
                 if display is not None:
@@ -1823,6 +1836,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             volume = self._selectorCurrentNode("volumeSelector")
         if work_seg is not None:
             try:
+                MergeCompare.show_all_segments(work_seg)
                 display = work_seg.GetDisplayNode()
                 if display is not None:
                     display.SetVisibility(True)
