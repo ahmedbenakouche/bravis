@@ -1,6 +1,7 @@
-# BRAVIS
-
-Extension **3D Slicer** pour versionner et partager des annotations en équipe.
+<center>
+  <img src="docs/images/logo.jpg" alt="BRAVIS — BRAin-atlas Versioning Interactive System" width="680" />
+  <p>Extension <strong>3D Slicer</strong> pour versionner et partager des annotations en équipe.</p>
+</center>
 
 ---
 
