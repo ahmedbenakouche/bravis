@@ -121,7 +121,14 @@ Tu peux Switch même sur un nœud avec 🔒 (consultation). Seuls Save / Share s
 
 ## Merge — quand le bouton apparaît
 
-Le bouton **Merge** est dans les **détails** d’une version (pas un bouton global). Règles actuelles :
+Le bouton **Merge** est dans les **détails** d’une version (pas un bouton global). Tu peux d’abord **Compare** les deux tips (6 vues 2D/3D synchronisées) avant de fusionner :
+
+<p align="center">
+  <a href="docs/videos/video2.mp4"><img src="docs/images/video2-poster.jpg" alt="Démo Merge Compare — 6 vues synchronisées" width="720" /></a><br/>
+  <a href="docs/videos/video2.mp4"><strong>▶ Voir la vidéo</strong></a> — Merge → Compare (layout côte à côte, vues synchronisées)
+</p>
+
+Règles actuelles :
 
 ### Branche DIY “plate” (ex. `sos`, sans tâche)
 
@@ -203,6 +210,11 @@ Les notifications aident : le senior est guidé vers le 🔵 ; les autres junior
 ## Compare with shared
 
 Quand le projet distant a bougé (ou que Share / Merge refuse parce que tu n’es pas à jour) :
+
+<p align="center">
+  <a href="docs/videos/video1.mp4"><img src="docs/images/video1-poster.jpg" alt="Démo Compare with shared" width="720" /></a><br/>
+  <a href="docs/videos/video1.mp4"><strong>▶ Voir la vidéo</strong></a> — Local en retard : Compare with shared (local, distant, résultat)
+</p>
 
 1. Ouvre **Compare with shared** (souvent via la cloche)  
 2. Tu vois ton côté, le shared, et un aperçu selon le choix  
