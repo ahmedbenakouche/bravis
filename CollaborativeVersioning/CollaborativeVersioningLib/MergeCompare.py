@@ -38,7 +38,8 @@ CUBE_DIFF_SELECTED_COLOR = (0.15, 0.95, 1.0)  # cyan = selected cube
 CUBE_DIFF_LINE_WIDTH = 2.0
 CUBE_DIFF_SELECTED_LINE_WIDTH = 4.0
 CUBE_DIFF_MODEL_NAME = "CVCompare_CubeDiffs"
-CUBE_DIFF_SELECTED_MODEL_NAME = "CVCompare_CubeDiffSelected"
+CUBE_DIFF_CHOSEN_UPPER_NAME = "CVCompare_CubeDiffChosenUpper"
+CUBE_DIFF_CHOSEN_LOWER_NAME = "CVCompare_CubeDiffChosenLower"
 
 
 def _geometry_ijk_to_ras_matrix(geometry: dict | None) -> vtk.vtkMatrix4x4:
@@ -182,8 +183,9 @@ class CubeDiffOverlay:
         self._ras_to_ijk: vtk.vtkMatrix4x4 | None = None
         self._enabled = True
         self._model_node_id = ""
-        self._chosen_model_id = ""
-        self._chosen_keys: set[str] = set()
+        self._chosen_upper_id = ""
+        self._chosen_lower_id = ""
+        self._choices: dict[str, str] = {}
         self._click_observers: list[tuple] = []
         self._click_callback = None
 
@@ -232,14 +234,19 @@ class CubeDiffOverlay:
             poly,
             CUBE_DIFF_COLOR,
             CUBE_DIFF_LINE_WIDTH,
+            TARGET_SLICE_TAGS + SOURCE_SLICE_TAGS,
         )
         self._install_click_observers()
         self._apply_visibility()
-        self.set_chosen_keys(self._chosen_keys)
+        self.set_choices(self._choices)
 
     def stop(self) -> None:
         self._remove_click_observers()
-        for node_id in (self._model_node_id, self._chosen_model_id):
+        for node_id in (
+            self._model_node_id,
+            self._chosen_upper_id,
+            self._chosen_lower_id,
+        ):
             if not node_id:
                 continue
             node = slicer.mrmlScene.GetNodeByID(str(node_id))
@@ -249,7 +256,8 @@ class CubeDiffOverlay:
                 except Exception:
                     pass
         self._model_node_id = ""
-        self._chosen_model_id = ""
+        self._chosen_upper_id = ""
+        self._chosen_lower_id = ""
         self._remove_named_models()
 
     def set_enabled(self, enabled: bool) -> None:
@@ -259,32 +267,52 @@ class CubeDiffOverlay:
             return
         self._apply_visibility()
         if not self._enabled:
-            self._clear_chosen_model()
+            self._clear_chosen_models()
         else:
-            self.set_chosen_keys(self._chosen_keys)
+            self.set_choices(self._choices)
 
-    def set_chosen_keys(self, keys) -> None:
-        """Cyan outline for cubes already chosen (will be taken on Apply)."""
-        self._chosen_keys = {str(k) for k in (keys or []) if str(k or "").strip()}
-        self._clear_chosen_model()
-        if not self._enabled or not self._chosen_keys:
+    def set_choices(self, choices: dict[str, str] | None) -> None:
+        """Cyan only on the side that was chosen (upper views vs lower views)."""
+        cleaned: dict[str, str] = {}
+        for key, side in dict(choices or {}).items():
+            k = str(key or "").strip()
+            s = str(side or "").strip().lower()
+            if k and s in ("upper", "lower"):
+                cleaned[k] = s
+        self._choices = cleaned
+        self._clear_chosen_models()
+        if not self._enabled or not self._choices:
             return
-        cubes = [
+        upper_cubes = [
             self._cube_by_key[k]
-            for k in self._chosen_keys
-            if k in self._cube_by_key
+            for k, s in self._choices.items()
+            if s == "upper" and k in self._cube_by_key
         ]
-        if not cubes:
-            return
-        poly = self._build_wireframe_polydata(cubes)
-        if poly is None or int(poly.GetNumberOfPoints()) <= 0:
-            return
-        self._chosen_model_id = self._add_model(
-            CUBE_DIFF_SELECTED_MODEL_NAME,
-            poly,
-            CUBE_DIFF_SELECTED_COLOR,
-            CUBE_DIFF_SELECTED_LINE_WIDTH,
-        )
+        lower_cubes = [
+            self._cube_by_key[k]
+            for k, s in self._choices.items()
+            if s == "lower" and k in self._cube_by_key
+        ]
+        if upper_cubes:
+            poly = self._build_wireframe_polydata(upper_cubes)
+            if poly is not None and int(poly.GetNumberOfPoints()) > 0:
+                self._chosen_upper_id = self._add_model(
+                    CUBE_DIFF_CHOSEN_UPPER_NAME,
+                    poly,
+                    CUBE_DIFF_SELECTED_COLOR,
+                    CUBE_DIFF_SELECTED_LINE_WIDTH,
+                    TARGET_SLICE_TAGS,
+                )
+        if lower_cubes:
+            poly = self._build_wireframe_polydata(lower_cubes)
+            if poly is not None and int(poly.GetNumberOfPoints()) > 0:
+                self._chosen_lower_id = self._add_model(
+                    CUBE_DIFF_CHOSEN_LOWER_NAME,
+                    poly,
+                    CUBE_DIFF_SELECTED_COLOR,
+                    CUBE_DIFF_SELECTED_LINE_WIDTH,
+                    SOURCE_SLICE_TAGS,
+                )
 
     def pick_key_at_ras(self, ras) -> str:
         """Return changed-cube key containing this RAS point, else ''."""
@@ -386,7 +414,11 @@ class CubeDiffOverlay:
             pass
 
     def _apply_visibility(self) -> None:
-        for node_id in (self._model_node_id, self._chosen_model_id):
+        for node_id in (
+            self._model_node_id,
+            self._chosen_upper_id,
+            self._chosen_lower_id,
+        ):
             node = slicer.mrmlScene.GetNodeByID(str(node_id or ""))
             if node is None:
                 continue
@@ -399,19 +431,20 @@ class CubeDiffOverlay:
             except Exception:
                 pass
 
-    def _clear_chosen_model(self) -> None:
-        node_id = str(self._chosen_model_id or "")
-        self._chosen_model_id = ""
-        if not node_id:
-            return
-        node = slicer.mrmlScene.GetNodeByID(node_id)
-        if node is not None:
-            try:
-                slicer.mrmlScene.RemoveNode(node)
-            except Exception:
-                pass
+    def _clear_chosen_models(self) -> None:
+        for attr in ("_chosen_upper_id", "_chosen_lower_id"):
+            node_id = str(getattr(self, attr, "") or "")
+            setattr(self, attr, "")
+            if not node_id:
+                continue
+            node = slicer.mrmlScene.GetNodeByID(node_id)
+            if node is not None:
+                try:
+                    slicer.mrmlScene.RemoveNode(node)
+                except Exception:
+                    pass
 
-    def _add_model(self, name: str, poly, color, thickness) -> str:
+    def _add_model(self, name: str, poly, color, thickness, slice_tags) -> str:
         model = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
         model.SetName(name)
         model.SetAndObservePolyData(poly)
@@ -442,7 +475,7 @@ class CubeDiffOverlay:
                     pass
                 display.RemoveAllViewNodeIDs()
                 layout = slicer.app.layoutManager()
-                for tag in TARGET_SLICE_TAGS + SOURCE_SLICE_TAGS:
+                for tag in slice_tags:
                     widget = layout.sliceWidget(tag)
                     if widget is None:
                         continue
@@ -507,7 +540,12 @@ class CubeDiffOverlay:
     @staticmethod
     def _remove_named_models() -> None:
         scene = slicer.mrmlScene
-        names = {CUBE_DIFF_MODEL_NAME, CUBE_DIFF_SELECTED_MODEL_NAME}
+        names = {
+            CUBE_DIFF_MODEL_NAME,
+            CUBE_DIFF_CHOSEN_UPPER_NAME,
+            CUBE_DIFF_CHOSEN_LOWER_NAME,
+            "CVCompare_CubeDiffSelected",  # legacy name from earlier builds
+        }
         for index in range(scene.GetNumberOfNodesByClass("vtkMRMLModelNode") - 1, -1, -1):
             node = scene.GetNthNodeByClass(index, "vtkMRMLModelNode")
             if node is None:
@@ -1331,15 +1369,14 @@ class MergeComparePanel(qt.QWidget):
         self.showCubeDiffsCheck = qt.QCheckBox("Show cube diffs")
         self.showCubeDiffsCheck.setChecked(True)
         self.showCubeDiffsCheck.setToolTip(
-            "Outline changed cubes on 2D views. "
-            "Click a cube on upper views = keep upper; lower views = keep lower."
+            "Outline changed cubes on the 2D Compare views."
         )
         layout.addWidget(self.showCubeDiffsCheck)
 
         self.cubeGuideLabel = qt.QLabel(
-            "Click the cube you want to keep on the 2D views "
-            "(upper = keep upper, lower = keep lower). "
-            "Chosen cubes turn cyan — those are the ones taken on Apply merge."
+            "Click the cube you want to keep on the 2D views. "
+            "Chosen cubes turn cyan on that side — those are taken on Apply merge. "
+            "Click again on the same side to clear."
         )
         self.cubeGuideLabel.setWordWrap(True)
         self.cubeGuideLabel.setStyleSheet("color: %s; font-size: 11px;" % muted)

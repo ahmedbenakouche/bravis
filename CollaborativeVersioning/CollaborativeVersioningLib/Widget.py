@@ -2007,7 +2007,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 logging.exception("Could not toggle cube-diff overlay")
 
     def _mergeCompareCubeClicked(self, key: str, side: str) -> None:
-        """Upper 2D click = keep upper; lower 2D click = keep lower → cyan."""
+        """Click side to choose; re-click same side to clear. Cyan only on that side."""
         session = getattr(self, "_merge_compare_session", None)
         if not session:
             return
@@ -2017,18 +2017,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not key or not choose:
             return
         choices = dict(session.get("cube_choices") or {})
-        choices[key] = choose
+        previous = str(choices.get(key) or "").strip().lower()
+        if previous == choose:
+            choices.pop(key, None)
+            action = "cleared"
+        else:
+            choices[key] = choose
+            action = "keep %s" % choose
         session["cube_choices"] = choices
         overlay = session.get("cube_overlay")
         if overlay is not None:
             try:
-                overlay.set_chosen_keys(
-                    [
-                        k
-                        for k, v in choices.items()
-                        if str(v or "").strip().lower() in ("upper", "lower")
-                    ]
-                )
+                overlay.set_choices(choices)
             except Exception:
                 logging.exception("Could not highlight chosen cubes")
         total = len(list(session.get("cube_rows") or []))
@@ -2037,7 +2037,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             for v in choices.values()
             if str(v or "").strip().lower() in ("upper", "lower")
         )
-        self._appendFeed("Cube %s → keep %s (%d/%d)." % (key, choose, chosen, total))
+        self._appendFeed("Cube %s → %s (%d/%d)." % (key, action, chosen, total))
 
     def _mergeCompareApply(self) -> None:
         session = getattr(self, "_merge_compare_session", None)
