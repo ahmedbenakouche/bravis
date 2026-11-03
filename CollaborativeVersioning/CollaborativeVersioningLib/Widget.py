@@ -1779,18 +1779,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._merge_compare_session = {
                 "source_lane": source_lane,
                 "target_lane": target_lane,
-                "source_vid": source_vid,
-                "target_vid": target_vid,
                 "target_node_id": target_node.GetID(),
                 "source_node_id": source_node.GetID(),
                 "work_seg_id": work_seg.GetID() if work_seg is not None else "",
                 "volume_id": volume_node.GetID() if volume_node is not None else "",
                 "segment_names": names,
-                "segment_rows": rows,
                 "segment_index": 0,
                 "show_3d": False,
                 "show_all": False,
-                "show_cube_diffs": show_cube_diffs,
                 "cube_overlay": cube_overlay,
                 "cube_diff_count": cube_count,
                 "cube_rows": cube_rows,
@@ -2003,7 +1999,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         session = getattr(self, "_merge_compare_session", None)
         if not session:
             return
-        session["show_cube_diffs"] = bool(checked)
         overlay = session.get("cube_overlay")
         if overlay is not None:
             try:
@@ -2087,7 +2082,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         upper_n = sum(1 for v in choices.values() if v == "upper")
         lower_n = sum(1 for v in choices.values() if v == "lower")
-        session["merged_manifest"] = merged
         full_name = self._currentProjectName() or ""
         pr_number = None
         if target_lane == "main" and full_name:

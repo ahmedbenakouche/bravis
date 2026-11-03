@@ -190,10 +190,6 @@ class CubeDiffOverlay:
         self._click_callback = None
 
     @property
-    def cube_count(self) -> int:
-        return len(self._cubes)
-
-    @property
     def cubes(self) -> list[dict]:
         return list(self._cubes)
 
@@ -1003,13 +999,6 @@ def segment_names(segmentation_node) -> list[str]:
         if name:
             names.append(name)
     return names
-
-
-def union_segment_names(target_node, source_node) -> list[str]:
-    return [
-        row["name"]
-        for row in segment_presence_rows(target_node, source_node, "", "")
-    ]
 
 
 def segment_presence_rows(
