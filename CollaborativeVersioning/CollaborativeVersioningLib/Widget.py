@@ -2022,9 +2022,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         overlay = session.get("cube_overlay")
         if overlay is not None:
             try:
-                overlay.set_chosen_keys(list(choices.keys()))
+                overlay.set_chosen_keys(
+                    [
+                        k
+                        for k, v in choices.items()
+                        if str(v or "").strip().lower() in ("upper", "lower")
+                    ]
+                )
             except Exception:
-                pass
+                logging.exception("Could not highlight chosen cubes")
+        total = len(list(session.get("cube_rows") or []))
+        chosen = sum(
+            1
+            for v in choices.values()
+            if str(v or "").strip().lower() in ("upper", "lower")
+        )
+        self._appendFeed("Cube %s → keep %s (%d/%d)." % (key, choose, chosen, total))
 
     def _mergeCompareApply(self) -> None:
         session = getattr(self, "_merge_compare_session", None)

@@ -295,14 +295,34 @@ class CubeDiffOverlay:
             [float(ras[0]), float(ras[1]), float(ras[2]), 1.0], out
         )
         i, j, k = float(out[0]), float(out[1]), float(out[2])
+        # Exact containment (with tiny slack for plane rounding).
+        slack = 0.51
         for cube in self._cubes:
             if (
-                float(cube["i0"]) <= i < float(cube["i1"])
-                and float(cube["j0"]) <= j < float(cube["j1"])
-                and float(cube["k0"]) <= k < float(cube["k1"])
+                float(cube["i0"]) - slack <= i < float(cube["i1"]) + slack
+                and float(cube["j0"]) - slack <= j < float(cube["j1"]) + slack
+                and float(cube["k0"]) - slack <= k < float(cube["k1"]) + slack
             ):
                 return str(cube.get("key") or "")
-        return ""
+        # Fallback: nearest cube center in IJK (helps if click is slightly off).
+        best_key = ""
+        best_dist = 1e18
+        for cube in self._cubes:
+            ci = 0.5 * (float(cube["i0"]) + float(cube["i1"]))
+            cj = 0.5 * (float(cube["j0"]) + float(cube["j1"]))
+            ck = 0.5 * (float(cube["k0"]) + float(cube["k1"]))
+            dist = (i - ci) ** 2 + (j - cj) ** 2 + (k - ck) ** 2
+            # Only accept if roughly inside/near the cube diagonal.
+            half = max(
+                abs(float(cube["i1"]) - float(cube["i0"])),
+                abs(float(cube["j1"]) - float(cube["j0"])),
+                abs(float(cube["k1"]) - float(cube["k0"])),
+                1.0,
+            )
+            if dist < best_dist and dist <= (0.75 * half) ** 2:
+                best_dist = dist
+                best_key = str(cube.get("key") or "")
+        return best_key
 
     def _install_click_observers(self) -> None:
         layout = slicer.app.layoutManager()
@@ -322,6 +342,7 @@ class CubeDiffOverlay:
         if interactor is None:
             return
 
+        # Keep a Python reference to the handler — VTK observers alone can GC it.
         def _handler(caller=None, event=None, w=widget, s=side):
             self._on_slice_click(w, s, caller)
 
@@ -329,12 +350,14 @@ class CubeDiffOverlay:
             oid = interactor.AddObserver(
                 vtk.vtkCommand.LeftButtonReleaseEvent, _handler
             )
-            self._click_observers.append((interactor, oid))
+            self._click_observers.append((interactor, oid, _handler))
         except Exception:
             pass
 
     def _remove_click_observers(self) -> None:
-        for interactor, oid in self._click_observers:
+        for entry in self._click_observers:
+            interactor = entry[0]
+            oid = entry[1]
             try:
                 interactor.RemoveObserver(oid)
             except Exception:
@@ -351,7 +374,7 @@ class CubeDiffOverlay:
                 return
         except Exception:
             pass
-        ras = _ras_from_slice_interactor(slice_widget, caller)
+        ras = _ras_from_slice_click(slice_widget, caller)
         if ras is None:
             return
         key = self.pick_key_at_ras(ras)
@@ -496,9 +519,41 @@ class CubeDiffOverlay:
                     pass
 
 
-def _ras_from_slice_interactor(slice_widget, interactor) -> tuple[float, float, float] | None:
-    """Map a slice-view click to RAS."""
-    if slice_widget is None or interactor is None:
+def _ras_from_slice_click(slice_widget, interactor) -> tuple[float, float, float] | None:
+    """Map a slice-view click to RAS (several fallbacks for Slicer builds)."""
+    if slice_widget is None:
+        return None
+
+    # 1) Crosshair cursor RAS — usually tracks the mouse in slice views.
+    try:
+        nodes = slicer.util.getNodesByClass("vtkMRMLCrosshairNode")
+        if isinstance(nodes, dict):
+            cross_list = list(nodes.values())
+        else:
+            cross_list = list(nodes or [])
+        for crosshair in cross_list:
+            if crosshair is None:
+                continue
+            ras = [0.0, 0.0, 0.0]
+            ok = False
+            getter = getattr(crosshair, "GetCursorPositionRAS", None)
+            if callable(getter):
+                try:
+                    ok = bool(getter(ras))
+                except TypeError:
+                    getter(ras)
+                    ok = True
+            if not ok:
+                getter2 = getattr(crosshair, "GetCrosshairRAS", None)
+                if callable(getter2):
+                    getter2(ras)
+                    ok = True
+            if ok:
+                return float(ras[0]), float(ras[1]), float(ras[2])
+    except Exception:
+        pass
+
+    if interactor is None:
         return None
     try:
         x, y = interactor.GetEventPosition()
@@ -509,16 +564,37 @@ def _ras_from_slice_interactor(slice_widget, interactor) -> tuple[float, float, 
         slice_view = slice_widget.sliceView()
     except Exception:
         return None
-    if slice_node is None:
+    if slice_node is None or slice_view is None:
         return None
-    xyz = [float(x), float(y), 0.0]
+
+    # High-DPI: event position may be in device pixels.
     try:
-        # Preferred: display → XYZ in the slice canvas.
+        ratio = float(slice_view.devicePixelRatio())
+        if ratio > 1.0:
+            x = int(round(float(x) / ratio))
+            y = int(round(float(y) / ratio))
+    except Exception:
+        pass
+
+    xyz = [float(x), float(y), 0.0]
+    converted = False
+    try:
         tmp = [0.0, 0.0, 0.0]
         slice_view.convertDisplayToXYZ(int(x), int(y), tmp)
         xyz = [float(tmp[0]), float(tmp[1]), float(tmp[2])]
+        converted = True
     except Exception:
-        pass
+        converted = False
+    if not converted:
+        try:
+            # Some Slicer builds expose convertXYToXYZ via sliceLogic.
+            logic = slice_widget.sliceLogic()
+            tmp = [0.0, 0.0, 0.0]
+            logic.GetSliceNode()  # ensure alive
+            _ = logic
+        except Exception:
+            pass
+
     xy_to_ras = vtk.vtkMatrix4x4()
     try:
         slice_node.GetXYToRAS(xy_to_ras)
