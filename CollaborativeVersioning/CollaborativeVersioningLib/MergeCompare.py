@@ -1260,10 +1260,6 @@ class MergeComparePanel(qt.QWidget):
         )
         layout.addWidget(self.showCubeDiffsCheck)
 
-        self.cubeDiffsBox = qt.QWidget()
-        cube_box = qt.QVBoxLayout(self.cubeDiffsBox)
-        cube_box.setContentsMargins(0, 4, 0, 0)
-        cube_box.setSpacing(6)
         self.cubeGuideLabel = qt.QLabel(
             "Click the cube you want to keep on the 2D views "
             "(upper = keep upper, lower = keep lower). "
@@ -1271,15 +1267,16 @@ class MergeComparePanel(qt.QWidget):
         )
         self.cubeGuideLabel.setWordWrap(True)
         self.cubeGuideLabel.setStyleSheet("color: %s; font-size: 11px;" % muted)
-        cube_box.addWidget(self.cubeGuideLabel)
+        layout.addWidget(self.cubeGuideLabel)
+
         self.applyMergeButton = qt.QPushButton("Apply merge")
         self.applyMergeButton.setToolTip(
             "Build the merged tip from the cyan (chosen) cubes."
         )
         self.applyMergeButton.setStyleSheet(BTN_CREATE or "")
         self.applyMergeButton.setMinimumHeight(32)
-        cube_box.addWidget(self.applyMergeButton)
-        layout.addWidget(self.cubeDiffsBox)
+        self.applyMergeButton.setEnabled(True)
+        layout.addWidget(self.applyMergeButton)
 
         self.quitButton = qt.QPushButton("Quit")
         self.quitButton.setToolTip("Leave Compare and restore the normal layout")
@@ -1293,7 +1290,6 @@ class MergeComparePanel(qt.QWidget):
             "only": red,
             "muted": muted,
         }
-        self.set_cube_diffs_visible(True)
 
     def set_version_labels(self, target_label: str, source_label: str) -> None:
         muted = self._status_colors["muted"]
@@ -1363,12 +1359,6 @@ class MergeComparePanel(qt.QWidget):
                 "color: %s; font-size: 11px;" % self._status_colors["only"]
             )
 
-    def set_cube_diffs_visible(self, visible: bool) -> None:
-        visible = bool(visible)
-        self.cubeDiffsBox.setVisible(visible)
-        # Apply merge is only active while Show cube diffs is on.
-        self.applyMergeButton.setEnabled(visible)
-
     def reset_controls(self) -> None:
         self.showAllCheck.blockSignals(True)
         self.showCubeDiffsCheck.blockSignals(True)
@@ -1391,4 +1381,4 @@ class MergeComparePanel(qt.QWidget):
         self.statusLabel.setText("")
         self.upperVersionLabel.setText("—")
         self.lowerVersionLabel.setText("—")
-        self.set_cube_diffs_visible(True)
+        self.applyMergeButton.setEnabled(True)

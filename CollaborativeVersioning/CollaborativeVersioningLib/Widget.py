@@ -1775,8 +1775,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
             cube_rows = list(cube_overlay.cubes)
             cube_choices: dict[str, str] = {}
-            if panel is not None:
-                panel.set_cube_diffs_visible(show_cube_diffs)
             self._merge_compare_session = {
                 "target_node_id": target_node.GetID(),
                 "source_node_id": source_node.GetID(),
@@ -2001,12 +1999,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not session:
             return
         session["show_cube_diffs"] = bool(checked)
-        panel = session.get("panel") or getattr(self, "comparePanel", None)
-        if panel is not None:
-            try:
-                panel.set_cube_diffs_visible(bool(checked))
-            except Exception:
-                pass
         overlay = session.get("cube_overlay")
         if overlay is not None:
             try:
