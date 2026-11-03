@@ -91,6 +91,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     review_parent_lane_already_merged_upward,
     is_nested_lane_path,
     merge_nested_lane_into_parent,
+    merge_cube_manifest_onto_lane,
     parent_lane_slug,
     delete_local_unshared_version,
     sha_is_shared_on_remote,
@@ -1776,6 +1777,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             cube_rows = list(cube_overlay.cubes)
             cube_choices: dict[str, str] = {}
             self._merge_compare_session = {
+                "source_lane": source_lane,
+                "target_lane": target_lane,
+                "source_vid": source_vid,
+                "target_vid": target_vid,
                 "target_node_id": target_node.GetID(),
                 "source_node_id": source_node.GetID(),
                 "work_seg_id": work_seg.GetID() if work_seg is not None else "",
@@ -2069,14 +2074,98 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if merged is None:
             self._appendFeed("Apply merge: could not build merged manifest.", error=True)
             return
-        session["merged_manifest"] = merged
+        source_lane = str(session.get("source_lane") or "").strip()
+        target_lane = str(session.get("target_lane") or "").strip() or "main"
+        if self._isMainHistoryLane(target_lane):
+            target_lane = "main"
+        if not source_lane:
+            self._appendFeed("Apply merge: missing source branch.", error=True)
+            return
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
+            self._appendFeed("Open the project first.", error=True)
+            return
         upper_n = sum(1 for v in choices.values() if v == "upper")
         lower_n = sum(1 for v in choices.values() if v == "lower")
+        session["merged_manifest"] = merged
+        full_name = self._currentProjectName() or ""
+        pr_number = None
+        if target_lane == "main" and full_name:
+            try:
+                req = find_open_review_request_for_branch(full_name, source_lane)
+            except Exception:
+                req = None
+            if isinstance(req, dict):
+                pr_number = req.get("number")
+        me = (self._githubLogin() or "").strip()
+        # Leave Compare before checkouts so temp segs/layout are gone.
+        self._exitMergeCompare(feed_message=None)
+        self._openProgress("Merge", "Applying cube merge…")
+        try:
+            local_freeze = copy.deepcopy(
+                getattr(self, "_project_history_bundle", None)
+            )
+            ensure_can_share_with_shared(
+                local_path, local_history=local_freeze, action="merge"
+            )
+            self._updateProgress("Writing merged cubes onto %s…" % target_lane)
+            merge_cube_manifest_onto_lane(
+                local_path,
+                source_lane,
+                target_lane,
+                merged,
+                full_name=full_name,
+                pr_number=pr_number,
+            )
+            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
+            self._updateProgress("Updating version history…")
+            history = read_project_history(local_path)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
+            self._closeProgress()
+            self._showGithubError(error, box=True)
+            return
+        self._closeProgress()
+        unshared = self._historyHasUnsharedVersion(history)
+        self._suppress_dirty += 1
+        self._suppress_asset_ui_updates += 1
+        try:
+            self._applyProjectHistoryBundle(history)
+            self._clearChangeFlags()
+            self._unshared_version = unshared
+            self._syncAssetDataObservers()
+        finally:
+            self._suppress_asset_ui_updates -= 1
+            self._suppress_dirty -= 1
+        self._refreshUiState()
+        self._clearChangeFlags()
+        self._unshared_version = unshared
+        self._updateVersionActionButtons()
+        self._armLoadSettle()
+        if target_lane == "main":
+            task = self._activeTaskForBranchSlug(source_lane)
+            if task is not None and str(task.get("status") or "") != "accepted":
+                self._markTaskAccepted(task)
+            else:
+                self._recordActivity(
+                    full_name,
+                    "accept",
+                    "%s merged cubes from %s onto main."
+                    % (me or "Someone", source_lane),
+                )
+        else:
+            self._recordActivity(
+                full_name,
+                "accept",
+                "%s merged cubes from %s onto %s."
+                % (me or "Someone", source_lane, target_lane),
+            )
         self._appendFeed(
-            "Apply merge ready: %d cube(s) (%d upper, %d lower). "
-            "Tip write/publish will be wired next."
-            % (len(cubes), upper_n, lower_n)
+            "Applied cube merge: %d cube(s) (%d upper, %d lower) onto %s."
+            % (len(cubes), upper_n, lower_n, target_lane)
         )
+        self._updateActiveVersionIndicators()
+        self._updateTaskButtonUi()
+        self._refreshOpenVersionTreeIfNeeded()
 
     def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
         session = getattr(self, "_merge_compare_session", None)
@@ -2117,7 +2206,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             index = 0
         self._mergeCompareFocusIndex(index)
 
-    def _exitMergeCompare(self) -> None:
+    def _exitMergeCompare(self, *, feed_message: str | None = "Quit Compare.") -> None:
         session = getattr(self, "_merge_compare_session", None)
         if not session:
             return
@@ -2179,7 +2268,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 DataManager().present_in_slice_views(volume, work_seg)
             except Exception:
                 logging.exception("Could not restore slice views after Compare")
-            self._appendFeed("Quit Compare.")
+            if feed_message:
+                self._appendFeed(str(feed_message))
         finally:
             self._closeProgress()
 

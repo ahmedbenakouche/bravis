@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any
@@ -1852,6 +1853,260 @@ def merge_nested_lane_into_parent(repo_dir: str, lane: str) -> str:
     if restore_sha:
         _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
     return parent
+
+
+def _cv_seg_digests(manifest: dict) -> set[str]:
+    """Content-addressed block hashes referenced by a cube-store manifest."""
+    out: set[str] = set()
+    chunks = manifest.get("chunks") if isinstance(manifest, dict) else None
+    if not isinstance(chunks, dict):
+        return out
+    for raw in chunks.values():
+        digest = str(raw or "").strip().lower()
+        if len(digest) >= 2:
+            out.add(digest)
+    return out
+
+
+def _stage_cv_seg_blocks_from_checkout(
+    repo_dir: str, staging_dir: str, digests: set[str]
+) -> None:
+    """Copy present digests from the current worktree store into ``staging_dir``."""
+    from CollaborativeVersioningLib import SegmentationCubes
+
+    for digest in digests:
+        try:
+            src = SegmentationCubes.block_file_path(repo_dir, digest)
+        except ValueError:
+            continue
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(staging_dir, digest[:2], digest)
+        if os.path.isfile(dst):
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def _install_staged_cv_seg_blocks(repo_dir: str, staging_dir: str) -> None:
+    """Copy staged block files into the worktree ``.cv_seg/blocks`` store."""
+    from CollaborativeVersioningLib import SegmentationCubes
+
+    if not staging_dir or not os.path.isdir(staging_dir):
+        return
+    dest_root = SegmentationCubes.blocks_dir(repo_dir)
+    for root, _dirs, files in os.walk(staging_dir):
+        for name in files:
+            src = os.path.join(root, name)
+            rel = os.path.relpath(src, staging_dir)
+            dst = os.path.join(dest_root, rel)
+            if os.path.isfile(dst):
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+
+
+def merge_cube_manifest_onto_lane(
+    repo_dir: str,
+    source_lane: str,
+    target_lane: str,
+    merged_manifest: dict,
+    *,
+    full_name: str = "",
+    pr_number=None,
+) -> str:
+    """Publish a hybrid cube-store tip onto ``target_lane`` (two parents).
+
+    Unlike Merge now / Accept (child tip tree wholesale), this keeps the target
+    tip tree and only replaces ``.cv_seg`` with ``merged_manifest`` plus any
+    content-addressed blocks gathered from both tips. Returns the target lane
+    display name (``main`` or parent slug).
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    if not isinstance(merged_manifest, dict):
+        raise GitHubAuthError("Could not apply the cube merge.")
+    source_slug = normalize_lane_path(source_lane) or str(source_lane or "").strip()
+    if not source_slug:
+        raise GitHubAuthError("Could not apply the cube merge.")
+    target_raw = str(target_lane or "").strip() or "main"
+    target_is_main = target_raw.lower() == "main"
+    if not target_is_main:
+        target_norm = normalize_lane_path(target_raw)
+        if not target_norm:
+            target_is_main = True
+        else:
+            target_raw = target_norm
+    if target_is_main:
+        target_display = "main"
+        target_branch = "main"
+    else:
+        target_display = target_raw
+        target_branch = review_branch_for(target_display)
+    source_branch = review_branch_for(source_slug)
+
+    ensure_merge_target_has_no_unshared_locals(repo_dir, target_display)
+    login = current_login()
+    if login:
+        _configure_repo_identity(repo_dir, login)
+
+    child_tip = (
+        _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % source_branch)
+        or _git_rev_parse(repo_dir, "refs/heads/%s" % source_branch)
+    )
+    if target_branch == "main":
+        parent_tip = (
+            _git_rev_parse(repo_dir, "refs/remotes/origin/main")
+            or _git_rev_parse(repo_dir, "origin/main")
+            or _git_rev_parse(repo_dir, "refs/heads/main")
+        )
+    else:
+        parent_tip = (
+            _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % target_branch)
+            or _git_rev_parse(repo_dir, "refs/heads/%s" % target_branch)
+        )
+    if not child_tip:
+        raise GitHubAuthError(
+            "Could not find this branch tip.\n\n"
+            "Share it first, then try Apply again."
+        )
+    if not parent_tip:
+        raise GitHubAuthError(
+            "Could not find the merge target tip.\n\n"
+            "Open the shared project first, then try again."
+        )
+    if child_tip == parent_tip or _is_ancestor(repo_dir, child_tip, parent_tip):
+        raise GitHubAuthError(
+            "This branch is already on %s — nothing to Apply." % target_display
+        )
+
+    from CollaborativeVersioningLib import SegmentationCubes
+
+    restore_sha = _git_rev_parse(repo_dir, "HEAD") or ""
+    restore_lane = _checkout_lane_for_branch_name(_current_branch_name(repo_dir))
+    digests = _cv_seg_digests(merged_manifest)
+    staging = tempfile.mkdtemp(prefix="cv_merge_blocks_")
+    restored_early = False
+    try:
+        for tip_sha, tip_lane in (
+            (parent_tip, target_display),
+            (child_tip, source_slug),
+        ):
+            checkout_local_version(repo_dir, tip_sha, tip_lane)
+            _stage_cv_seg_blocks_from_checkout(repo_dir, staging, digests)
+
+        checkout_local_version(repo_dir, parent_tip, target_display)
+        _install_staged_cv_seg_blocks(repo_dir, staging)
+        SegmentationCubes.save_manifest(repo_dir, merged_manifest)
+
+        add = _run_git(
+            ["add", "-A", "--", SegmentationCubes.STORE_DIRNAME],
+            cwd=repo_dir,
+            timeout=120,
+        )
+        if add.returncode != 0:
+            detail = (add.stderr or add.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not apply the cube merge.\n%s" % detail[:400]
+            )
+        tree = _run_git(["write-tree"], cwd=repo_dir, timeout=60)
+        tree_sha = (tree.stdout or "").strip()
+        if tree.returncode != 0 or not tree_sha:
+            detail = (tree.stderr or tree.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not apply the cube merge.\n%s" % detail[:400]
+            )
+        commit = _run_git(
+            [
+                "commit-tree",
+                tree_sha,
+                "-p",
+                parent_tip,
+                "-p",
+                child_tip,
+                "-m",
+                "Merge cubes from %s onto %s" % (source_slug, target_display),
+            ],
+            cwd=repo_dir,
+            timeout=30,
+        )
+        merge_sha = (commit.stdout or "").strip()
+        if commit.returncode != 0 or not merge_sha:
+            detail = (commit.stderr or commit.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not apply the cube merge.\n%s" % detail[:400]
+            )
+        # Hybrid tree is in the merge commit — clear the dirty worktree, then leave
+        # the target branch so update-ref does not drag a symbolic HEAD along.
+        reset = _run_git(
+            ["reset", "--hard", parent_tip], cwd=repo_dir, timeout=120
+        )
+        if reset.returncode != 0:
+            detail = (reset.stderr or reset.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not apply the cube merge.\n%s" % detail[:400]
+            )
+        if restore_sha:
+            _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
+            restored_early = True
+
+        push = _run_git(
+            ["push", "origin", "%s:refs/heads/%s" % (merge_sha, target_branch)],
+            cwd=repo_dir,
+            timeout=180,
+        )
+        if push.returncode != 0:
+            _raise_share_failure((push.stderr or push.stdout or "").strip())
+        _run_git(
+            ["update-ref", "refs/remotes/origin/%s" % target_branch, merge_sha],
+            cwd=repo_dir,
+            timeout=20,
+        )
+        _run_git(
+            ["update-ref", "refs/heads/%s" % target_branch, merge_sha],
+            cwd=repo_dir,
+            timeout=20,
+        )
+        if target_branch == "main":
+            _run_git(
+                ["branch", "--set-upstream-to=origin/main", "main"],
+                cwd=repo_dir,
+                timeout=20,
+            )
+            # Keep the review line tip (same idea as Accept); only close the PR label.
+            if full_name and pr_number not in (None, ""):
+                closed = _run_gh(
+                    [
+                        "pr",
+                        "close",
+                        str(pr_number),
+                        "--repo",
+                        str(full_name),
+                        "--comment",
+                        "Accepted in Collaborative Versioning.",
+                    ],
+                    timeout=40,
+                )
+                if closed.returncode != 0:
+                    detail = (closed.stderr or closed.stdout or "").strip().lower()
+                    if (
+                        "already" not in detail
+                        and "not found" not in detail
+                        and "merged" not in detail
+                    ):
+                        pass
+                try:
+                    _ensure_github_branch(str(full_name), source_branch, child_tip)
+                except (GitHubAuthError, OSError, ValueError):
+                    pass
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        if restore_sha and not restored_early:
+            try:
+                _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
+            except Exception:
+                pass
+    return target_display
 
 
 def review_branch_for(name: str) -> str:
