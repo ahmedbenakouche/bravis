@@ -602,10 +602,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.comparePanel.prevButton.clicked.connect(self._mergeComparePrev)
         self.comparePanel.nextButton.clicked.connect(self._mergeCompareNext)
         self.comparePanel.showAllCheck.toggled.connect(self._mergeCompareSetShowAll)
+        self.comparePanel.show3dCheck.toggled.connect(self._mergeCompareSetShow3d)
         self.comparePanel.showCubeDiffsCheck.toggled.connect(
             self._mergeCompareSetShowCubeDiffs
         )
-        self.comparePanel.show3dCheck.toggled.connect(self._mergeCompareSetShow3d)
+        self.comparePanel.applyMergeButton.clicked.connect(self._mergeCompareApply)
         self.comparePanel.quitButton.clicked.connect(self._exitMergeCompare)
         self.comparePanel.segmentList.currentRowChanged.connect(
             self._mergeCompareListRowChanged
@@ -1772,6 +1773,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             cube_count = cube_overlay.configure(
                 target_manifest, source_manifest, volume_node
             )
+            cube_rows = list(cube_overlay.cubes)
+            cube_choices: dict[str, str] = {}
+            if panel is not None:
+                panel.set_cube_diffs_visible(show_cube_diffs)
             self._merge_compare_session = {
                 "target_node_id": target_node.GetID(),
                 "source_node_id": source_node.GetID(),
@@ -1785,6 +1790,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "show_cube_diffs": show_cube_diffs,
                 "cube_overlay": cube_overlay,
                 "cube_diff_count": cube_count,
+                "cube_rows": cube_rows,
+                "cube_choices": cube_choices,
+                "target_manifest": target_manifest,
+                "source_manifest": source_manifest,
                 "previous_layout": previous_layout,
                 "panel": panel,
             }
@@ -1796,7 +1805,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._mergeCompareFocusIndex(0)
             else:
                 MergeCompare.assign_volume_only(volume_node)
-            cube_overlay.start(enabled=show_cube_diffs)
+            cube_overlay.start(
+                enabled=show_cube_diffs,
+                click_callback=self._mergeCompareCubeClicked,
+            )
             self._setCompareModeUi(True)
             compare_ok = True
         except Exception as error:
@@ -1989,12 +2001,77 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not session:
             return
         session["show_cube_diffs"] = bool(checked)
+        panel = session.get("panel") or getattr(self, "comparePanel", None)
+        if panel is not None:
+            try:
+                panel.set_cube_diffs_visible(bool(checked))
+            except Exception:
+                pass
         overlay = session.get("cube_overlay")
         if overlay is not None:
             try:
                 overlay.set_enabled(bool(checked))
             except Exception:
                 logging.exception("Could not toggle cube-diff overlay")
+
+    def _mergeCompareCubeClicked(self, key: str, side: str) -> None:
+        """Upper 2D click = keep upper; lower 2D click = keep lower → cyan."""
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        key = str(key or "").strip()
+        side = str(side or "").strip().lower()
+        choose = "upper" if side == "upper" else "lower" if side == "lower" else ""
+        if not key or not choose:
+            return
+        choices = dict(session.get("cube_choices") or {})
+        choices[key] = choose
+        session["cube_choices"] = choices
+        overlay = session.get("cube_overlay")
+        if overlay is not None:
+            try:
+                overlay.set_chosen_keys(list(choices.keys()))
+            except Exception:
+                pass
+
+    def _mergeCompareApply(self) -> None:
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        cubes = list(session.get("cube_rows") or [])
+        choices = dict(session.get("cube_choices") or {})
+        if not cubes:
+            self._appendFeed("No changed cubes to merge.", error=True)
+            return
+        missing = [
+            str(c.get("key") or "")
+            for c in cubes
+            if str(choices.get(str(c.get("key") or "")) or "").strip().lower()
+            not in ("upper", "lower")
+        ]
+        if missing:
+            self._appendFeed(
+                "Apply merge: %d cube(s) still unchosen — click upper/lower 2D views."
+                % len(missing),
+                error=True,
+            )
+            return
+        merged = MergeCompare.build_merged_manifest(
+            session.get("target_manifest"),
+            session.get("source_manifest"),
+            choices,
+        )
+        if merged is None:
+            self._appendFeed("Apply merge: could not build merged manifest.", error=True)
+            return
+        session["merged_manifest"] = merged
+        upper_n = sum(1 for v in choices.values() if v == "upper")
+        lower_n = sum(1 for v in choices.values() if v == "lower")
+        self._appendFeed(
+            "Apply merge ready: %d cube(s) (%d upper, %d lower). "
+            "Tip write/publish will be wired next."
+            % (len(cubes), upper_n, lower_n)
+        )
 
     def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
         session = getattr(self, "_merge_compare_session", None)
