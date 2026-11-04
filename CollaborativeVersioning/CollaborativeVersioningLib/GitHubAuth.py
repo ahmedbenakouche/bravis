@@ -10,7 +10,6 @@ import re
 import shutil
 import stat
 import subprocess
-import tempfile
 import threading
 import time
 from typing import Any
@@ -1868,42 +1867,46 @@ def _cv_seg_digests(manifest: dict) -> set[str]:
     return out
 
 
-def _stage_cv_seg_blocks_from_checkout(
-    repo_dir: str, staging_dir: str, digests: set[str]
+def _fill_missing_cv_seg_blocks_from_commit(
+    repo_dir: str, source_sha: str, digests: set[str]
 ) -> None:
-    """Copy present digests from the current worktree store into ``staging_dir``."""
+    """Bring missing block files from ``source_sha`` into the current worktree.
+
+    Does not switch HEAD: ``git checkout <sha> -- path`` only materializes those
+    paths (binary-safe). Digests already present on disk are skipped. Paths absent
+    from the source tip (e.g. zero cubes with no block file) are ignored.
+    """
     from CollaborativeVersioningLib import SegmentationCubes
 
-    for digest in digests:
+    tip = str(source_sha or "").strip()
+    if not tip or not digests:
+        return
+    missing: list[str] = []
+    for digest in sorted(digests):
         try:
-            src = SegmentationCubes.block_file_path(repo_dir, digest)
+            abs_path = SegmentationCubes.block_file_path(repo_dir, digest)
         except ValueError:
             continue
-        if not os.path.isfile(src):
+        if os.path.isfile(abs_path):
             continue
-        dst = os.path.join(staging_dir, digest[:2], digest)
-        if os.path.isfile(dst):
-            continue
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
-
-
-def _install_staged_cv_seg_blocks(repo_dir: str, staging_dir: str) -> None:
-    """Copy staged block files into the worktree ``.cv_seg/blocks`` store."""
-    from CollaborativeVersioningLib import SegmentationCubes
-
-    if not staging_dir or not os.path.isdir(staging_dir):
+        rel = os.path.relpath(abs_path, repo_dir).replace("\\", "/")
+        missing.append(rel)
+    if not missing:
         return
-    dest_root = SegmentationCubes.blocks_dir(repo_dir)
-    for root, _dirs, files in os.walk(staging_dir):
-        for name in files:
-            src = os.path.join(root, name)
-            rel = os.path.relpath(src, staging_dir)
-            dst = os.path.join(dest_root, rel)
-            if os.path.isfile(dst):
-                continue
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
+    # Keep argv short on Windows; cube Apply usually needs only a handful of paths.
+    batch_size = 40
+    for index in range(0, len(missing), batch_size):
+        batch = missing[index : index + batch_size]
+        result = _run_git(
+            ["checkout", tip, "--", *batch],
+            cwd=repo_dir,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            continue
+        # Batch failed (one path missing on source) — retry path-by-path.
+        for rel in batch:
+            _run_git(["checkout", tip, "--", rel], cwd=repo_dir, timeout=60)
 
 
 def merge_cube_manifest_onto_lane(
@@ -1919,8 +1922,8 @@ def merge_cube_manifest_onto_lane(
 
     Unlike Merge now / Accept (child tip tree wholesale), this keeps the target
     tip tree and only replaces ``.cv_seg`` with ``merged_manifest`` plus any
-    content-addressed blocks gathered from both tips. Returns the target lane
-    display name (``main`` or parent slug).
+    content-addressed blocks missing on the target tip (pulled from the source
+    tip). Returns the target lane display name (``main`` or parent slug).
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -1985,18 +1988,11 @@ def merge_cube_manifest_onto_lane(
     restore_sha = _git_rev_parse(repo_dir, "HEAD") or ""
     restore_lane = _checkout_lane_for_branch_name(_current_branch_name(repo_dir))
     digests = _cv_seg_digests(merged_manifest)
-    staging = tempfile.mkdtemp(prefix="cv_merge_blocks_")
     restored_early = False
     try:
-        for tip_sha, tip_lane in (
-            (parent_tip, target_display),
-            (child_tip, source_slug),
-        ):
-            checkout_local_version(repo_dir, tip_sha, tip_lane)
-            _stage_cv_seg_blocks_from_checkout(repo_dir, staging, digests)
-
+        # One target checkout; pull only missing blocks from the source tip.
         checkout_local_version(repo_dir, parent_tip, target_display)
-        _install_staged_cv_seg_blocks(repo_dir, staging)
+        _fill_missing_cv_seg_blocks_from_commit(repo_dir, child_tip, digests)
         SegmentationCubes.save_manifest(repo_dir, merged_manifest)
 
         add = _run_git(
@@ -2067,6 +2063,18 @@ def merge_cube_manifest_onto_lane(
             cwd=repo_dir,
             timeout=20,
         )
+        # Keep a local source-lane tip (same SHA as origin) so Share/Compare do not
+        # treat the still-published review branch as a brand-new remote lane.
+        _run_git(
+            ["update-ref", "refs/heads/%s" % source_branch, child_tip],
+            cwd=repo_dir,
+            timeout=20,
+        )
+        _run_git(
+            ["update-ref", "refs/remotes/origin/%s" % source_branch, child_tip],
+            cwd=repo_dir,
+            timeout=20,
+        )
         if target_branch == "main":
             _run_git(
                 ["branch", "--set-upstream-to=origin/main", "main"],
@@ -2100,7 +2108,6 @@ def merge_cube_manifest_onto_lane(
                 except (GitHubAuthError, OSError, ValueError):
                     pass
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
         if restore_sha and not restored_early:
             try:
                 _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
@@ -4189,6 +4196,17 @@ def read_compare_project_histories(
                 remote_shas.add(sha)
     only_remote_main = remote_main_shas - local_main_shas
     only_local_main = local_main_shas - remote_main_shas
+    # Stale review-tip SHAs that are already ancestors of this computer's main
+    # (via merge second-parents after Accept / cube Apply) are not "incoming".
+    # Example: origin/cv-review/dgf tip still listed while local dgf tip moved —
+    # the old tip remains reachable from main and must not block Share.
+    main_reach_local = (
+        _all_reachable_shas(commit_by_sha, local_main or head_sha or "")
+        if commit_by_sha
+        else set()
+    )
+    if main_reach_local:
+        only_remote_shas -= main_reach_local
     has_remote_extras = bool(only_remote_shas)
     has_local_extras = bool(only_local_shas)
     # Empty task lanes share a main SHA — SHA diff misses them. Detect new remote
@@ -4198,12 +4216,23 @@ def read_compare_project_histories(
         for name in local_review_tips
         if str(name).strip()
     }
-    new_remote_lanes = sorted(
-        str(name).strip().lower()
-        for name in remote_review_tips
-        if str(name).strip()
-        and str(name).strip().lower() not in local_lane_slugs
+    main_reach_origin = (
+        _all_reachable_shas(commit_by_sha, origin) if origin and commit_by_sha else set()
     )
+    known_lane_tip_shas = local_shas | main_reach_local | main_reach_origin
+    # Remote lane still on origin after Merge/Apply is not "new" when its tip is
+    # already on this computer (possibly under another local lane name) or already
+    # merged into shared main.
+    new_remote_lanes = []
+    for name in remote_review_tips:
+        key = str(name or "").strip().lower()
+        if not key or key in local_lane_slugs:
+            continue
+        tip = _first_tip(remote_review_tips.get(name))
+        if tip and tip in known_lane_tip_shas:
+            continue
+        new_remote_lanes.append(key)
+    new_remote_lanes = sorted(new_remote_lanes)
     has_new_remote_lanes = bool(new_remote_lanes)
     aligned = (
         not has_remote_extras
