@@ -1346,37 +1346,91 @@ def is_viewing_older_than_branch_tip(repo_dir: str, lane: str = "main") -> bool:
     return _is_ancestor(repo_dir, head, tip)
 
 
-def checkout_local_version(repo_dir: str, sha: str, lane: str = "main") -> None:
+def _review_branches_at_tip(repo_dir: str, sha: str) -> list[str]:
+    """Local/remote ``cv-review/*`` branch names whose tip is exactly ``sha``."""
+    tip = str(sha or "").strip()
+    if not tip or not repo_dir:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for ref in _history_refs(repo_dir):
+        if not (
+            ref.startswith("refs/heads/cv-review/")
+            or ref.startswith("refs/remotes/origin/cv-review/")
+        ):
+            continue
+        if _git_rev_parse(repo_dir, ref) != tip:
+            continue
+        if ref.startswith("refs/heads/"):
+            name = ref[len("refs/heads/") :]
+        else:
+            name = ref[len("refs/remotes/origin/") :]
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        found.append(name)
+    return found
+
+
+def checkout_local_version(
+    repo_dir: str,
+    sha: str,
+    lane: str = "main",
+    *,
+    attach_branch: bool = True,
+) -> None:
     """Point HEAD at this version and sync the full worktree (Switch).
 
     When the target is an older commit on the same lane, leave the branch tip
     where it is (detached HEAD) so later unshared versions stay on that line.
     Switching to the tip (or ahead) attaches the branch again.
+
+    ``attach_branch=False`` (Compare / temporary loads): always detach — never
+    rewrite lane tips via ``branch -f``.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
     if not sha:
         raise GitHubAuthError("Could not switch version.")
+    target = _git_rev_parse(repo_dir, sha) or str(sha).strip()
+    if not attach_branch:
+        _checkout_detached_at(repo_dir, target)
+        return
     branch = git_branch_for_history_lane(lane)
     head = _git_rev_parse(repo_dir, "HEAD")
     current = _current_branch_name(repo_dir)
     tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
-    if head == sha and current == branch:
+    if head == target and current == branch:
         return
     # Already viewing this older commit with tip preserved.
     if (
-        head == sha
+        head == target
         and not current
         and tip
-        and tip != sha
-        and _is_ancestor(repo_dir, sha, tip)
+        and tip != target
+        and _is_ancestor(repo_dir, target, tip)
     ):
         return
     # Older version on this lane: load it without moving the tip (keeps main/2–3).
-    if tip and sha != tip and _is_ancestor(repo_dir, sha, tip):
-        _checkout_detached_at(repo_dir, sha)
+    if tip and tip != target and _is_ancestor(repo_dir, target, tip):
+        _checkout_detached_at(repo_dir, target)
         return
-    _checkout_branch_at(repo_dir, branch, sha)
+    # Review lanes: never ``branch -f`` onto a commit that is already another
+    # review branch's tip (stolen tip / wrong Version-tree label). View detached.
+    if branch != "main" and tip != target:
+        owners = [
+            name
+            for name in _review_branches_at_tip(repo_dir, target)
+            if name != branch
+        ]
+        if owners:
+            _checkout_detached_at(repo_dir, target)
+            return
+        # Diverged from this lane's tip (not a fast-forward): keep tip intact.
+        if tip and not _is_ancestor(repo_dir, tip, target):
+            _checkout_detached_at(repo_dir, target)
+            return
+    _checkout_branch_at(repo_dir, branch, target)
 
 
 def _share_failure_message(detail: str) -> str:
@@ -1990,8 +2044,10 @@ def merge_cube_manifest_onto_lane(
     digests = _cv_seg_digests(merged_manifest)
     restored_early = False
     try:
-        # One target checkout; pull only missing blocks from the source tip.
-        checkout_local_version(repo_dir, parent_tip, target_display)
+        # Detached target tip: Apply must not rewrite unrelated lane tips.
+        checkout_local_version(
+            repo_dir, parent_tip, target_display, attach_branch=False
+        )
         _fill_missing_cv_seg_blocks_from_commit(repo_dir, child_tip, digests)
         SegmentationCubes.save_manifest(repo_dir, merged_manifest)
 

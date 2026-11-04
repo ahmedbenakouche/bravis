@@ -1638,7 +1638,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         sha, lane = self._shaAndLaneForVersion(version_id)
         if not local_path or not sha:
             raise RuntimeError("Could not resolve %s." % self._versionDisplayTag(version_id))
-        checkout_local_version(local_path, sha, lane)
+        # Detached: Compare must never rewrite cv-review/* tips via branch -f.
+        checkout_local_version(local_path, sha, lane, attach_branch=False)
         manager = DataManager()
         files = manager.discover_project_files(local_path)
         stem = self._compareNodeStem(version_id)
@@ -1736,7 +1737,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     # Disk is still at target tip — brief checkout to read source manifest.
                     src_sha, src_lane = self._shaAndLaneForVersion(source_vid)
                     if src_sha:
-                        checkout_local_version(local_path, src_sha, src_lane)
+                        checkout_local_version(
+                            local_path, src_sha, src_lane, attach_branch=False
+                        )
                         need_checkout_restore = True
                     source_manifest = SegmentationCubes.try_load_manifest(local_path)
                 else:
