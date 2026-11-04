@@ -690,6 +690,38 @@ def layout_xml(target_label: str, source_label: str) -> str:
     return "\n".join(parts)
 
 
+def refresh_compare_view_labels(target_label: str, source_label: str) -> None:
+    """Update Compare singleton view titles (XML viewlabel is ignored on reuse)."""
+    top = str(target_label or "target").strip() or "target"
+    bottom = str(source_label or "source").strip() or "source"
+    short_by_orient = {"Axial": "Ax", "Sagittal": "Sg", "Coronal": "Co"}
+    layout = slicer.app.layoutManager()
+
+    def _set_label(node, text: str) -> None:
+        if node is None:
+            return
+        try:
+            node.SetLayoutLabel(str(text))
+        except Exception:
+            pass
+
+    for tags, prefix in (
+        (TARGET_SLICE_TAGS, top),
+        (SOURCE_SLICE_TAGS, bottom),
+    ):
+        for tag, orient in zip(tags, _ORIENT):
+            widget = layout.sliceWidget(tag)
+            if widget is None:
+                continue
+            try:
+                node = widget.mrmlSliceNode()
+            except Exception:
+                continue
+            _set_label(node, "%s %s" % (prefix, short_by_orient.get(orient, "")))
+    _set_label(_three_d_view_node(TARGET_3D_TAG), "%s 3D" % top)
+    _set_label(_three_d_view_node(SOURCE_3D_TAG), "%s 3D" % bottom)
+
+
 def apply_compare_layout(target_label: str, source_label: str) -> int:
     """Install compare layout; return previous view arrangement id."""
     layout_node = slicer.app.layoutManager().layoutLogic().GetLayoutNode()
@@ -701,6 +733,7 @@ def apply_compare_layout(target_label: str, source_label: str) -> int:
     else:
         layout_node.AddLayoutDescription(user_view, xml_code)
     layout_node.SetViewArrangement(user_view)
+    refresh_compare_view_labels(target_label, source_label)
     return previous
 
 
