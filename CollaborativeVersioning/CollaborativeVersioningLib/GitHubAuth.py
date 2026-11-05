@@ -1249,8 +1249,12 @@ def ensure_can_share_with_shared(
     """Fetch and refuse publish actions when the shared project is ahead or tips diverged.
 
     Used before Share and before Assign (task-branch push). Local unshared
-    versions alone do not block. Remote extras, tip conflicts, or an obsolete
-    merged branch require Compare → Update/resolve first.
+    versions alone do not block. Remote extras, new remote lanes, or tip
+    conflicts require Compare → Update/resolve first.
+
+    ``obsolete_merged`` is not a Share gate: Save on an already-integrated tip
+    already forces Create a branch, and the detector false-positives nested
+    lanes whose parent tip was merged.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -1260,7 +1264,6 @@ def ensure_can_share_with_shared(
         compare.get("has_remote_extras")
         or compare.get("has_new_remote_lanes")
         or compare.get("conflict")
-        or compare.get("obsolete_merged")
     ):
         verb = str(action or "share").strip().lower() or "share"
         label = verb[:1].upper() + verb[1:]
