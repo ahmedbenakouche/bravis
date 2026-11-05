@@ -1331,6 +1331,47 @@ def _find_segment_id_by_name(segmentation_node, name: str) -> str:
     return ""
 
 
+def segment_center_ras(segmentation_node, name: str):
+    """RAS center of a segment by name, or None if missing."""
+    segment_id = _find_segment_id_by_name(segmentation_node, name)
+    if not segment_id or segmentation_node is None:
+        return None
+    try:
+        center = segmentation_node.GetSegmentCenterRAS(segment_id)
+    except Exception:
+        return None
+    if center is None:
+        return None
+    try:
+        return (float(center[0]), float(center[1]), float(center[2]))
+    except Exception:
+        return None
+
+
+def jump_compare_slices_to_ras(ras) -> None:
+    """Move Compare 2D cuts through ``ras`` (slice offset only — no pan/drag)."""
+    if ras is None:
+        return
+    try:
+        x, y, z = float(ras[0]), float(ras[1]), float(ras[2])
+    except Exception:
+        return
+    layout = slicer.app.layoutManager()
+    for tag in TARGET_SLICE_TAGS + SOURCE_SLICE_TAGS:
+        widget = layout.sliceWidget(tag)
+        if widget is None:
+            continue
+        try:
+            slice_node = widget.mrmlSliceNode()
+            if slice_node is None:
+                continue
+            # JumpSlice = change which cut is shown (like mouse-wheel scroll).
+            # Not JumpSliceByCentering (that also pans the point to the window center).
+            slice_node.JumpSlice(x, y, z)
+        except Exception:
+            continue
+
+
 def _center_cameras_on_segment(segmentation_node, segment_id: str) -> None:
     """Point compare 3D cameras at the segment center (Prev/Next navigation)."""
     if segmentation_node is None or not segment_id:

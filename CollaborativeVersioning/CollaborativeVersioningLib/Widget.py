@@ -1962,24 +1962,29 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 panel.set_current_index(index)
             except Exception:
                 pass
-        # Overview mode: keep all segments / true colors; only move list highlight.
-        if bool(session.get("show_all")):
-            return
         name = names[index]
-        show_3d = bool(session.get("show_3d"))
         target, source = self._mergeCompareNodes()
-        MergeCompare.focus_segment_name(
-            target,
-            name,
-            show_3d=show_3d,
-            override_color=MergeCompare.COMPARE_COLOR_TARGET,
-        )
-        MergeCompare.focus_segment_name(
-            source,
-            name,
-            show_3d=show_3d,
-            override_color=MergeCompare.COMPARE_COLOR_SOURCE,
-        )
+        # Overview mode: keep all segments / true colors; only move list highlight.
+        if not bool(session.get("show_all")):
+            show_3d = bool(session.get("show_3d"))
+            MergeCompare.focus_segment_name(
+                target,
+                name,
+                show_3d=show_3d,
+                override_color=MergeCompare.COMPARE_COLOR_TARGET,
+            )
+            MergeCompare.focus_segment_name(
+                source,
+                name,
+                show_3d=show_3d,
+                override_color=MergeCompare.COMPARE_COLOR_SOURCE,
+            )
+        # Jump 2D slices to this segment (same as scrolling the cut manually).
+        ras = MergeCompare.segment_center_ras(
+            target, name
+        ) or MergeCompare.segment_center_ras(source, name)
+        if ras is not None:
+            MergeCompare.jump_compare_slices_to_ras(ras)
 
     def _mergeCompareListRowChanged(self, row: int) -> None:
         panel = getattr(self, "comparePanel", None)
