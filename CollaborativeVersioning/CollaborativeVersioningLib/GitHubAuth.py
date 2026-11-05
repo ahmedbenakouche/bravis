@@ -4519,19 +4519,14 @@ def _all_reachable_shas(commit_by_sha: dict[str, dict], tip: str) -> set[str]:
 def _branch_merged_into_main(
     commit_by_sha: dict[str, dict], origin: str, branch_tip: str
 ) -> bool:
-    """True when this branch tip (or a merge of it) is already on shared main."""
+    """True when this exact tip is already reachable from shared main.
+
+    Do not treat ancestor commits as proof: a nested lane that forked from a
+    tip later merged onto main is not itself merged (false obsolete otherwise).
+    """
     if not origin or not branch_tip or not commit_by_sha:
         return False
-    main_reach = _all_reachable_shas(commit_by_sha, origin)
-    if branch_tip in main_reach:
-        return True
-    branch_chain = set(_first_parent_chain(commit_by_sha, branch_tip))
-    for sha in _first_parent_chain(commit_by_sha, origin):
-        parents = (commit_by_sha.get(sha) or {}).get("parents") or []
-        for extra in parents[1:]:
-            if extra and extra in branch_chain:
-                return True
-    return False
+    return branch_tip in _all_reachable_shas(commit_by_sha, origin)
 
 
 def _tips_diverged(commit_by_sha: dict[str, dict], tip_a: str, tip_b: str) -> bool:
