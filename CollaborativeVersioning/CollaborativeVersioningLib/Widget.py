@@ -90,7 +90,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     review_lane_tip_integrated_into_parent,
     review_parent_lane_already_merged_upward,
     is_nested_lane_path,
-    merge_nested_lane_into_parent,
     merge_cube_manifest_onto_lane,
     parent_lane_slug,
     delete_local_unshared_version,
@@ -99,7 +98,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     decline_share_request,
     work_is_on_review_branch,
     is_viewing_older_than_branch_tip,
-    review_branch_for,
     current_review_branch_slug,
     normalize_branch_slug,
     normalize_lane_path,
@@ -592,7 +590,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
         # Compare mode replaces Active project in the left panel (hidden until Compare).
         self.compareButton = ctk.ctkCollapsibleButton()
-        self.compareButton.text = "Compare"
+        self.compareButton.text = "Compare and Merge"
         self.compareButton.collapsed = False
         self.compareButton.setVisible(False)
         self.layout.addWidget(self.compareButton)
@@ -1579,8 +1577,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.exec_()
         return box.clickedButton() == share_btn
 
-    def _askMergeChoice(self, source: str, target: str) -> str | None:
-        """Merge dialog: Merge now / Compare… / Cancel. Returns 'merge', 'compare', or None."""
+    def _askMergeChoice(self, source: str, target: str) -> bool:
+        """Merge dialog: Compare and Merge / Cancel. Returns True to open the layout."""
         src = str(source or "").strip() or "?"
         dst = str(target or "").strip() or "?"
         box = qt.QMessageBox(slicer.util.mainWindow())
@@ -1588,21 +1586,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.setIcon(qt.QMessageBox.Question)
         box.setText("Merge branch %s onto %s?" % (src, dst))
         box.setInformativeText(
-            "Merge now publishes the branch tip onto %s (same as today).\n"
-            "Compare opens a side-by-side review of both tips (no merge yet)."
+            "Opens a side-by-side view of both versions so you can review "
+            "the differences, pick what to keep, then apply the merge onto %s."
             % dst
         )
-        merge_btn = box.addButton("Merge now", qt.QMessageBox.AcceptRole)
-        compare_btn = box.addButton("Compare…", qt.QMessageBox.ActionRole)
+        compare_btn = box.addButton("Compare and Merge", qt.QMessageBox.AcceptRole)
         box.addButton("Cancel", qt.QMessageBox.RejectRole)
-        box.setDefaultButton(merge_btn)
+        box.setDefaultButton(compare_btn)
         box.exec_()
-        clicked = box.clickedButton()
-        if clicked == merge_btn:
-            return "merge"
-        if clicked == compare_btn:
-            return "compare"
-        return None
+        return box.clickedButton() == compare_btn
 
     def _shaAndLaneForVersion(self, version_id: str) -> tuple[str, str]:
         vid = str(version_id or "").strip()
@@ -1712,7 +1704,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         # Compare slice singletons persist in Slicer across layout switches: reset them.
         MergeCompare.hide_all_scene_segmentations()
         MergeCompare.reset_compare_slice_views()
-        self._openProgress("Compare", "Opening comparison views…")
+        self._openProgress("Compare and Merge", "Opening comparison views…")
         try:
             previous_layout = MergeCompare.apply_compare_layout(target_label, source_label)
             MergeCompare.assign_volume_only(volume_node)
@@ -1866,7 +1858,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return True
 
     def _setCompareModeUi(self, active: bool) -> None:
-        """Left: only Merge Compare. Right: only Activity feed."""
+        """Left: only Compare and Merge. Right: only Activity feed."""
         active = bool(active)
         compare = getattr(self, "compareButton", None)
         left_normal = (
@@ -2209,7 +2201,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         # Prevent re-entry while we tear down.
         self._merge_compare_session = None
-        self._openProgress("Compare", "Leaving Compare…")
+        self._openProgress("Compare and Merge", "Leaving Compare and Merge…")
         try:
             overlay = session.get("cube_overlay")
             if overlay is not None:
@@ -8237,63 +8229,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 error=True,
             )
             return
-        choice = self._askMergeChoice(slug, parent)
-        if choice == "compare":
-            self._startMergeCompare(source_lane=slug, target_lane=parent)
+        if not self._askMergeChoice(slug, parent):
             return
-        if choice != "merge":
-            return
-        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
-        if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
-            self._appendFeed("Open the project first.", error=True)
-            return
-        me = (self._githubLogin() or "").strip()
-        self._openProgress("Merge", "Checking the shared project…")
-        try:
-            local_freeze = copy.deepcopy(
-                getattr(self, "_project_history_bundle", None)
-            )
-            ensure_can_share_with_shared(
-                local_path, local_history=local_freeze, action="merge"
-            )
-            self._updateProgress("Merging onto %s…" % parent)
-            merge_nested_lane_into_parent(local_path, slug)
-            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
-            self._updateProgress("Updating version history…")
-            history = read_project_history(local_path)
-        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            self._closeProgress()
-            self._showGithubError(error, box=True)
-            return
-        self._closeProgress()
-        unshared = self._historyHasUnsharedVersion(history)
-        self._suppress_dirty += 1
-        self._suppress_asset_ui_updates += 1
-        try:
-            self._applyProjectHistoryBundle(history)
-            self._clearChangeFlags()
-            self._unshared_version = unshared
-            self._syncAssetDataObservers()
-        finally:
-            self._suppress_asset_ui_updates -= 1
-            self._suppress_dirty -= 1
-        self._refreshUiState()
-        self._clearChangeFlags()
-        self._unshared_version = unshared
-        self._updateVersionActionButtons()
-        self._armLoadSettle()
-        self._recordActivity(
-            self._currentProjectName(),
-            "accept",
-            "%s merged branch %s onto %s." % (me or "Someone", slug, parent),
-        )
-        self._appendFeed("Merged %s onto %s." % (slug, parent))
-        self._updateActiveVersionIndicators()
-        self._updateTaskButtonUi()
-        self._refreshOpenVersionTreeIfNeeded()
+        self._startMergeCompare(source_lane=slug, target_lane=parent)
 
     def _mergeOwnReviewLine(self, lane: str = "") -> None:
-        """Senior/owner: put a shared named branch onto main (same merge as Accept)."""
+        """Senior/owner: open Compare and Merge to put a shared named branch onto main."""
         me = (self._githubLogin() or "").strip()
         if not me or not self._canAssignTask():
             self._appendFeed("Only a senior can merge their branch onto main.", error=True)
@@ -8311,50 +8252,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 error=True,
             )
             return
-        task = self._activeTaskForBranchSlug(slug)
-        choice = self._askMergeChoice(slug, "main")
-        if choice == "compare":
-            self._startMergeCompare(source_lane=slug, target_lane="main")
+        if not self._askMergeChoice(slug, "main"):
             return
-        if choice != "merge":
-            return
-        # DIY Merge: same gate as Share — refuse when shared is ahead / tips diverged.
-        if task is None:
-            local_path = str(getattr(self, "_local_project_path", None) or "").strip()
-            if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
-                self._appendFeed("Open the project first.", error=True)
-                return
-            self._openProgress("Merge", "Checking the shared project…")
-            try:
-                local_freeze = copy.deepcopy(
-                    getattr(self, "_project_history_bundle", None)
-                )
-                ensure_can_share_with_shared(
-                    local_path, local_history=local_freeze, action="merge"
-                )
-            except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-                self._closeProgress()
-                self._showGithubError(error, box=True)
-                return
-            self._closeProgress()
-        request = {
-            "full_name": self._currentProjectName(),
-            "branch": review_branch_for(slug),
-            "number": None,
-            "author": me,
-        }
-        if self._acceptReviewedShareRequest(request):
-            if task is not None and str(task.get("status") or "") != "accepted":
-                # Merging a task lane closes the task for everyone assigned.
-                self._markTaskAccepted(task)
-            else:
-                self._recordActivity(
-                    self._currentProjectName(),
-                    "accept",
-                    "%s merged branch %s onto main." % (me or "Someone", slug),
-                )
-            self._updateActiveVersionIndicators()
-            self._updateTaskButtonUi()
+        self._startMergeCompare(source_lane=slug, target_lane="main")
 
     def _showShareBranchBeforeReviewHint(self) -> None:
         """Junior tried Request review before Share — box + feed."""

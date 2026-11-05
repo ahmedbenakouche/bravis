@@ -1974,10 +1974,10 @@ def merge_cube_manifest_onto_lane(
 ) -> str:
     """Publish a hybrid cube-store tip onto ``target_lane`` (two parents).
 
-    Unlike Merge now / Accept (child tip tree wholesale), this keeps the target
-    tip tree and only replaces ``.cv_seg`` with ``merged_manifest`` plus any
-    content-addressed blocks missing on the target tip (pulled from the source
-    tip). Returns the target lane display name (``main`` or parent slug).
+    Unlike Accept (child tip tree wholesale), this keeps the target tip tree and
+    only replaces ``.cv_seg`` with ``merged_manifest`` plus any content-addressed
+    blocks missing on the target tip (pulled from the source tip). Returns the
+    target lane display name (``main`` or parent slug).
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")

@@ -1414,7 +1414,9 @@ class MergeComparePanel(qt.QWidget):
         layout.addWidget(self.applyMergeButton)
 
         self.quitButton = qt.QPushButton("Quit")
-        self.quitButton.setToolTip("Leave Compare and restore the normal layout")
+        self.quitButton.setToolTip(
+            "Leave Compare and Merge and restore the normal layout"
+        )
         self.quitButton.setStyleSheet(BTN_DELETE)
         self.quitButton.setMinimumHeight(32)
         layout.addWidget(self.quitButton)
