@@ -36,10 +36,13 @@ COMPARE_COLOR_SOURCE = (0.95, 0.22, 0.18)  # red = source / lower
 CUBE_DIFF_COLOR = (1.0, 0.85, 0.15)
 CUBE_DIFF_SELECTED_COLOR = (0.15, 0.95, 1.0)  # cyan = selected cube
 CUBE_DIFF_LINE_WIDTH = 2.0
-CUBE_DIFF_SELECTED_LINE_WIDTH = 4.0
+CUBE_DIFF_SELECTED_LINE_WIDTH = 2.0
+CUBE_DIFF_FILL_OPACITY = 0.38
 CUBE_DIFF_MODEL_NAME = "CVCompare_CubeDiffs"
 CUBE_DIFF_CHOSEN_UPPER_NAME = "CVCompare_CubeDiffChosenUpper"
 CUBE_DIFF_CHOSEN_LOWER_NAME = "CVCompare_CubeDiffChosenLower"
+CUBE_DIFF_CHOSEN_UPPER_COLOR = "CVCompare_CubeDiffChosenUpperColor"
+CUBE_DIFF_CHOSEN_LOWER_COLOR = "CVCompare_CubeDiffChosenLowerColor"
 
 
 def _geometry_ijk_to_ras_matrix(geometry: dict | None) -> vtk.vtkMatrix4x4:
@@ -212,17 +215,21 @@ def build_merged_manifest(
 
 
 class CubeDiffOverlay:
-    """Outline changed cubes via light wireframe models (2D slice intersections)."""
+    """Outline changed cubes; chosen cubes use a translucent 2D fill (labelmap)."""
 
     def __init__(self) -> None:
         self._cubes: list[dict] = []
         self._cube_by_key: dict[str, dict] = {}
         self._ijk_to_ras: vtk.vtkMatrix4x4 | None = None
         self._ras_to_ijk: vtk.vtkMatrix4x4 | None = None
+        self._volume_node_id = ""
         self._enabled = True
         self._model_node_id = ""
         self._chosen_upper_id = ""
         self._chosen_lower_id = ""
+        self._chosen_upper_color_id = ""
+        self._chosen_lower_color_id = ""
+        self._label_bindings: list[tuple[str, str]] = []
         self._choices: dict[str, str] = {}
         self._click_observers: list[tuple] = []
         self._click_callback = None
@@ -239,13 +246,19 @@ class CubeDiffOverlay:
     ) -> int:
         self._cubes = changed_cube_bounds(target_manifest, source_manifest)
         self._cube_by_key = {str(c.get("key") or ""): c for c in self._cubes}
+        self._volume_node_id = ""
         matrix = vtk.vtkMatrix4x4()
         if volume_node is not None:
             try:
+                self._volume_node_id = str(volume_node.GetID() or "")
                 volume_node.GetIJKToRASMatrix(matrix)
             except Exception:
                 geo = manifest_geometry(source_manifest or target_manifest, volume_node)
                 matrix = _geometry_ijk_to_ras_matrix(geo)
+                try:
+                    self._volume_node_id = str(volume_node.GetID() or "")
+                except Exception:
+                    self._volume_node_id = ""
         else:
             geo = manifest_geometry(source_manifest or target_manifest, None)
             matrix = _geometry_ijk_to_ras_matrix(geo)
@@ -276,22 +289,15 @@ class CubeDiffOverlay:
 
     def stop(self) -> None:
         self._remove_click_observers()
-        for node_id in (
-            self._model_node_id,
-            self._chosen_upper_id,
-            self._chosen_lower_id,
-        ):
-            if not node_id:
-                continue
-            node = slicer.mrmlScene.GetNodeByID(str(node_id))
+        self._clear_chosen_models()
+        if self._model_node_id:
+            node = slicer.mrmlScene.GetNodeByID(str(self._model_node_id))
             if node is not None:
                 try:
                     slicer.mrmlScene.RemoveNode(node)
                 except Exception:
                     pass
         self._model_node_id = ""
-        self._chosen_upper_id = ""
-        self._chosen_lower_id = ""
         self._remove_named_models()
 
     def set_enabled(self, enabled: bool) -> None:
@@ -306,7 +312,7 @@ class CubeDiffOverlay:
             self.set_choices(self._choices)
 
     def set_choices(self, choices: dict[str, str] | None) -> None:
-        """Cyan only on the side that was chosen (upper views vs lower views)."""
+        """Cyan fill on the side that was chosen (upper views vs lower views)."""
         cleaned: dict[str, str] = {}
         for key, side in dict(choices or {}).items():
             k = str(key or "").strip()
@@ -328,25 +334,23 @@ class CubeDiffOverlay:
             if s == "lower" and k in self._cube_by_key
         ]
         if upper_cubes:
-            poly = self._build_wireframe_polydata(upper_cubes)
-            if poly is not None and int(poly.GetNumberOfPoints()) > 0:
-                self._chosen_upper_id = self._add_model(
-                    CUBE_DIFF_CHOSEN_UPPER_NAME,
-                    poly,
-                    CUBE_DIFF_SELECTED_COLOR,
-                    CUBE_DIFF_SELECTED_LINE_WIDTH,
-                    TARGET_SLICE_TAGS,
-                )
+            node_id, color_id = self._add_chosen_fill(
+                upper_cubes,
+                CUBE_DIFF_CHOSEN_UPPER_NAME,
+                CUBE_DIFF_CHOSEN_UPPER_COLOR,
+                TARGET_SLICE_TAGS,
+            )
+            self._chosen_upper_id = node_id
+            self._chosen_upper_color_id = color_id
         if lower_cubes:
-            poly = self._build_wireframe_polydata(lower_cubes)
-            if poly is not None and int(poly.GetNumberOfPoints()) > 0:
-                self._chosen_lower_id = self._add_model(
-                    CUBE_DIFF_CHOSEN_LOWER_NAME,
-                    poly,
-                    CUBE_DIFF_SELECTED_COLOR,
-                    CUBE_DIFF_SELECTED_LINE_WIDTH,
-                    SOURCE_SLICE_TAGS,
-                )
+            node_id, color_id = self._add_chosen_fill(
+                lower_cubes,
+                CUBE_DIFF_CHOSEN_LOWER_NAME,
+                CUBE_DIFF_CHOSEN_LOWER_COLOR,
+                SOURCE_SLICE_TAGS,
+            )
+            self._chosen_lower_id = node_id
+            self._chosen_lower_color_id = color_id
 
     def pick_key_at_ras(self, ras) -> str:
         """Return changed-cube key containing this RAS point, else ''."""
@@ -448,25 +452,33 @@ class CubeDiffOverlay:
             pass
 
     def _apply_visibility(self) -> None:
-        for node_id in (
-            self._model_node_id,
-            self._chosen_upper_id,
-            self._chosen_lower_id,
-        ):
-            node = slicer.mrmlScene.GetNodeByID(str(node_id or ""))
-            if node is None:
-                continue
+        node = slicer.mrmlScene.GetNodeByID(str(self._model_node_id or ""))
+        if node is not None:
             display = node.GetDisplayNode()
-            if display is None:
+            if display is not None:
+                try:
+                    display.SetVisibility(bool(self._enabled))
+                    display.SetVisibility2D(bool(self._enabled))
+                except Exception:
+                    pass
+        opacity = CUBE_DIFF_FILL_OPACITY if self._enabled else 0.0
+        for composite_id, _prev in list(self._label_bindings):
+            composite = slicer.mrmlScene.GetNodeByID(str(composite_id or ""))
+            if composite is None:
                 continue
             try:
-                display.SetVisibility(bool(self._enabled))
-                display.SetVisibility2D(bool(self._enabled))
+                composite.SetLabelOpacity(float(opacity))
             except Exception:
                 pass
 
     def _clear_chosen_models(self) -> None:
-        for attr in ("_chosen_upper_id", "_chosen_lower_id"):
+        self._restore_label_bindings()
+        for attr in (
+            "_chosen_upper_id",
+            "_chosen_lower_id",
+            "_chosen_upper_color_id",
+            "_chosen_lower_color_id",
+        ):
             node_id = str(getattr(self, attr, "") or "")
             setattr(self, attr, "")
             if not node_id:
@@ -477,6 +489,180 @@ class CubeDiffOverlay:
                     slicer.mrmlScene.RemoveNode(node)
                 except Exception:
                     pass
+        self._remove_named_chosen_nodes()
+
+    def _restore_label_bindings(self) -> None:
+        for composite_id, prev_label_id in list(self._label_bindings):
+            composite = slicer.mrmlScene.GetNodeByID(str(composite_id or ""))
+            if composite is None:
+                continue
+            try:
+                composite.SetLabelVolumeID(str(prev_label_id or ""))
+            except Exception:
+                pass
+        self._label_bindings = []
+
+    def _bind_label_to_slices(self, labelmap, slice_tags) -> None:
+        if labelmap is None:
+            return
+        label_id = str(labelmap.GetID() or "")
+        if not label_id:
+            return
+        layout = slicer.app.layoutManager()
+        for tag in slice_tags:
+            widget = layout.sliceWidget(tag)
+            if widget is None:
+                continue
+            try:
+                composite = widget.sliceLogic().GetSliceCompositeNode()
+            except Exception:
+                continue
+            if composite is None:
+                continue
+            try:
+                prev = str(composite.GetLabelVolumeID() or "")
+                composite_id = str(composite.GetID() or "")
+                if composite_id:
+                    self._label_bindings.append((composite_id, prev))
+                composite.SetLabelVolumeID(label_id)
+                composite.SetLabelOpacity(
+                    float(CUBE_DIFF_FILL_OPACITY if self._enabled else 0.0)
+                )
+            except Exception:
+                continue
+
+    def _add_chosen_fill(
+        self,
+        cubes: list[dict],
+        label_name: str,
+        color_name: str,
+        slice_tags,
+    ) -> tuple[str, str]:
+        """Translucent cyan fill via labelmap on the given 2D compare views."""
+        volume = slicer.mrmlScene.GetNodeByID(str(self._volume_node_id or ""))
+        if volume is None or not cubes:
+            # Fallback: outline only (no volume to paint into).
+            poly = self._build_wireframe_polydata(cubes)
+            if poly is None or int(poly.GetNumberOfPoints()) <= 0:
+                return "", ""
+            return (
+                self._add_model(
+                    label_name,
+                    poly,
+                    CUBE_DIFF_SELECTED_COLOR,
+                    CUBE_DIFF_SELECTED_LINE_WIDTH,
+                    slice_tags,
+                ),
+                "",
+            )
+        self._remove_node_by_name("vtkMRMLLabelMapVolumeNode", label_name)
+        self._remove_node_by_name("vtkMRMLColorTableNode", color_name)
+
+        labelmap = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode", label_name
+        )
+        labelmap.SetName(label_name)
+        try:
+            slicer.modules.volumes.logic().CreateLabelVolumeFromVolume(
+                slicer.mrmlScene, labelmap, volume
+            )
+        except Exception:
+            try:
+                slicer.mrmlScene.RemoveNode(labelmap)
+            except Exception:
+                pass
+            poly = self._build_wireframe_polydata(cubes)
+            if poly is None or int(poly.GetNumberOfPoints()) <= 0:
+                return "", ""
+            return (
+                self._add_model(
+                    label_name,
+                    poly,
+                    CUBE_DIFF_SELECTED_COLOR,
+                    CUBE_DIFF_SELECTED_LINE_WIDTH,
+                    slice_tags,
+                ),
+                "",
+            )
+
+        try:
+            arr = slicer.util.arrayFromVolume(labelmap)
+            arr[:] = 0
+            # arrayFromVolume is shaped (k, j, i).
+            nk, nj, ni = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+            for cube in cubes:
+                i0 = max(0, int(cube["i0"]))
+                i1 = min(ni, int(cube["i1"]))
+                j0 = max(0, int(cube["j0"]))
+                j1 = min(nj, int(cube["j1"]))
+                k0 = max(0, int(cube["k0"]))
+                k1 = min(nk, int(cube["k1"]))
+                if i1 > i0 and j1 > j0 and k1 > k0:
+                    arr[k0:k1, j0:j1, i0:i1] = 1
+            slicer.util.updateVolumeFromArray(labelmap, arr)
+        except Exception:
+            try:
+                slicer.mrmlScene.RemoveNode(labelmap)
+            except Exception:
+                pass
+            return "", ""
+
+        color_id = ""
+        try:
+            color_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLColorTableNode", color_name
+            )
+            color_node.SetName(color_name)
+            color_node.SetTypeToUser()
+            color_node.SetNumberOfColors(2)
+            color_node.SetColor(0, 0.0, 0.0, 0.0, 0.0)
+            color_node.SetColor(
+                1,
+                float(CUBE_DIFF_SELECTED_COLOR[0]),
+                float(CUBE_DIFF_SELECTED_COLOR[1]),
+                float(CUBE_DIFF_SELECTED_COLOR[2]),
+                1.0,
+            )
+            color_id = str(color_node.GetID() or "")
+            display = labelmap.GetDisplayNode()
+            if display is None:
+                labelmap.CreateDefaultDisplayNodes()
+                display = labelmap.GetDisplayNode()
+            if display is not None and color_id:
+                display.SetAndObserveColorNodeID(color_id)
+                try:
+                    display.SetVisibility(bool(self._enabled))
+                except Exception:
+                    pass
+        except Exception:
+            color_id = ""
+
+        self._bind_label_to_slices(labelmap, slice_tags)
+        return str(labelmap.GetID() or ""), color_id
+
+    @staticmethod
+    def _remove_node_by_name(class_name: str, name: str) -> None:
+        scene = slicer.mrmlScene
+        for index in range(scene.GetNumberOfNodesByClass(class_name) - 1, -1, -1):
+            node = scene.GetNthNodeByClass(index, class_name)
+            if node is None:
+                continue
+            if str(node.GetName() or "") == name:
+                try:
+                    scene.RemoveNode(node)
+                except Exception:
+                    pass
+
+    def _remove_named_chosen_nodes(self) -> None:
+        for class_name, name in (
+            ("vtkMRMLLabelMapVolumeNode", CUBE_DIFF_CHOSEN_UPPER_NAME),
+            ("vtkMRMLLabelMapVolumeNode", CUBE_DIFF_CHOSEN_LOWER_NAME),
+            ("vtkMRMLModelNode", CUBE_DIFF_CHOSEN_UPPER_NAME),
+            ("vtkMRMLModelNode", CUBE_DIFF_CHOSEN_LOWER_NAME),
+            ("vtkMRMLColorTableNode", CUBE_DIFF_CHOSEN_UPPER_COLOR),
+            ("vtkMRMLColorTableNode", CUBE_DIFF_CHOSEN_LOWER_COLOR),
+        ):
+            self._remove_node_by_name(class_name, name)
 
     def _add_model(self, name: str, poly, color, thickness, slice_tags) -> str:
         model = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
@@ -574,7 +760,7 @@ class CubeDiffOverlay:
     @staticmethod
     def _remove_named_models() -> None:
         scene = slicer.mrmlScene
-        names = {
+        model_names = {
             CUBE_DIFF_MODEL_NAME,
             CUBE_DIFF_CHOSEN_UPPER_NAME,
             CUBE_DIFF_CHOSEN_LOWER_NAME,
@@ -584,11 +770,26 @@ class CubeDiffOverlay:
             node = scene.GetNthNodeByClass(index, "vtkMRMLModelNode")
             if node is None:
                 continue
-            if str(node.GetName() or "") in names:
+            if str(node.GetName() or "") in model_names:
                 try:
                     scene.RemoveNode(node)
                 except Exception:
                     pass
+        for class_name, name in (
+            ("vtkMRMLLabelMapVolumeNode", CUBE_DIFF_CHOSEN_UPPER_NAME),
+            ("vtkMRMLLabelMapVolumeNode", CUBE_DIFF_CHOSEN_LOWER_NAME),
+            ("vtkMRMLColorTableNode", CUBE_DIFF_CHOSEN_UPPER_COLOR),
+            ("vtkMRMLColorTableNode", CUBE_DIFF_CHOSEN_LOWER_COLOR),
+        ):
+            for index in range(scene.GetNumberOfNodesByClass(class_name) - 1, -1, -1):
+                node = scene.GetNthNodeByClass(index, class_name)
+                if node is None:
+                    continue
+                if str(node.GetName() or "") == name:
+                    try:
+                        scene.RemoveNode(node)
+                    except Exception:
+                        pass
 
 
 def _ras_from_slice_click(slice_widget, interactor) -> tuple[float, float, float] | None:
