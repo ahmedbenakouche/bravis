@@ -605,6 +605,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self.comparePanel.showCubeDiffsCheck.toggled.connect(
             self._mergeCompareSetShowCubeDiffs
         )
+        self.comparePanel.autoSelectCheck.toggled.connect(
+            self._mergeCompareSetAutoSelect
+        )
         self.comparePanel.applyMergeButton.clicked.connect(self._mergeCompareApply)
         self.comparePanel.quitButton.clicked.connect(self._exitMergeCompare)
         self.comparePanel.segmentList.currentRowChanged.connect(
@@ -2000,6 +2003,48 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 overlay.set_enabled(bool(checked))
             except Exception:
                 logging.exception("Could not toggle cube-diff overlay")
+
+    def _mergeCompareSetAutoSelect(self, checked: bool = False) -> None:
+        """Check: fill empty↔filled choices. Uncheck: leave cyan as-is."""
+        if not checked:
+            return
+        session = getattr(self, "_merge_compare_session", None)
+        if not session:
+            return
+        target_manifest = session.get("target_manifest")
+        source_manifest = session.get("source_manifest")
+        choices = dict(session.get("cube_choices") or {})
+        auto_n = 0
+        conflict_n = 0
+        for cube in list(session.get("cube_rows") or []):
+            key = str((cube or {}).get("key") or "").strip()
+            if not key:
+                continue
+            side = MergeCompare.auto_choice_for_cube(
+                target_manifest, source_manifest, key
+            )
+            if side in ("upper", "lower"):
+                choices[key] = side
+                auto_n += 1
+            else:
+                conflict_n += 1
+        session["cube_choices"] = choices
+        overlay = session.get("cube_overlay")
+        if overlay is not None:
+            try:
+                overlay.set_choices(choices)
+            except Exception:
+                logging.exception("Could not highlight auto-selected cubes")
+        total = len(list(session.get("cube_rows") or []))
+        chosen = sum(
+            1
+            for v in choices.values()
+            if str(v or "").strip().lower() in ("upper", "lower")
+        )
+        self._appendFeed(
+            "Auto-select: %d clear change(s), %d conflict(s) left (%d/%d chosen)."
+            % (auto_n, conflict_n, chosen, total)
+        )
 
     def _mergeCompareCubeClicked(self, key: str, side: str) -> None:
         """Click side to choose; re-click same side to clear. Cyan only on that side."""

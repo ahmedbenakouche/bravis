@@ -141,6 +141,44 @@ def manifest_geometry(manifest: dict | None, volume_node=None) -> dict:
     }
 
 
+def _cube_digest_is_empty(manifest: dict | None, key: str) -> bool:
+    """True when the cube is absent or an all-zero hash for its block shape."""
+    if not isinstance(manifest, dict):
+        return True
+    chunks = manifest.get("chunks") or {}
+    if not isinstance(chunks, dict):
+        return True
+    digest = str(chunks.get(key) or "").strip().lower()
+    if not digest:
+        return True
+    shape, chunk = SegmentationCubes._manifest_shape_chunk(manifest)
+    if shape is None:
+        return False
+    try:
+        expected = SegmentationCubes.cube_shape(shape, key, chunk)
+        return digest == str(SegmentationCubes.zero_hash(expected) or "").strip().lower()
+    except (TypeError, ValueError, RuntimeError):
+        return False
+
+
+def auto_choice_for_cube(
+    target_manifest: dict | None,
+    source_manifest: dict | None,
+    key: str,
+) -> str | None:
+    """Return ``upper``/``lower`` for empty↔filled diffs; ``None`` for conflicts."""
+    key = str(key or "").strip()
+    if not key:
+        return None
+    upper_empty = _cube_digest_is_empty(target_manifest, key)
+    lower_empty = _cube_digest_is_empty(source_manifest, key)
+    if upper_empty and not lower_empty:
+        return "lower"
+    if lower_empty and not upper_empty:
+        return "upper"
+    return None
+
+
 def build_merged_manifest(
     target_manifest: dict | None,
     source_manifest: dict | None,
@@ -1395,10 +1433,16 @@ class MergeComparePanel(qt.QWidget):
         )
         layout.addWidget(self.showCubeDiffsCheck)
 
+        self.autoSelectCheck = qt.QCheckBox("Auto-select")
+        self.autoSelectCheck.setChecked(False)
+        layout.addWidget(self.autoSelectCheck)
+
         self.cubeGuideLabel = qt.QLabel(
             "Click the cube you want to keep on the 2D views. "
             "Chosen cubes turn cyan on that side — those are taken on Apply merge. "
-            "Click again on the same side to clear."
+            "Click again on the same side to clear. "
+            "Auto-select keeps the side that has content when the other side is empty. "
+            "If both sides have content, you choose."
         )
         self.cubeGuideLabel.setWordWrap(True)
         self.cubeGuideLabel.setStyleSheet("color: %s; font-size: 11px;" % muted)
@@ -1500,14 +1544,17 @@ class MergeComparePanel(qt.QWidget):
         self.showAllCheck.blockSignals(True)
         self.showCubeDiffsCheck.blockSignals(True)
         self.show3dCheck.blockSignals(True)
+        self.autoSelectCheck.blockSignals(True)
         try:
             self.showAllCheck.setChecked(False)
             self.show3dCheck.setChecked(False)
             self.showCubeDiffsCheck.setChecked(True)
+            self.autoSelectCheck.setChecked(False)
         finally:
             self.showAllCheck.blockSignals(False)
             self.showCubeDiffsCheck.blockSignals(False)
             self.show3dCheck.blockSignals(False)
+            self.autoSelectCheck.blockSignals(False)
         self._rows = []
         self._suppress_list = True
         try:
