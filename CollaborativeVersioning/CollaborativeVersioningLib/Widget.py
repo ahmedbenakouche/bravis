@@ -1364,17 +1364,30 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         junior: bool = False,
         older_lane: str = "",
         at_lane_tip: bool = False,
+        merged_tip: bool = False,
     ) -> str:
         """Ask where to save. Returns main | same | branch | cancel.
 
         - Tip of main (senior): Put on main / Create a branch.
         - Tip of a side lane: Save on this branch / Create a branch (fork).
+        - Tip of a merged lane: Create a branch only (do not advance the tip).
         - Older tip view: Create a branch only (do not rewind the tip).
         - Junior (legacy path): Create a branch only.
         """
         box = qt.QMessageBox(slicer.util.mainWindow())
         box.setWindowTitle("Save version")
         lane_label = str(older_lane or "").strip() or "main"
+        if merged_tip:
+            box.setText("This branch is already merged.")
+            box.setInformativeText(
+                "Create a branch from here to keep working. "
+                "The merged branch tip stays unchanged."
+            )
+            branch_btn = box.addButton("Create a branch", qt.QMessageBox.AcceptRole)
+            box.addButton("Cancel", qt.QMessageBox.RejectRole)
+            box.setDefaultButton(branch_btn)
+            box.exec_()
+            return "branch" if box.clickedButton() == branch_btn else "cancel"
         if at_lane_tip:
             box.setText("Where should this version be saved?")
             box.setInformativeText(
@@ -8907,15 +8920,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             on_branch = False
         if on_branch and not from_older_line:
             # Tip of a side lane: continue here or fork parent/<child>.
+            # Already merged upward → Create a branch only (same gate as hide Merge).
             tip_lane = lane_slug or older_lane or "branch"
-            destination = self._promptSaveDestination(
-                at_lane_tip=True,
-                older_lane=tip_lane,
-            )
-            if destination == "cancel":
-                self._appendFeed("Save cancelled.")
-                return
-            if destination == "branch":
+            if self._laneAlreadyIntegrated(tip_lane):
+                destination = self._promptSaveDestination(
+                    merged_tip=True,
+                    older_lane=tip_lane,
+                )
+                if destination == "cancel":
+                    self._appendFeed("Save cancelled.")
+                    return
                 fork_parent = self._forkParentLaneForCreate(
                     tip_lane or older_lane or lane_slug
                 )
@@ -8923,7 +8937,23 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if not new_branch_slug:
                     self._appendFeed("Save cancelled.")
                     return
-            # "same" → keep on_branch and commit on the current lane.
+            else:
+                destination = self._promptSaveDestination(
+                    at_lane_tip=True,
+                    older_lane=tip_lane,
+                )
+                if destination == "cancel":
+                    self._appendFeed("Save cancelled.")
+                    return
+                if destination == "branch":
+                    fork_parent = self._forkParentLaneForCreate(
+                        tip_lane or older_lane or lane_slug
+                    )
+                    new_branch_slug = self._promptBranchName(parent_lane=fork_parent)
+                    if not new_branch_slug:
+                        self._appendFeed("Save cancelled.")
+                        return
+                # "same" → keep on_branch and commit on the current lane.
         elif not on_branch:
             # Junior: Create a branch only (cannot Share from main).
             # Older tip (main or task): Create a branch only.
