@@ -544,14 +544,18 @@ def _ranges_overlap(first, second):
 
 
 def _side_branch_spans(specs, rows):
-    """Row ranges each side branch occupies, including fork/merge corridors.
+    """Row ranges each side branch occupies for column assignment.
 
-    For every side node we reserve from its parent row through the node row so
-    another lane cannot reuse that column while our vertical edge is still
-    traveling (classic bug: empty task stub + later branch stacked in one
-    column with edges cutting through the stub).
+    Reserve from fork parent row through each side node so another lane cannot
+    reuse that column while our vertical edge is still traveling (classic bug:
+    empty task stub + later branch stacked with edges cutting through the stub).
+
+    Do **not** extend the span to a merge *target* on main: that row is the main
+    junction (e.g. ``jh`` merges into ``main/2``, ``sgtf`` forks from ``main/2``).
+    Extending caused a false conflict and shoved ``jh`` to +2; allowing a mere
+    boundary touch instead let ``hvk`` share +1 with ``sgtf`` so the fork edge
+    looked like ``sgtf`` hung under ``hvk``.
     """
-    specs_by_id = {spec["id"]: spec for spec in specs or []}
     spans = {}
     for spec in specs or []:
         branch = spec.get("branch") or "main"
@@ -568,17 +572,6 @@ def _side_branch_spans(specs, rows):
             spans[branch] = (lo, hi)
         else:
             spans[branch] = (min(current[0], lo), max(current[1], hi))
-    for spec in specs or []:
-        if not spec.get("merge"):
-            continue
-        merge_row = rows.get(spec["id"], 0)
-        for source_id in spec.get("merge_from") or []:
-            source = specs_by_id.get(source_id) or {}
-            branch = source.get("branch") or "main"
-            if branch == "main" or branch not in spans:
-                continue
-            lo, hi = spans[branch]
-            spans[branch] = (lo, max(hi, merge_row))
     return spans
 
 
@@ -640,6 +633,8 @@ def _assign_side_lanes(specs, rows):
     """Assign columns: main-rooted like before; sub-branches nest around their parent.
 
     - Forks from ``main``: closest free column (+1, -1, +2, -2, …).
+    - Placement order: depth, then **later** corridor start first (so a lower
+      fork keeps +1/−1; an older fork that grows down moves outward).
     - Forks from a side branch A: treat A as a local main — same ±1, ±2 pattern
       relative to A (outer then inner), always on A's side of ``main``. When the
       inner slot is blocked (by main or by a cousin like F already between main
@@ -667,9 +662,13 @@ def _assign_side_lanes(specs, rows):
                 break
         return depth
 
+    # Later-starting corridors first (larger spans[lo]): a branch that forks
+    # lower on main keeps the near column (+1/−1). An older fork that grows
+    # downward yields the outer column instead of shoving the lower branch out
+    # (avoids main→lower-branch edges crossing through the older tip).
     ordered = sorted(
         spans.keys(),
-        key=lambda name: (branch_depth(name), spans[name][0], name),
+        key=lambda name: (branch_depth(name), -spans[name][0], name),
     )
 
     for branch in ordered:
