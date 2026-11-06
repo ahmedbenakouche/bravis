@@ -9111,22 +9111,32 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         unshared = self._historyHasUnsharedVersion(history)
         self._applyProjectHistoryBundle(history, follow_head=True)
         self._unshared_version = unshared
-        self._closeProgress()
-        self._refreshUiState()
-        self._unshared_version = unshared
-        self._updateVersionActionButtons()
         me = self._githubLogin() or "Someone"
         if published == "main":
-            self._appendFeed("Shared on main.")
+            feed_msg = "Shared on main."
             share_event = self._buildActivityEvent(
                 "share", "%s shared versions on main." % me
             )
         else:
             label = published or branch
-            self._appendFeed("Shared on branch %s." % label)
+            feed_msg = "Shared on branch %s." % label
             share_event = self._buildActivityEvent(
                 "share", "%s shared versions on branch %s." % (me, label)
             )
+        # Do NOT _refreshUiState / rebuild the history table here: Share only
+        # flips local→pushed (dashed box on the graph), and the table does not
+        # show that column — a full rebuild was pure freeze. Keep the progress
+        # dialog open through the light UI pass + activity network write, or the
+        # freeze appears after the bar closes (_recordActivity → gh API).
+        self._updateProgress("Updating the Version tree…")
+        self._updateVersionActionButtons()
+        self._updateActiveVersionIndicators()
+        if share_event:
+            self._updateProgress("Recording activity…")
+            self._recordActivity(self._currentProjectName(), event=share_event)
+        self._closeProgress()
+        self._appendFeed(feed_msg)
+        if published != "main":
             # Juniors get a next-step hint; seniors already have the feed (like Share on main).
             next_step = self._shareLineNextStepMessage()
             if next_step:
@@ -9135,8 +9145,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed(
                 "Unsaved changes are still on this computer. Save a version if you want them shared later."
             )
-        if share_event:
-            self._recordActivity(self._currentProjectName(), event=share_event)
 
     def _activeTasksAsJunior(self) -> list:
         me = (self._githubLogin() or "").strip().lower()
@@ -10030,18 +10038,36 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 str((spec or {}).get("id") or "") for spec in specs
             )
             specs_changed = bool(specs) and prev_spec_ids != new_spec_ids
+            # Share: same node ids, only local → pushed (dashed → solid). Compare
+            # status before replacing commit_history_by_id or badges-only skips draw.
+            def _share_status_key(lookup) -> tuple:
+                return tuple(
+                    sorted(
+                        (
+                            str(vid),
+                            str((info or {}).get("status") or "").strip().lower(),
+                        )
+                        for vid, info in (lookup or {}).items()
+                    )
+                )
+
+            prev_share = _share_status_key(
+                getattr(canvas, "commit_history_by_id", None)
+            )
+            new_lookup = CollaborativeVersioningLib.GraphCanvas.commit_history_lookup(
+                bundle.get("commit_history", [])
+            )
+            share_status_changed = prev_share != _share_status_key(new_lookup)
             if specs and hasattr(canvas, "version_specs"):
                 canvas.version_specs = specs
                 canvas._specs_by_id = {spec["id"]: spec for spec in specs}
-                canvas.commit_history_by_id = CollaborativeVersioningLib.GraphCanvas.commit_history_lookup(
-                    bundle.get("commit_history", [])
-                )
+                canvas.commit_history_by_id = new_lookup
             pending = set(self._reviewPendingVersionIds() or ())
             locked = set(self._writeLockedVersionIds() or ())
-            # After Merge/Accept/Share the graph topology changes but 🔵/🔒/checkout
-            # may stay the same — refresh_status_badges would skip draw. Force a
-            # full redraw when version_specs change; otherwise badge-only refresh.
-            if specs_changed and hasattr(canvas, "draw"):
+            # After Merge/Accept/Share the graph topology or share status changes
+            # but 🔵/🔒/checkout may stay the same — refresh_status_badges would
+            # skip draw. Force a full redraw when specs or local/pushed change.
+            if (specs_changed or share_status_changed) and hasattr(canvas, "draw"):
                 canvas.review_pending_ids = pending
                 canvas.write_locked_ids = locked
                 canvas.active_version_id = active
