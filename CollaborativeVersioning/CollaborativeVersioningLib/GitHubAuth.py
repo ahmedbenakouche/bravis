@@ -2847,31 +2847,48 @@ def _format_git_date(iso: str) -> str:
     return text.strip()
 
 
-def _unpushed_commit_shas(repo_dir: str) -> set[str]:
+def _unpushed_commit_shas(
+    repo_dir: str,
+    *,
+    commit_by_sha: dict[str, dict] | None = None,
+    shared_shas: set[str] | None = None,
+    line_tip: str | None = None,
+    review_tips: dict | None = None,
+) -> set[str]:
     """SHAs on the current line tip that are not on any shared remote tip.
 
     Matches Version-tree "local" vs "pushed": shared = origin/main +
     origin/cv-review/* (see ``_shared_remote_shas``). On main (or detached
     viewing an older main commit), use the main tip; on a review branch or
     detached task-lane commit, use HEAD.
+
+    Pass ``commit_by_sha`` / ``shared_shas`` / ``line_tip`` / ``review_tips``
+    when the caller already has them — avoids a second ``git log``, shared scan,
+    and a costly ``head_is_side_review_commit`` tip reload.
     """
-    head = _git_rev_parse(repo_dir, "HEAD")
-    main_tip = _git_rev_parse(repo_dir, "refs/heads/main")
-    if work_is_on_review_branch(repo_dir) or head_is_side_review_commit(
-        repo_dir, head, main_tip
-    ):
-        tip = head
-    else:
-        tip = main_tip or head
+    tip = str(line_tip or "").strip()
+    if not tip:
+        head = _git_rev_parse(repo_dir, "HEAD")
+        main_tip = _git_rev_parse(repo_dir, "refs/heads/main")
+        if work_is_on_review_branch(repo_dir) or head_is_side_review_commit(
+            repo_dir, head, main_tip, review_tips
+        ):
+            tip = head
+        else:
+            tip = main_tip or head
     if not tip:
         return set()
-    commit_by_sha = _read_repo_commits(repo_dir)
-    if not commit_by_sha:
+    commits = commit_by_sha if commit_by_sha is not None else _read_repo_commits(repo_dir)
+    if not commits:
         return set()
-    shared = _shared_remote_shas(repo_dir, commit_by_sha)
+    shared = (
+        shared_shas
+        if shared_shas is not None
+        else _shared_remote_shas(repo_dir, commits)
+    )
     return {
         sha
-        for sha in _first_parent_chain(commit_by_sha, tip)
+        for sha in _first_parent_chain(commits, tip)
         if sha and sha not in shared
     }
 
@@ -3052,11 +3069,12 @@ def open_or_update_local_project(full_name: str, mode: str = "update") -> str:
     return dest
 
 
-def _history_refs(repo_dir: str) -> list[str]:
+def _history_ref_sha_pairs(repo_dir: str) -> list[tuple[str, str]]:
+    """One ``for-each-ref`` for cv-review heads + origin tips (name, sha)."""
     result = _run_git(
         [
             "for-each-ref",
-            "--format=%(refname)",
+            "--format=%(refname)\t%(objectname)",
             "refs/heads/cv-review",
             "refs/remotes/origin/cv-review",
         ],
@@ -3065,12 +3083,27 @@ def _history_refs(repo_dir: str) -> list[str]:
     )
     if result.returncode != 0:
         return []
-    refs = []
+    pairs: list[tuple[str, str]] = []
     for line in (result.stdout or "").splitlines():
-        ref = line.strip()
-        if ref:
-            refs.append(ref)
-    return refs
+        raw = line.strip()
+        if not raw:
+            continue
+        if "\t" in raw:
+            ref, sha = raw.split("\t", 1)
+        else:
+            parts = raw.split(None, 1)
+            if len(parts) != 2:
+                continue
+            ref, sha = parts
+        ref = ref.strip()
+        sha = sha.strip()
+        if ref and sha:
+            pairs.append((ref, sha))
+    return pairs
+
+
+def _history_refs(repo_dir: str) -> list[str]:
+    return [ref for ref, _sha in _history_ref_sha_pairs(repo_dir)]
 
 
 def _review_tips(
@@ -3081,21 +3114,40 @@ def _review_tips(
 ) -> dict[str, list[str]]:
     """Tips for cv-review lanes. Optionally restrict to local heads or origin remotes."""
     tips: dict[str, list[str]] = {}
-    for ref in _history_refs(repo_dir):
+    for ref, sha in _history_ref_sha_pairs(repo_dir):
         if local_only and not ref.startswith("refs/heads/cv-review"):
             continue
         if remote_only and not ref.startswith("refs/remotes/origin/cv-review"):
             continue
         login = _review_login_from_ref(ref)
-        if not login:
-            continue
-        sha = _git_rev_parse(repo_dir, ref)
-        if not sha:
+        if not login or not sha:
             continue
         bucket = tips.setdefault(login.lower(), [])
         if sha not in bucket:
             bucket.append(sha)
     return tips
+
+
+def _review_tips_local_and_remote(
+    repo_dir: str,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Local + remote review tips from a single for-each-ref."""
+    local_tips: dict[str, list[str]] = {}
+    remote_tips: dict[str, list[str]] = {}
+    for ref, sha in _history_ref_sha_pairs(repo_dir):
+        login = _review_login_from_ref(ref)
+        if not login or not sha:
+            continue
+        key = login.lower()
+        if ref.startswith("refs/heads/cv-review"):
+            bucket = local_tips.setdefault(key, [])
+        elif ref.startswith("refs/remotes/origin/cv-review"):
+            bucket = remote_tips.setdefault(key, [])
+        else:
+            continue
+        if sha not in bucket:
+            bucket.append(sha)
+    return local_tips, remote_tips
 
 
 def _first_parent_chain(commit_by_sha: dict[str, dict], tip: str) -> list[str]:
@@ -3368,18 +3420,31 @@ def _lane_start_anchor_sha(
 
 
 def _history_log_refs(repo_dir: str) -> list[str]:
-    refs = []
-    seen = set()
-    for ref in ("HEAD", "refs/heads/main", "refs/remotes/origin/main"):
-        if not _git_rev_parse(repo_dir, ref):
-            continue
-        if ref not in seen:
-            seen.add(ref)
-            refs.append(ref)
-    for ref in _history_refs(repo_dir):
-        if ref not in seen:
-            seen.add(ref)
-            refs.append(ref)
+    """Refs for ``git log`` — minimize process spawns (esp. on Windows)."""
+    refs: list[str] = []
+    seen: set[str] = set()
+    # One rev-parse for HEAD; main tips via for-each-ref (no per-ref verify spawn).
+    if _git_rev_parse(repo_dir, "HEAD"):
+        refs.append("HEAD")
+        seen.add("HEAD")
+    main_refs = _run_git(
+        [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/main",
+            "refs/remotes/origin/main",
+            "refs/heads/cv-review",
+            "refs/remotes/origin/cv-review",
+        ],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    if main_refs.returncode == 0:
+        for line in (main_refs.stdout or "").splitlines():
+            ref = line.strip()
+            if ref and ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
     return refs
 
 
@@ -3424,10 +3489,9 @@ def _shared_remote_shas(repo_dir: str, commit_by_sha: dict[str, dict]) -> set[st
             for extra in parents[1:]:
                 if extra:
                     shared.update(_first_parent_chain(commit_by_sha, extra))
-    for ref in _history_refs(repo_dir):
+    for ref, tip in _history_ref_sha_pairs(repo_dir):
         if not ref.startswith("refs/remotes/origin/cv-review"):
             continue
-        tip = _git_rev_parse(repo_dir, ref)
         if tip:
             shared.update(_first_parent_chain(commit_by_sha, tip))
     return shared
@@ -3736,18 +3800,33 @@ def _empty_history_model() -> dict[str, Any]:
 
 def _read_repo_commits(repo_dir: str) -> dict[str, dict[str, Any]]:
     """Load commit metadata for history / compare views."""
+    t_all = time.perf_counter()
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return {}
+    t0 = time.perf_counter()
     refs = _history_log_refs(repo_dir)
+    t_refs = time.perf_counter() - t0
     if not refs:
+        print(
+            "[CV History] _read_repo_commits: no refs (%.3fs)"
+            % (time.perf_counter() - t_all)
+        )
         return {}
+    t0 = time.perf_counter()
     result = _run_git(
         ["log", "--parents", "--reverse", "--format=%H%x1f%P%x1f%cI%x1f%an%x1f%s", *refs],
         cwd=repo_dir,
         timeout=60,
     )
+    t_git_log = time.perf_counter() - t0
     if result.returncode != 0:
+        print(
+            "[CV History] _read_repo_commits: git log failed refs=%d "
+            "refs=%.3fs git_log=%.3fs"
+            % (len(refs), t_refs, t_git_log)
+        )
         return {}
+    t0 = time.perf_counter()
     commit_by_sha: dict[str, dict[str, Any]] = {}
     for line in (result.stdout or "").splitlines():
         if not line.strip():
@@ -3763,6 +3842,19 @@ def _read_repo_commits(repo_dir: str) -> dict[str, dict[str, Any]]:
             "author": author,
             "message": message,
         }
+    t_parse = time.perf_counter() - t0
+    print(
+        "[CV History] _read_repo_commits: commits=%d refs=%d | "
+        "refs=%.3fs git_log=%.3fs parse=%.3fs TOTAL=%.3fs"
+        % (
+            len(commit_by_sha),
+            len(refs),
+            t_refs,
+            t_git_log,
+            t_parse,
+            time.perf_counter() - t_all,
+        )
+    )
     return commit_by_sha
 
 
@@ -4001,19 +4093,28 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
     are capped to the last Validate Update / Take / explicit sync — so a Compare
     peek-fetch alone does not rewrite the Version tree on the next Open.
     """
+    t_all = time.perf_counter()
     empty = _empty_history_model()
+    t0 = time.perf_counter()
     commit_by_sha = _read_repo_commits(repo_dir)
+    t_commits = time.perf_counter() - t0
     if not commit_by_sha:
+        print(
+            "[CV History] read_project_history empty after commits (%.3fs)"
+            % (time.perf_counter() - t_all)
+        )
         return empty
+    t0 = time.perf_counter()
     origin = _git_rev_parse(repo_dir, "origin/main")
     local_main = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
         repo_dir, "main"
     )
     head_sha = _git_rev_parse(repo_dir, "HEAD")
-    local_tips = _review_tips(repo_dir, local_only=True)
-    remote_tips = _review_tips(repo_dir, remote_only=True)
+    local_tips, remote_tips = _review_tips_local_and_remote(repo_dir)
     main_tip = origin or local_main
+    t_tips = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     if apply_ui_caps:
         caps = load_remote_sync_caps(repo_dir)
         if caps:
@@ -4038,11 +4139,13 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
                 if use:
                     capped_remote[login] = [use]
             remote_tips = capped_remote
+    t_caps = time.perf_counter() - t0
 
     # Never hide tips this computer already has on main (Share/Accept before caps refresh).
     # Do NOT advance main from HEAD when HEAD is on a side branch — that would paint
     # new branch commits as main/N (e.g. Save → Create a branch). Same when Switch
     # left HEAD detached on an older task-lane commit (not on cv-review/* by name).
+    t0 = time.perf_counter()
     main_tip = _prefer_ahead_tip(repo_dir, main_tip or "", local_main or "")
     review_tips: dict[str, list[str]] = dict(remote_tips)
     for login, tips in local_tips.items():
@@ -4050,17 +4153,39 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
         for tip in tips:
             if tip and tip not in bucket:
                 bucket.append(tip)
-    if head_sha and not head_is_side_review_commit(
-        repo_dir, head_sha, main_tip or local_main, review_tips
-    ):
+    on_side = bool(
+        head_sha
+        and head_is_side_review_commit(
+            repo_dir, head_sha, main_tip or local_main, review_tips
+        )
+    )
+    if head_sha and not on_side:
         main_tip = _prefer_ahead_tip(repo_dir, main_tip or "", head_sha) or main_tip
+    t_merge_tips = time.perf_counter() - t0
 
-    unpushed = _unpushed_commit_shas(repo_dir)
+    t0 = time.perf_counter()
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
+    t_shared = time.perf_counter() - t0
+    line_tip = (
+        head_sha
+        if on_side
+        else (local_main or head_sha or "")
+    )
+    t0 = time.perf_counter()
+    unpushed = _unpushed_commit_shas(
+        repo_dir,
+        commit_by_sha=commit_by_sha,
+        shared_shas=shared_shas,
+        line_tip=line_tip,
+    )
+    t_unpushed = time.perf_counter() - t0
     # Permanent …/start for Assign tasks only — not every origin/cv-review (DIY Share).
+    t0 = time.perf_counter()
     stub_slugs = _start_stub_slugs_for_history(
         repo_dir, remote_tips, main_tip or local_main or "", commit_by_sha
     )
+    t_stubs = time.perf_counter() - t0
+    t0 = time.perf_counter()
     model = build_project_history_model(
         commit_by_sha,
         main_tip,
@@ -4069,6 +4194,26 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
         unpushed,
         shared_shas=shared_shas,
         start_stub_slugs=stub_slugs,
+    )
+    t_build = time.perf_counter() - t0
+    print(
+        "[CV History] read_project_history TOTAL=%.3fs | "
+        "commits=%.3fs tips=%.3fs caps=%.3fs merge_tips=%.3fs "
+        "unpushed=%.3fs shared=%.3fs stubs=%.3fs build_model=%.3fs | "
+        "commits_n=%d versions=%d"
+        % (
+            time.perf_counter() - t_all,
+            t_commits,
+            t_tips,
+            t_caps,
+            t_merge_tips,
+            t_unpushed,
+            t_shared,
+            t_stubs,
+            t_build,
+            len(commit_by_sha),
+            len(model.get("version_specs") or []),
+        )
     )
     if not model.get("version_specs"):
         return empty
@@ -4119,10 +4264,22 @@ def read_compare_project_histories(
         repo_dir, "main"
     )
     head_sha = _git_rev_parse(repo_dir, "HEAD")
-    unpushed = _unpushed_commit_shas(repo_dir)
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
     local_review_tips = _prefer_farthest_review_tips(
         commit_by_sha, _review_tips(repo_dir, local_only=True)
+    )
+    on_side = bool(
+        head_sha
+        and head_is_side_review_commit(
+            repo_dir, head_sha, local_main or origin, local_review_tips
+        )
+    )
+    line_tip = head_sha if on_side else (local_main or head_sha or "")
+    unpushed = _unpushed_commit_shas(
+        repo_dir,
+        commit_by_sha=commit_by_sha,
+        shared_shas=shared_shas,
+        line_tip=line_tip,
     )
 
     remote_main_shas: set[str] = (
