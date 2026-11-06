@@ -2176,8 +2176,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._closeProgress()
             self._showGithubError(error, box=True)
             return
-        self._closeProgress()
+        # Keep progress open through UI rebuild + activity (same freeze as Share).
         unshared = self._historyHasUnsharedVersion(history)
+        self._updateProgress("Updating the Version tree…")
         self._suppress_dirty += 1
         self._suppress_asset_ui_updates += 1
         try:
@@ -2193,6 +2194,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._unshared_version = unshared
         self._updateVersionActionButtons()
         self._armLoadSettle()
+        self._updateActiveVersionIndicators()
+        self._updateTaskButtonUi()
+        self._updateProgress("Recording activity…")
         if target_lane == "main":
             task = self._activeTaskForBranchSlug(source_lane)
             if task is not None and str(task.get("status") or "") != "accepted":
@@ -2211,12 +2215,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "%s merged cubes from %s onto %s."
                 % (me or "Someone", source_lane, target_lane),
             )
+        self._closeProgress()
         self._appendFeed(
             "Applied cube merge: %d cube(s) (%d upper, %d lower) onto %s."
             % (len(cubes), upper_n, lower_n, target_lane)
         )
-        self._updateActiveVersionIndicators()
-        self._updateTaskButtonUi()
         self._refreshOpenVersionTreeIfNeeded()
 
     def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
@@ -4739,7 +4742,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._closeProgress()
             self._showGithubError(error, box=True)
             return current
-        self._closeProgress()
         if outcome == "already":
             message = "%s is already on this project." % username
         else:
@@ -4748,11 +4750,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 % (username, access_label)
             )
             me = self._githubLogin() or "Someone"
+            self._updateProgress("Recording activity…")
             self._recordActivity(
                 full_name,
                 "people_add",
                 "%s invited %s (%s)." % (me, username, access_label),
             )
+        self._closeProgress()
         self._appendFeed(message)
         return people
 
@@ -4775,7 +4779,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._closeProgress()
             self._showGithubError(error, box=True)
             return current
-        self._closeProgress()
         login_key = login.lower()
         people = [
             item
@@ -4786,18 +4789,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         me = self._githubLogin() or "Someone"
         if role == "pending":
             message = "Cancelled the invitation for %s." % login
-            self._recordActivity(
-                full_name,
-                "people_remove",
-                "%s cancelled the invitation for %s." % (me, login),
-            )
+            activity_text = "%s cancelled the invitation for %s." % (me, login)
         else:
             message = "Removed %s from the project." % login
-            self._recordActivity(
-                full_name,
-                "people_remove",
-                "%s removed %s from the project." % (me, login),
-            )
+            activity_text = "%s removed %s from the project." % (me, login)
+        self._updateProgress("Recording activity…")
+        self._recordActivity(full_name, "people_remove", activity_text)
+        self._closeProgress()
         self._appendFeed(message)
         return people
 
@@ -4819,7 +4817,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._closeProgress()
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
-        self._closeProgress()
         me = self._githubLogin() or "Someone"
         try:
             access = people_access_for(full_name, me)
@@ -4828,6 +4825,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         # Always refresh session cache (Senior→Junior re-invite must not keep old role).
         self._rememberPeopleAccess(full_name, access)
         role_label = "Senior" if access == PEOPLE_ACCESS_SENIOR else "Junior"
+        self._updateProgress("Recording activity…")
         self._recordActivity(
             full_name,
             "join",
@@ -4836,16 +4834,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         loaded = str(getattr(self, "_loaded_project_name", None) or "").strip()
         if full_name and loaded and full_name.lower() == loaded.lower():
             # Project already open: padlocks / Save / Share / Tasks follow the new role.
+            self._updateProgress("Updating the project…")
             self._refreshUiState()
             self._updateCommitHistoryPanel()
             self._updateVersionActionButtons()
             self._updateTaskButtonUi()
-            self._appendFeed(
+            feed_msg = (
                 "Joined %s as %s — role updated for the open project."
                 % (full_name, role_label)
             )
         else:
-            self._appendFeed("Joined %s. Open it when you are ready." % full_name)
+            feed_msg = "Joined %s. Open it when you are ready." % full_name
+        self._closeProgress()
+        self._appendFeed(feed_msg)
 
     def _declineIncomingInvitation(self, invitation: dict) -> None:
         full_name = invitation.get("full_name") or "the project"
