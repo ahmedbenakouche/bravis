@@ -3800,33 +3800,18 @@ def _empty_history_model() -> dict[str, Any]:
 
 def _read_repo_commits(repo_dir: str) -> dict[str, dict[str, Any]]:
     """Load commit metadata for history / compare views."""
-    t_all = time.perf_counter()
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return {}
-    t0 = time.perf_counter()
     refs = _history_log_refs(repo_dir)
-    t_refs = time.perf_counter() - t0
     if not refs:
-        print(
-            "[CV History] _read_repo_commits: no refs (%.3fs)"
-            % (time.perf_counter() - t_all)
-        )
         return {}
-    t0 = time.perf_counter()
     result = _run_git(
         ["log", "--parents", "--reverse", "--format=%H%x1f%P%x1f%cI%x1f%an%x1f%s", *refs],
         cwd=repo_dir,
         timeout=60,
     )
-    t_git_log = time.perf_counter() - t0
     if result.returncode != 0:
-        print(
-            "[CV History] _read_repo_commits: git log failed refs=%d "
-            "refs=%.3fs git_log=%.3fs"
-            % (len(refs), t_refs, t_git_log)
-        )
         return {}
-    t0 = time.perf_counter()
     commit_by_sha: dict[str, dict[str, Any]] = {}
     for line in (result.stdout or "").splitlines():
         if not line.strip():
@@ -3842,19 +3827,6 @@ def _read_repo_commits(repo_dir: str) -> dict[str, dict[str, Any]]:
             "author": author,
             "message": message,
         }
-    t_parse = time.perf_counter() - t0
-    print(
-        "[CV History] _read_repo_commits: commits=%d refs=%d | "
-        "refs=%.3fs git_log=%.3fs parse=%.3fs TOTAL=%.3fs"
-        % (
-            len(commit_by_sha),
-            len(refs),
-            t_refs,
-            t_git_log,
-            t_parse,
-            time.perf_counter() - t_all,
-        )
-    )
     return commit_by_sha
 
 
@@ -4093,18 +4065,10 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
     are capped to the last Validate Update / Take / explicit sync — so a Compare
     peek-fetch alone does not rewrite the Version tree on the next Open.
     """
-    t_all = time.perf_counter()
     empty = _empty_history_model()
-    t0 = time.perf_counter()
     commit_by_sha = _read_repo_commits(repo_dir)
-    t_commits = time.perf_counter() - t0
     if not commit_by_sha:
-        print(
-            "[CV History] read_project_history empty after commits (%.3fs)"
-            % (time.perf_counter() - t_all)
-        )
         return empty
-    t0 = time.perf_counter()
     origin = _git_rev_parse(repo_dir, "origin/main")
     local_main = _git_rev_parse(repo_dir, "refs/heads/main") or _git_rev_parse(
         repo_dir, "main"
@@ -4112,9 +4076,7 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
     head_sha = _git_rev_parse(repo_dir, "HEAD")
     local_tips, remote_tips = _review_tips_local_and_remote(repo_dir)
     main_tip = origin or local_main
-    t_tips = time.perf_counter() - t0
 
-    t0 = time.perf_counter()
     if apply_ui_caps:
         caps = load_remote_sync_caps(repo_dir)
         if caps:
@@ -4139,13 +4101,11 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
                 if use:
                     capped_remote[login] = [use]
             remote_tips = capped_remote
-    t_caps = time.perf_counter() - t0
 
     # Never hide tips this computer already has on main (Share/Accept before caps refresh).
     # Do NOT advance main from HEAD when HEAD is on a side branch — that would paint
     # new branch commits as main/N (e.g. Save → Create a branch). Same when Switch
     # left HEAD detached on an older task-lane commit (not on cv-review/* by name).
-    t0 = time.perf_counter()
     main_tip = _prefer_ahead_tip(repo_dir, main_tip or "", local_main or "")
     review_tips: dict[str, list[str]] = dict(remote_tips)
     for login, tips in local_tips.items():
@@ -4161,31 +4121,23 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
     )
     if head_sha and not on_side:
         main_tip = _prefer_ahead_tip(repo_dir, main_tip or "", head_sha) or main_tip
-    t_merge_tips = time.perf_counter() - t0
 
-    t0 = time.perf_counter()
     shared_shas = _shared_remote_shas(repo_dir, commit_by_sha)
-    t_shared = time.perf_counter() - t0
     line_tip = (
         head_sha
         if on_side
         else (local_main or head_sha or "")
     )
-    t0 = time.perf_counter()
     unpushed = _unpushed_commit_shas(
         repo_dir,
         commit_by_sha=commit_by_sha,
         shared_shas=shared_shas,
         line_tip=line_tip,
     )
-    t_unpushed = time.perf_counter() - t0
     # Permanent …/start for Assign tasks only — not every origin/cv-review (DIY Share).
-    t0 = time.perf_counter()
     stub_slugs = _start_stub_slugs_for_history(
         repo_dir, remote_tips, main_tip or local_main or "", commit_by_sha
     )
-    t_stubs = time.perf_counter() - t0
-    t0 = time.perf_counter()
     model = build_project_history_model(
         commit_by_sha,
         main_tip,
@@ -4194,26 +4146,6 @@ def read_project_history(repo_dir: str, *, apply_ui_caps: bool = True) -> dict[s
         unpushed,
         shared_shas=shared_shas,
         start_stub_slugs=stub_slugs,
-    )
-    t_build = time.perf_counter() - t0
-    print(
-        "[CV History] read_project_history TOTAL=%.3fs | "
-        "commits=%.3fs tips=%.3fs caps=%.3fs merge_tips=%.3fs "
-        "unpushed=%.3fs shared=%.3fs stubs=%.3fs build_model=%.3fs | "
-        "commits_n=%d versions=%d"
-        % (
-            time.perf_counter() - t_all,
-            t_commits,
-            t_tips,
-            t_caps,
-            t_merge_tips,
-            t_unpushed,
-            t_shared,
-            t_stubs,
-            t_build,
-            len(commit_by_sha),
-            len(model.get("version_specs") or []),
-        )
     )
     if not model.get("version_specs"):
         return empty

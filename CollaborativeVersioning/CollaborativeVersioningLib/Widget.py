@@ -9464,8 +9464,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._unloadProjectSceneNodes()
             self._updateProgress(progress_label)
             local_path = open_or_update_local_project(full_name, mode=choice)
-            loaded = self._loadOpenedProjectAssets(local_path)
-            self._updateProgress("Reading version history…")
+            # Reserve last progress step for history (e.g. 4/4 when vol+seg+ontology).
+            loaded = self._loadOpenedProjectAssets(local_path, extra_progress_steps=1)
+            bar = getattr(self, "_progressBar", None)
+            total = 0
+            try:
+                if bar is not None:
+                    total = int(bar.maximum() or 0)
+            except (RuntimeError, TypeError, ValueError):
+                total = 0
+            if total > 0:
+                self._setProgressStep(total, total, "Reading version history…")
+            else:
+                self._updateProgress("Reading version history…")
             history = read_project_history(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
@@ -9620,7 +9631,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return current
         return None
 
-    def _loadOpenedProjectAssets(self, folder: str, volume_folder: str | None = None) -> dict[str, str]:
+    def _loadOpenedProjectAssets(
+        self,
+        folder: str,
+        volume_folder: str | None = None,
+        *,
+        extra_progress_steps: int = 0,
+    ) -> dict[str, str]:
         manager = DataManager()
         from_snapshot = volume_folder is not None
         files = manager.discover_project_files(folder)
@@ -9639,7 +9656,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         # Prefer .cv_seg cubes when present; else legacy root *_segmentation.nii.gz.
         use_cubes = bool(files.get("segmentation_store"))
         has_segmentation = use_cubes or bool(files.get("segmentation"))
-        steps = (1 if load_volume else 0) + (1 if has_segmentation else 0) + 1
+        # Open can reserve +1 for « Reading version history… » after assets.
+        steps = (
+            (1 if load_volume else 0)
+            + (1 if has_segmentation else 0)
+            + 1
+            + max(0, int(extra_progress_steps or 0))
+        )
         if load_volume:
             self._setProgressStep(1, steps, "Loading 3D volume…")
         elif has_segmentation:
