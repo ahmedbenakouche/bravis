@@ -7821,6 +7821,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, TypeError, ValueError):
             return False
 
+    def _currentVersionIsLaneStart(self) -> bool:
+        """True when the checked-out Version-tree node is a …/start stub."""
+        version_id = str(getattr(self, "_currentVersionId", None) or "").strip()
+        if not version_id:
+            return False
+        bundle = getattr(self, "_project_history_bundle", None) or {}
+        for spec in bundle.get("version_specs") or []:
+            if str((spec or {}).get("id") or "").strip() != version_id:
+                continue
+            return bool((spec or {}).get("lane_start"))
+        return False
+
     def _canOfferNestedMerge(self, lane: str) -> bool:
         """Who may Merge a depth≥2 tip onto its parent (DIY senior; task senior/junior)."""
         if not is_nested_lane_path(lane):
@@ -8933,7 +8945,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             tip_lane = lane_slug or older_lane or "branch"
             if on_branch and not from_older_line:
                 # Already merged upward → Create a branch only (same gate as hide Merge).
-                merged_tip = self._laneAlreadyIntegrated(tip_lane)
+                # Exception: …/start tip SHA still sits on main, so
+                # review_lane_tip_integrated_into_main is True — that is for
+                # hiding Merge, not for Save. Keep Save on this branch / Create.
+                if not self._currentVersionIsLaneStart():
+                    merged_tip = self._laneAlreadyIntegrated(tip_lane)
         finally:
             self._closeProgress()
         new_branch_slug = ""
