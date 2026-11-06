@@ -8867,68 +8867,79 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if not self._ontology_document:
                 self._appendFeed("Fill project data first: Ontology map.", error=True)
                 return
+        # Git tip / reattach / merged-lane checks before the Save dialog — show
+        # progress so the UI does not feel frozen with no feedback.
+        self._openProgress("Save version", "Checking…")
         on_branch = False
         from_older_line = False
         older_lane = ""
-        lane_slug = self._effectiveShareBranchSlug(local_path)
+        lane_slug = ""
+        tip_lane = "branch"
+        merged_tip = False
         try:
-            on_branch = work_is_on_review_branch(local_path)
-            if on_branch:
-                tip_lane = current_review_branch_slug(local_path) or lane_slug or "main"
-                from_older_line = is_viewing_older_than_branch_tip(local_path, tip_lane)
-                if from_older_line:
-                    older_lane = tip_lane
-            elif lane_slug:
-                # Detached on a task lane (Switch kept the tip): same as older main —
-                # do not offer Put on main; Create a branch so the tip stays.
-                from_older_line = is_viewing_older_than_branch_tip(
-                    local_path, lane_slug
-                )
-                if from_older_line:
-                    older_lane = lane_slug
-                else:
-                    # At the lane tip but detached — reattach, then Save on that branch.
-                    bundle = getattr(self, "_project_history_bundle", None) or {}
-                    version_id = str(
-                        getattr(self, "_currentVersionId", None) or ""
-                    ).strip()
-                    sha = str(
-                        (bundle.get("sha_by_id") or {}).get(version_id) or ""
-                    ).strip()
-                    if sha:
-                        checkout_local_version(local_path, sha, lane_slug)
-                        on_branch = work_is_on_review_branch(local_path)
-            else:
-                from_older_line = is_viewing_older_than_branch_tip(local_path, "main")
-                if from_older_line:
-                    older_lane = "main"
-        except (GitHubAuthError, OSError, RuntimeError, ValueError):
-            on_branch = False
-            from_older_line = False
-            older_lane = ""
-        # Junior on …/start (task lane already exists): UI can show test/start while
-        # Git is still on main (same SHA). Attach to that branch — do not ask to
-        # "Create a branch".
-        if (
-            not on_branch
-            and not from_older_line
-            and self._shareNeedsApproval()
-            and self._attachGitToCurrentTaskStart(local_path)
-        ):
+            lane_slug = self._effectiveShareBranchSlug(local_path)
             try:
                 on_branch = work_is_on_review_branch(local_path)
+                if on_branch:
+                    tip_lane = current_review_branch_slug(local_path) or lane_slug or "main"
+                    from_older_line = is_viewing_older_than_branch_tip(local_path, tip_lane)
+                    if from_older_line:
+                        older_lane = tip_lane
+                elif lane_slug:
+                    # Detached on a task lane (Switch kept the tip): same as older main —
+                    # do not offer Put on main; Create a branch so the tip stays.
+                    from_older_line = is_viewing_older_than_branch_tip(
+                        local_path, lane_slug
+                    )
+                    if from_older_line:
+                        older_lane = lane_slug
+                    else:
+                        # At the lane tip but detached — reattach, then Save on that branch.
+                        bundle = getattr(self, "_project_history_bundle", None) or {}
+                        version_id = str(
+                            getattr(self, "_currentVersionId", None) or ""
+                        ).strip()
+                        sha = str(
+                            (bundle.get("sha_by_id") or {}).get(version_id) or ""
+                        ).strip()
+                        if sha:
+                            checkout_local_version(local_path, sha, lane_slug)
+                            on_branch = work_is_on_review_branch(local_path)
+                else:
+                    from_older_line = is_viewing_older_than_branch_tip(local_path, "main")
+                    if from_older_line:
+                        older_lane = "main"
             except (GitHubAuthError, OSError, RuntimeError, ValueError):
                 on_branch = False
+                from_older_line = False
+                older_lane = ""
+            # Junior on …/start (task lane already exists): UI can show test/start while
+            # Git is still on main (same SHA). Attach to that branch — do not ask to
+            # "Create a branch".
+            if (
+                not on_branch
+                and not from_older_line
+                and self._shareNeedsApproval()
+                and self._attachGitToCurrentTaskStart(local_path)
+            ):
+                try:
+                    on_branch = work_is_on_review_branch(local_path)
+                except (GitHubAuthError, OSError, RuntimeError, ValueError):
+                    on_branch = False
+            if on_branch and from_older_line:
+                # Attached name but viewing older tip should not happen often; still
+                # force Create a branch so we never rewind the tip on Save.
+                on_branch = False
+            tip_lane = lane_slug or older_lane or "branch"
+            if on_branch and not from_older_line:
+                # Already merged upward → Create a branch only (same gate as hide Merge).
+                merged_tip = self._laneAlreadyIntegrated(tip_lane)
+        finally:
+            self._closeProgress()
         new_branch_slug = ""
-        if on_branch and from_older_line:
-            # Attached name but viewing older tip should not happen often; still
-            # force Create a branch so we never rewind the tip on Save.
-            on_branch = False
         if on_branch and not from_older_line:
             # Tip of a side lane: continue here or fork parent/<child>.
-            # Already merged upward → Create a branch only (same gate as hide Merge).
-            tip_lane = lane_slug or older_lane or "branch"
-            if self._laneAlreadyIntegrated(tip_lane):
+            if merged_tip:
                 destination = self._promptSaveDestination(
                     merged_tip=True,
                     older_lane=tip_lane,
