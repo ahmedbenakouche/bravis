@@ -9127,10 +9127,10 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             share_event = self._buildActivityEvent(
                 "share", "%s shared versions on branch %s." % (me, label)
             )
-            slicer.util.infoDisplay(
-                self._shareLineNextStepMessage(),
-                windowTitle="Share",
-            )
+            # Juniors get a next-step hint; seniors already have the feed (like Share on main).
+            next_step = self._shareLineNextStepMessage()
+            if next_step:
+                slicer.util.infoDisplay(next_step, windowTitle="Share")
         if self._unsaved_changes:
             self._appendFeed(
                 "Unsaved changes are still on this computer. Save a version if you want them shared later."
@@ -9279,8 +9279,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         return True
 
     def _shareLineNextStepMessage(self) -> str:
+        """Junior-only hint after Share on a branch. Empty for seniors (feed only)."""
         if self._canAssignTask():
-            return "Shared on your branch."
+            return ""
         if self._hasActiveTaskAsJunior():
             return (
                 "Shared on the task branch. "
