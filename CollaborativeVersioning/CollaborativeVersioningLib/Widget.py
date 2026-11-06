@@ -9723,7 +9723,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 if use_cubes:
                     # Cubes → labelmap RAM → segments (no cache NIfTI).
                     stem = self._savedProjectFileStem(folder)
-                    cube_timings: dict = {}
                     if can_inject:
                         ok, cube_timings = manager.inject_segmentation_from_cubes(
                             current_seg,
@@ -9733,30 +9732,27 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                             segmentation_node = current_seg
                         else:
                             # Inject already tried RemoveAll fallback on the same node.
-                            # Recreating a NEW segmentation node is much slower — only
-                            # as last resort, and keep inject timings visible in the feed.
+                            # Recreating a NEW segmentation node is much slower — last resort.
                             inj_err = str((cube_timings or {}).get("_inject_error") or "").strip()
                             self._appendFeed(
                                 "Cube inject failed on existing node%s"
                                 % ((" (%s)" % inj_err) if inj_err else ""),
                                 error=True,
                             )
-                            # self._appendCubeLoadTimings(cube_timings)
                             names_to_replace = {
                                 manager._basename_without_extension(
                                     "%s_segmentation.nii.gz" % stem
                                 )
                             }
                             manager.remove_scene_nodes_by_names(names_to_replace)
-                            segmentation_node, cube_timings = (
+                            segmentation_node, _cube_timings = (
                                 manager.load_segmentation_from_cubes(folder, stem)
                             )
                             self._appendFeed("Fell back to new segmentation node (slow path).")
                     else:
-                        segmentation_node, cube_timings = (
+                        segmentation_node, _cube_timings = (
                             manager.load_segmentation_from_cubes(folder, stem)
                         )
-                    # self._appendCubeLoadTimings(cube_timings)
                 else:
                     segmentation_path = legacy_segmentation_path
                     if can_inject and manager.inject_segmentation_from_file(
@@ -9910,7 +9906,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         # Snapshot cube manifest before checkout (for changed-cube feed line only).
         before_manifest = SegmentationCubes.try_load_manifest(local_path)
         cube_diff = None
-        switch_wall_ms = None
         self._suppress_history_selection_signal = True
         try:
             self._currentVersionId = version_id
@@ -9918,7 +9913,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._selectHistoryRowForVersion(version_id)
             self._openProgress("Switch version", "Loading %s…" % display)
             try:
-                switch_t0 = time.perf_counter()
                 checkout_local_version(local_path, sha, lane)
                 # Load from the project folder (volume untouched; seg/ontology restored above).
                 # volume_folder=local_path keeps soft reload: reuse volume + inject seg, no temp copy.
@@ -9935,7 +9929,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     before_manifest,
                     after_manifest,
                 )
-                switch_wall_ms = (time.perf_counter() - switch_t0) * 1000.0
             except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
                 self._currentVersionId = previous_id
                 self._updateActiveVersionIndicators()
@@ -9961,10 +9954,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._closeProgress()
         if notify:
             self._appendFeed("Checked out %s." % display)
-        # if switch_wall_ms is not None:
-        #     self._appendFeed(
-        #         "Switch wall-clock (checkout+load assets): %.1f ms" % float(switch_wall_ms)
-        #     )
         if cube_diff is not None:
             changed = int(cube_diff.get("changed") or 0)
             total = int(cube_diff.get("total") or 0)
@@ -10198,40 +10187,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 feed.setHtml("")
             except (RuntimeError, ValueError, TypeError):
                 return
-
-    def _appendCubeLoadTimings(self, timings: dict | None) -> None:
-        """Temporary Switch profiling: show cube→segment step durations in the feed."""
-        if not timings:
-            return
-        # Timing feed disabled for now (keep code for later profiling).
-        # if "inject_update" in timings:
-        #     mode = "update+obsolete" if float(timings["inject_update"]) >= 0.5 else "RemoveAll+Import"
-        #     self._appendFeed("Seg load mode: %s" % mode)
-        # inj_err = str(timings.get("_inject_error") or "").strip()
-        # if inj_err:
-        #     self._appendFeed("  inject_error: %s" % inj_err, error=True)
-        # if "RemoveObsolete_count" in timings:
-        #     self._appendFeed(
-        #         "  RemoveObsolete_count: %d" % int(float(timings["RemoveObsolete_count"]))
-        #     )
-        # order = (
-        #     ("read_store_ms", "read_store (cubes→grid)"),
-        #     ("labelmap_fill_ms", "labelmap_fill (array→node)"),
-        #     ("prepare_ms", "prepare (colors/display)"),
-        #     ("RemapLabels_ms", "RemapLabels (ontology→1..N)"),
-        #     ("RemoveAllSegments_ms", "RemoveAllSegments"),
-        #     ("ImportLabelmap_ms", "ImportLabelmapToSegmentationNode"),
-        #     ("RemoveObsolete_ms", "RemoveObsolete segments"),
-        #     ("finalize_ms", "finalize (names/colors)"),
-        #     ("resumeRender_ms", "resumeRender (slice redraw)"),
-        #     ("cleanup_labelmap_ms", "cleanup temp labelmap"),
-        #     ("total_ms", "TOTAL loading segmentation"),
-        # )
-        # self._appendFeed("Seg load timing (cube path):")
-        # for key, label in order:
-        #     if key not in timings:
-        #         continue
-        #     self._appendFeed("  %s: %.1f ms" % (label, float(timings[key])))
 
     def _appendFeed(self, message: str, error: bool = False, *, force: bool = False) -> None:
         # Unify technical offline/DNS errors into one readable feed line.

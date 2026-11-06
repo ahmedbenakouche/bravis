@@ -14,6 +14,8 @@ set(MODULE_PYTHON_SCRIPTS
   CollaborativeVersioningLib/QtHelpers.py
   CollaborativeVersioningLib/Helpers.py
   CollaborativeVersioningLib/Dialogs.py
+  CollaborativeVersioningLib/MergeCompare.py
+  CollaborativeVersioningLib/SegmentationCubes.py
   CollaborativeVersioningLib/Widget.py
   CollaborativeVersioningLib/Logic.py
   )
