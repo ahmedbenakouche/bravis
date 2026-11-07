@@ -164,7 +164,7 @@ class CollaborativeVersioningLogic(ScriptedLoadableModuleLogic):
             if review_pending_ids:
                 extra_bits.append(
                     "🔵 = that exact version awaits review "
-                    "(double-click the 🔵 node to Accept or Decline)"
+                    "(double-click the 🔵 node to Accept and Merge or Decline)"
                 )
             if write_locked_ids:
                 extra_bits.append(

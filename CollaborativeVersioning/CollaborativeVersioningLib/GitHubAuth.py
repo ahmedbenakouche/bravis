@@ -3458,6 +3458,10 @@ def _slug_from_merge(
     found = re.search(r"Accept version from\s+(\S+)", message, re.I)
     if found:
         return _history_lane_slug(found.group(1))
+    # Accept and Merge (Compare cubes) commit message.
+    found = re.search(r"Merge cubes from\s+(\S+)\s+onto\b", message, re.I)
+    if found:
+        return _history_lane_slug(found.group(1))
     found = re.search(
         r"cv-review/([A-Za-z0-9._+/-]+)",
         message,

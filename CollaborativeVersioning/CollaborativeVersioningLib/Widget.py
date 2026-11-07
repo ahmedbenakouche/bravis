@@ -1612,6 +1612,28 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         box.exec_()
         return box.clickedButton() == compare_btn
 
+    def _askAcceptChoice(self, source: str, target: str = "main") -> bool:
+        """Accept dialog: Compare and Merge / Cancel (no wholesale Accept)."""
+        src = str(source or "").strip() or "?"
+        dst = str(target or "").strip() or "main"
+        if self._isMainHistoryLane(dst):
+            dst = "main"
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Accept and Merge")
+        box.setIcon(qt.QMessageBox.Question)
+        box.setText("Accept branch %s onto %s?" % (src, dst))
+        box.setInformativeText(
+            "Opens a side-by-side view so you can review the differences, "
+            "pick what to keep from the review, then apply onto %s.\n\n"
+            "Applying closes the review request and marks the task accepted."
+            % dst
+        )
+        compare_btn = box.addButton("Compare and Merge", qt.QMessageBox.AcceptRole)
+        box.addButton("Cancel", qt.QMessageBox.RejectRole)
+        box.setDefaultButton(compare_btn)
+        box.exec_()
+        return box.clickedButton() == compare_btn
+
     def _shaAndLaneForVersion(self, version_id: str) -> tuple[str, str]:
         vid = str(version_id or "").strip()
         if not vid:
@@ -7551,7 +7573,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if self._canAssignTask():
             return (
                 "Open the Version tree, find the node marked 🔵 (awaiting review)%s, "
-                "double-click it, then Accept or Decline."
+                "double-click it, then Accept and Merge or Decline."
                 % branch_bit
             )
         return (
@@ -8169,41 +8191,35 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 error=True,
             )
             return
+        slug = normalize_lane_path(lane) or str(lane or "").strip()
+        if action == "accept":
+            # Same engine as DIY Merge: Compare cubes → Apply closes PR + marks task.
+            if not slug:
+                self._appendFeed("Could not resolve this review branch.", error=True)
+                return
+            if not self._askAcceptChoice(slug, "main"):
+                return
+            self._startMergeCompare(source_lane=slug, target_lane="main")
+            return
         try:
             request = self._openReviewForTask(review_task, lane=lane)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._appendFeed(str(error).split("\n")[0], error=True)
             return
         if not request:
-            if action == "accept" and task is not None:
-                # No open PR — still finish the task lane via Merge (same as before).
-                self._mergeOwnReviewLine(lane)
-                return
             self._appendFeed("Nothing is waiting for review on this branch.", error=True)
             return
         junior = str(request.get("author") or "").strip() or "this junior"
-        if action == "accept":
-            confirmed = slicer.util.confirmYesNoDisplay(
-                "Accept %s's version onto main and publish it to the shared project?"
-                % junior,
-                windowTitle="Accept",
-            )
-            if not confirmed:
-                return
-            if self._acceptReviewedShareRequest(request):
-                # 1 task = 1 branch: Accept closes the task for every assigned junior.
-                self._markTaskAccepted(review_task)
-        else:
-            confirmed = slicer.util.confirmYesNoDisplay(
-                "Decline %s's review request ?\n\n"
-                "The task goes back to In progress (🟠)."
-                % junior,
-                windowTitle="Decline",
-            )
-            if not confirmed:
-                return
-            if self._declineReviewedShareRequest(request):
-                self._markTaskDeclined(review_task)
+        confirmed = slicer.util.confirmYesNoDisplay(
+            "Decline %s's review request ?\n\n"
+            "The task goes back to In progress (🟠)."
+            % junior,
+            windowTitle="Decline",
+        )
+        if not confirmed:
+            return
+        if self._declineReviewedShareRequest(request):
+            self._markTaskDeclined(review_task)
         self._updateActiveVersionIndicators()
         self._updateTaskButtonUi()
 

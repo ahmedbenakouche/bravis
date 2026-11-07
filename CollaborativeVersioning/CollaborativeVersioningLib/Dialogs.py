@@ -1155,7 +1155,7 @@ class PeopleDialog(qt.QDialog):
         owner_hint = qt.QLabel(
             "They will receive an invitation. After they accept, the project appears in their list.\n"
             "Senior: can assign Tasks, share onto main, "
-            "and Accept / Decline a junior's review request.\n"
+            "and Accept and Merge / Decline a junior's review request.\n"
             "Junior: can work on the project and share on their own branch "
             "(after a senior assigns a Task)."
         )
