@@ -989,7 +989,7 @@ def _draw_write_lock_legend(scene, x, y):
 def _draw_review_pending_legend(scene, x, y):
     """Legend for the exact version awaiting Accept/Decline."""
     text = scene.addText(
-        "🔵 = this version awaits senior review (double-click that node to Accept and Merge or Decline)"
+        "🔵 = this version awaits senior review (double-click that node to Accept or Decline)"
     )
     text.setFont(qt.QFont("Arial", 8))
     text.setDefaultTextColor(qt.QColor(_ui.GRAPH_HINT or _ui.GRAPH_TITLE or "#888888"))

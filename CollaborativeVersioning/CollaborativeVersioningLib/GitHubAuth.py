@@ -3454,11 +3454,26 @@ def _slug_from_merge(
     extra_sha: str,
     review_tips: dict[str, list[str]],
 ) -> str:
+    """Map a merge 2nd parent to a task lane slug.
+
+    Order: exact ``cv-review`` tip match, then known auto commit messages.
+    Returns ``\"\"`` when unknown (caller must not invent a lane / show error).
+    """
+    extra = str(extra_sha or "").strip()
+    if not extra:
+        return ""
+    # 1) Safe: 2nd parent is exactly a known task tip.
+    for login, tips in sorted((review_tips or {}).items(), key=lambda item: item[0]):
+        if isinstance(tips, str):
+            tips = [tips]
+        for tip in tips:
+            if str(tip or "").strip() == extra:
+                return _history_lane_slug(login)
+    # 2) Messages we write ourselves (Accept / Merge cubes / cv-review/…).
     message = str((commit_by_sha.get(merge_sha) or {}).get("message") or "")
     found = re.search(r"Accept version from\s+(\S+)", message, re.I)
     if found:
         return _history_lane_slug(found.group(1))
-    # Accept and Merge (Compare cubes) commit message.
     found = re.search(r"Merge cubes from\s+(\S+)\s+onto\b", message, re.I)
     if found:
         return _history_lane_slug(found.group(1))
@@ -3468,17 +3483,8 @@ def _slug_from_merge(
     )
     if found:
         return _history_lane_slug(found.group(1).rstrip("/.,)+"))
-    extra_chain = set(_first_parent_chain(commit_by_sha, extra_sha))
-    for login, tips in review_tips.items():
-        if isinstance(tips, str):
-            tips = [tips]
-        for tip in tips:
-            if extra_sha in set(_first_parent_chain(commit_by_sha, tip)) or extra_chain.intersection(
-                _first_parent_chain(commit_by_sha, tip)
-            ):
-                return _history_lane_slug(login)
-    author = str((commit_by_sha.get(extra_sha) or {}).get("author") or "colleague")
-    return _history_lane_slug(re.sub(r"[^A-Za-z0-9]+", "-", author).strip("-") or "colleague")
+    # 3) Unknown — no chain-intersection guess (too easy to steal another lane).
+    return ""
 
 
 def _shared_remote_shas(repo_dir: str, commit_by_sha: dict[str, dict]) -> set[str]:
@@ -3593,7 +3599,22 @@ def build_project_history_model(
     for merge_sha in main_chain:
         parents = (commit_by_sha.get(merge_sha) or {}).get("parents") or []
         for extra in parents[1:]:
-            remember_side(_slug_from_merge(commit_by_sha, merge_sha, extra, review_tips), extra)
+            if not extra:
+                continue
+            slug = _slug_from_merge(commit_by_sha, merge_sha, extra, review_tips)
+            if not slug:
+                merge_msg = str(
+                    (commit_by_sha.get(merge_sha) or {}).get("message") or ""
+                ).strip()
+                short = (merge_sha or "")[:7]
+                detail = merge_msg or short or "unknown merge"
+                raise GitHubAuthError(
+                    "Could not map a merged version to a task lane.\n"
+                    "%s\n"
+                    "Ask the developer to integrate it."
+                    % detail
+                )
+            remember_side(slug, extra)
 
     # Hierarchy under main: each side lane has a parent lane (\"\" = main).
     parent_of = _build_parent_lane_map(lane_tips)
