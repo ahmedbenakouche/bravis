@@ -94,7 +94,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     parent_lane_slug,
     delete_local_unshared_version,
     sha_is_shared_on_remote,
-    accept_share_request,
     decline_share_request,
     work_is_on_review_branch,
     is_viewing_older_than_branch_tip,
@@ -8518,52 +8517,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateTaskButtonUi()
         self._updateActiveVersionIndicators()
         self._updateVersionActionButtons()
-
-    def _acceptReviewedShareRequest(self, request: dict) -> None:
-        full_name = request.get("full_name") or ""
-        author = request.get("author") or "the colleague"
-        self._openProgress("Review version", "Adding the version to the project…")
-        try:
-            self._updateProgress("Adding the version to the project…")
-            local_path = accept_share_request(full_name, request.get("branch") or "", request.get("number"))
-            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
-            self._updateProgress("Updating version history…")
-            history = read_project_history(local_path)
-        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            self._closeProgress()
-            self._showGithubError(error, box=True)
-            return
-        self._closeProgress()
-        unshared = self._historyHasUnsharedVersion(history)
-        self._suppress_dirty += 1
-        self._suppress_asset_ui_updates += 1
-        try:
-            self._loaded_project_name = full_name
-            self._local_project_path = local_path
-            self._server_pulled = True
-            self._applyProjectHistoryBundle(history)
-            self._clearChangeFlags()
-            self._unshared_version = unshared
-            self._syncAssetDataObservers()
-        finally:
-            self._suppress_asset_ui_updates -= 1
-            self._suppress_dirty -= 1
-        self._refreshUiState()
-        self._clearChangeFlags()
-        self._unshared_version = unshared
-        self._updateVersionActionButtons()
-        self._armLoadSettle()
-        if full_name:
-            self._persistReadCursor(
-                full_name,
-                versions_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            )
-        self._appendFeed("Accepted the version from %s. It is now on the project." % author)
-        self._runNotificationChecks(announce=False)
-        # Open Version tree must redraw the new main tip (badge-only refresh would skip).
-        self._updateActiveVersionIndicators()
-        self._refreshOpenVersionTreeIfNeeded()
-        return True
 
     def _refreshOpenVersionTreeIfNeeded(self) -> None:
         """Rebuild an open Version tree dialog so Merge/Accept/Share topology shows up."""
