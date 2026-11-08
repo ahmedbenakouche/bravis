@@ -1,5 +1,5 @@
 <center>
-  <img src="docs/images/logo.jpg" alt="BRAVIS — BRAin-atlas Versioning Interactive System" width="1280" />
+  <img src="docs/images/logo2.png" alt="BRAVIS — BRAin-atlas Versioning Interactive System" width="1280" />
   <p>Extension <strong>3D Slicer</strong> pour versionner et partager des annotations en équipe.</p>
 </center>
 
