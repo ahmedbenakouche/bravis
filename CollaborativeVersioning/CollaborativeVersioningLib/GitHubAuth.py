@@ -4186,16 +4186,23 @@ def read_compare_project_histories(
         _all_reachable_shas(commit_by_sha, origin) if origin and commit_by_sha else set()
     )
     known_lane_tip_shas = local_shas | main_reach_local | main_reach_origin
-    # Remote lane still on origin after Merge/Apply is not "new" when its tip is
-    # already on this computer (possibly under another local lane name) or already
-    # merged into shared main.
+    # First-parent main only: Assign …/start tips sit here by design (same SHA as
+    # the anchor main node). Those empty lanes must still count as "new".
+    main_first_parent = (
+        set(_first_parent_chain(commit_by_sha, origin)) if origin and commit_by_sha else set()
+    )
+    if not main_first_parent and origin:
+        main_first_parent = {origin}
+    # Remote lane after Merge/Apply is not "new" when its tip is already known
+    # *and* that tip is not an empty-on-main Assign anchor (tip on main FP).
     new_remote_lanes = []
     for name in remote_review_tips:
         key = str(name or "").strip().lower()
         if not key or key in local_lane_slugs:
             continue
         tip = _first_tip(remote_review_tips.get(name))
-        if tip and tip in known_lane_tip_shas:
+        empty_assign_tip = bool(tip and tip in main_first_parent)
+        if tip and tip in known_lane_tip_shas and not empty_assign_tip:
             continue
         new_remote_lanes.append(key)
     new_remote_lanes = sorted(new_remote_lanes)
