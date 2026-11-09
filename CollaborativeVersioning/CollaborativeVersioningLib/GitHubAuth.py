@@ -1125,7 +1125,7 @@ def create_and_publish_task_branch(repo_dir: str, sha: str, branch_name: str) ->
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
-    slug = normalize_branch_slug(branch_name)
+    slug = normalize_lane_path(branch_name)
     if not slug:
         raise GitHubAuthError("Could not name the task branch.")
     tip = _git_rev_parse(repo_dir, sha)
@@ -1205,7 +1205,7 @@ def _task_branch_slugs_from_project_info(repo_dir: str) -> set[str]:
         return set()
     slugs: set[str] = set()
     for task in _normalize_stored_tasks(doc):
-        slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+        slug = normalize_lane_path((task or {}).get("branch_slug") or "")
         if slug:
             slugs.add(slug.lower())
     return slugs
@@ -4711,11 +4711,17 @@ def _normalize_conflict_lanes(lanes) -> list[str]:
         name = str(raw or "").strip()
         if not name:
             continue
-        key = name.lower()
-        if key in seen:
+        raw_key = name.lower()
+        if raw_key == "main":
+            lane = "main"
+        else:
+            # Lane paths (gfb/jhj), not single-segment slug — nests use + in Git refs.
+            lane = normalize_lane_path(name) or name
+        key = str(lane).strip().lower()
+        if not key or key in seen:
             continue
         seen.add(key)
-        ordered.append("main" if key == "main" else (normalize_branch_slug(name) or name))
+        ordered.append(lane)
     return ordered or ["main"]
 
 
@@ -5457,7 +5463,7 @@ def _normalize_stored_tasks(document) -> list[dict]:
             entry["anchor_sha"] = anchor_sha
         if anchor_label:
             entry["anchor_label"] = anchor_label
-        branch_slug = normalize_branch_slug(item.get("branch_slug") or "")
+        branch_slug = normalize_lane_path(item.get("branch_slug") or "")
         if branch_slug:
             entry["branch_slug"] = branch_slug
         submitted = normalize_task_title(item.get("submitted_description") or "")

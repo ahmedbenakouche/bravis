@@ -546,8 +546,7 @@ class CompareWithSharedDialog(qt.QDialog):
         )
         result_layout.addWidget(result_title)
         self._result_legend = qt.QLabel(
-            "Green dashed boxes show what this choice applies "
-            "(from shared and/or yours on top)."
+            "Green dashes show which versions come from shared and which stay yours."
         )
         self._result_legend.setWordWrap(True)
         self._result_legend.setAlignment(qt.Qt.AlignHCenter)
@@ -729,13 +728,13 @@ class CompareWithSharedDialog(qt.QDialog):
                     "Your local versions on those branches are obsolete.\n"
                     "Reset moves these tips to shared: %s "
                     "(main included — unshared main versions leave the tree).\n"
-                    "Click Validate to apply."
+                    "Click Validate to update."
                     if many
                     else "Branch %s was already merged onto main on the shared project.\n"
                     "Your local versions on that branch are obsolete.\n"
                     "Reset moves these tips to shared: %s "
                     "(main included — unshared main versions leave the tree).\n"
-                    "Click Validate to apply."
+                    "Click Validate to update."
                 )
                 % (branches, reset_also)
             )
@@ -751,7 +750,7 @@ class CompareWithSharedDialog(qt.QDialog):
                         "No tip conflict — the shared project has new branches (%s), "
                         "and you also have local versions not shared yet.\n"
                         "Preview: Update version tree (your local unshared versions stay). "
-                        "Click Validate to apply."
+                        "Click Validate to update."
                         % lanes
                     )
                 else:
@@ -759,20 +758,20 @@ class CompareWithSharedDialog(qt.QDialog):
                         "No tip conflict — the shared project has newer versions, "
                         "and you also have local versions not shared yet.\n"
                         "Preview: Update version tree (your local unshared versions stay). "
-                        "Click Validate to apply."
+                        "Click Validate to update."
                     )
             elif self._has_new_remote_lanes and not self._has_remote:
                 self._setConflictsMessage(
                     "No conflicts — the shared project has new branches (%s). "
                     "Preview below shows the result after integrating them into your local folder. "
-                    "Click Validate to apply."
+                    "Click Validate to update."
                     % lanes
                 )
             else:
                 self._setConflictsMessage(
                     "No conflicts — the shared project has newer versions. "
                     "Preview below shows the result after integrating them into your local folder. "
-                    "Click Validate to apply."
+                    "Click Validate to update."
                 )
             self._selectChoice(self.ACTION_UPDATE, silent=True)
             return
@@ -782,7 +781,7 @@ class CompareWithSharedDialog(qt.QDialog):
             self._setConflictsMessage(
                 "No tip conflict — you have local versions not shared yet, "
                 "and the shared project is not ahead.\n"
-                "Preview: Keep mine. Click Validate to apply "
+                "Preview: Keep mine. Click Validate to update "
                 "(or Close to leave the Version tree unchanged)."
             )
             self._keep_btn.show()

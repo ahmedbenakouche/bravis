@@ -2917,14 +2917,17 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         """
         version_id = str(getattr(self, "_currentVersionId", None) or "").strip()
         lane = (self._historyLaneForVersion(version_id) or "main").strip()
-        lane_key = normalize_branch_slug(lane) if lane else ""
-        if not lane_key or lane_key.lower() == "main" or str(lane).strip().lower() == "main":
+        lane_key = normalize_lane_path(lane) if lane else ""
+        if not lane_key or self._isMainHistoryLane(lane_key):
             return False
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "").strip().lower() != "submitted":
                 continue
-            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
-            if slug and slug.lower() == lane_key.lower():
+            slug = normalize_lane_path((task or {}).get("branch_slug") or "")
+            if slug and (
+                lane_key.lower() == slug.lower()
+                or lane_key.lower().startswith(slug.lower() + "/")
+            ):
                 return True
         return False
 
@@ -6670,7 +6673,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 "anchor_sha": anchor_sha,
                 "anchor_label": anchor_label,
             }
-            branch_slug = normalize_branch_slug(
+            branch_slug = normalize_lane_path(
                 (message or {}).get("branch_slug") or ""
             )
             if branch_slug:
@@ -7584,13 +7587,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _branchSlugFromSubmitNotification(self, item: dict) -> str:
         text = str((item or {}).get("text") or "")
-        found = re.search(r"\bbranch\s+([A-Za-z0-9._-]+)", text, flags=re.IGNORECASE)
+        found = re.search(
+            r"\bbranch\s+([A-Za-z0-9._+/-]+)", text, flags=re.IGNORECASE
+        )
         if found:
-            return normalize_branch_slug(found.group(1)) or found.group(1)
+            return normalize_lane_path(found.group(1)) or found.group(1)
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "") != "submitted":
                 continue
-            slug = normalize_branch_slug(task.get("branch_slug") or "")
+            slug = normalize_lane_path(task.get("branch_slug") or "")
             if slug:
                 return slug
         return ""
@@ -7631,7 +7636,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     marked.add(submitted_vid)
                 continue
             # Legacy tasks without a stored version: tip of the lane if present.
-            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            slug = normalize_lane_path((task or {}).get("branch_slug") or "")
             tip_id = self._tipVersionIdForLane(slug) if slug else ""
             if tip_id and tip_id in known_ids:
                 marked.add(tip_id)
@@ -7802,24 +7807,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _isDiyMergeLane(self, lane: str) -> bool:
         """Named branch with no active task — senior can Merge (checkout-independent)."""
         raw = str(lane or "").strip().lower()
-        # Check raw "main" first: normalize_branch_slug("main") → "branch-main".
         if not raw or raw == "main":
             return False
-        key = normalize_branch_slug(lane) or raw
-        if not key or key in ("main", "branch-main"):
+        key = normalize_lane_path(lane) or raw
+        if not key or self._isMainHistoryLane(key):
             return False
         return self._activeTaskForBranchSlug(key) is None
 
     def _laneHasAcceptedTask(self, lane: str) -> bool:
         """True when a task on this lane was already Accept'd (status accepted)."""
-        lane_key = normalize_branch_slug(lane) or str(lane or "").strip().lower()
-        if not lane_key or lane_key == "main":
+        lane_key = normalize_lane_path(lane) or str(lane or "").strip().lower()
+        if not lane_key or self._isMainHistoryLane(lane_key):
             return False
         for task in getattr(self, "_project_tasks", []) or []:
             if str(task.get("status") or "").strip().lower() != "accepted":
                 continue
-            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
-            if slug and slug.lower() == lane_key:
+            slug = normalize_lane_path((task or {}).get("branch_slug") or "")
+            if slug and (
+                lane_key.lower() == slug.lower()
+                or lane_key.lower().startswith(slug.lower() + "/")
+            ):
                 return True
         return False
 
@@ -8424,7 +8431,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         excerpt = _task_excerpt(description)
         submitted_vid = str(version_id or "").strip()
         if not submitted_vid:
-            slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+            slug = normalize_lane_path((task or {}).get("branch_slug") or "")
             submitted_vid = self._tipVersionIdForLane(slug) if slug else ""
         body = (
             "requested a review for this task: %s" % excerpt
@@ -8443,7 +8450,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             message["junior"] = juniors[0]
         message["senior"] = str((task or {}).get("senior") or "")
         message["description"] = normalize_task_title(description)
-        branch_slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+        branch_slug = normalize_lane_path((task or {}).get("branch_slug") or "")
         if branch_slug:
             message["branch_slug"] = branch_slug
         if submitted_vid:
@@ -8476,7 +8483,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             message["junior"] = juniors[0]
         message["senior"] = str((task or {}).get("senior") or "")
         message["description"] = normalize_task_title(description)
-        branch_slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+        branch_slug = normalize_lane_path((task or {}).get("branch_slug") or "")
         if branch_slug:
             message["branch_slug"] = branch_slug
         self._enqueueTaskMessage(message)
@@ -8510,7 +8517,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             message["junior"] = juniors[0]
         message["senior"] = str((task or {}).get("senior") or "")
         message["description"] = normalize_task_title(description)
-        branch_slug = normalize_branch_slug((task or {}).get("branch_slug") or "")
+        branch_slug = normalize_lane_path((task or {}).get("branch_slug") or "")
         if branch_slug:
             message["branch_slug"] = branch_slug
         self._enqueueTaskMessage(message)
