@@ -269,7 +269,6 @@ class CompareWithSharedDialog(qt.QDialog):
     ACTION_UPDATE = "update"
     ACTION_KEEP = "keep"
     ACTION_RESET = "reset"
-    ACTION_LINEAR = "linear"
     ACTION_MERGE = "merge"
 
     def __init__(self, parent, compare: dict | None = None) -> None:
@@ -352,7 +351,6 @@ class CompareWithSharedDialog(qt.QDialog):
             local_model,
             remote_model,
             self._compare.get("result"),
-            self._compare.get("linear"),
             self._compare.get("reset"),
         ):
             for spec in (model or {}).get("version_specs") or []:
@@ -491,15 +489,6 @@ class CompareWithSharedDialog(qt.QDialog):
         self._reset_btn.connect(
             "clicked()", lambda: self._selectChoice(self.ACTION_RESET)
         )
-        self._linear_btn = qt.QPushButton("Add shared, then mine")
-        self._linear_btn.setStyleSheet(BTN_SECONDARY)
-        self._linear_btn.setToolTip(
-            "On conflicting branches only: take the shared versions first, "
-            "then keep your local work on top. Other local branches stay."
-        )
-        self._linear_btn.connect(
-            "clicked()", lambda: self._selectChoice(self.ACTION_LINEAR)
-        )
         self._merge_btn = qt.QPushButton("Keep both (merge) — coming")
         self._merge_btn.setStyleSheet(BTN_SECONDARY)
         self._merge_btn.setToolTip(
@@ -511,7 +500,6 @@ class CompareWithSharedDialog(qt.QDialog):
         choice_row.addWidget(self._update_choice_btn)
         choice_row.addWidget(self._keep_btn)
         choice_row.addWidget(self._reset_btn)
-        choice_row.addWidget(self._linear_btn)
         choice_row.addWidget(self._merge_btn)
         choice_row.addStretch(1)
         conflicts_layout.addLayout(choice_row)
@@ -519,8 +507,6 @@ class CompareWithSharedDialog(qt.QDialog):
         self._conflict_options_help = qt.QLabel(
             "• Reset to shared — conflicting branches match shared; other local branches stay. "
             "Warning: conflicting saved versions leave those branch lines.\n"
-            "• Add shared, then mine — on conflicting branches only, take shared first, "
-            "then keep your local work on top. Other local branches stay.\n"
             "• Keep both (merge) — coming — keep both sides by merging annotations "
             "(not available yet)."
         )
@@ -651,9 +637,6 @@ class CompareWithSharedDialog(qt.QDialog):
         self._reset_btn.setStyleSheet(
             self._choiceButtonStyle(self._pending == self.ACTION_RESET)
         )
-        self._linear_btn.setStyleSheet(
-            self._choiceButtonStyle(self._pending == self.ACTION_LINEAR)
-        )
         self._merge_btn.setStyleSheet(
             self._choiceButtonStyle(self._pending == self.ACTION_MERGE)
         )
@@ -662,7 +645,6 @@ class CompareWithSharedDialog(qt.QDialog):
         self._update_choice_btn.hide()
         self._keep_btn.hide()
         self._reset_btn.hide()
-        self._linear_btn.hide()
         self._merge_btn.hide()
         help_lbl = getattr(self, "_conflict_options_help", None)
         if help_lbl is not None:
@@ -702,14 +684,13 @@ class CompareWithSharedDialog(qt.QDialog):
         if self._conflict:
             self._setConflictsMessage(
                 "Local and shared have diverged on: %s.\n"
-                "Reset / Add shared only change those branches; other local versions stay.\n"
+                "Reset only changes those branches; other local versions stay.\n"
                 "Choose how to integrate, then Validate."
                 % self._conflictLanesLabel()
             )
             self._update_choice_btn.hide()
             self._keep_btn.hide()
             self._reset_btn.show()
-            self._linear_btn.show()
             self._merge_btn.show()
             self._conflict_options_help.show()
             self._result_panel.hide()
@@ -833,13 +814,6 @@ class CompareWithSharedDialog(qt.QDialog):
                         mark_shas.add(sha)
             for vid in self._idsForShas(model, mark_shas):
                 roles[vid] = "shared"
-        elif choice == self.ACTION_LINEAR:
-            # Shared reds + local versions kept on top.
-            local_mark = conflict_local_shas or only_local
-            for vid in self._idsForShas(model, only_remote):
-                roles[vid] = "shared"
-            for vid in self._idsForShas(model, local_mark):
-                roles[vid] = "local"
         elif choice == self.ACTION_UPDATE:
             # Shared tips acknowledged + local unshared kept.
             # Include new empty remote lanes (same SHA as main — not in only_remote_shas).
@@ -863,9 +837,7 @@ class CompareWithSharedDialog(qt.QDialog):
         remote_model = self._compare.get("remote") or {}
         # Union preview: shared tips + local review tips (Update keeps unshared).
         update_model = self._compare.get("result") or remote_model
-        linear_model = self._compare.get("linear") or remote_model
         reset_model = self._compare.get("reset") or remote_model
-        lanes = self._conflictLanesLabel()
 
         if choice == self.ACTION_KEEP:
             return (
@@ -901,13 +873,6 @@ class CompareWithSharedDialog(qt.QDialog):
                 "Result — Update from shared",
                 "This computer follows the shared tips",
             )
-        if choice == self.ACTION_LINEAR:
-            return (
-                linear_model,
-                "Result — Add shared, then mine",
-                "On %s: shared first, then your local work; other branches stay"
-                % lanes,
-            )
         return (
             {},
             "Result — Keep both (merge)",
@@ -924,13 +889,12 @@ class CompareWithSharedDialog(qt.QDialog):
                 legend.hide()
             self._validate_btn.setEnabled(False)
             self._validate_btn.setToolTip(
-                "Keep both (merge) is not available yet — "
-                "choose Reset to shared or Add shared, then mine."
+                "Keep both (merge) is not available yet — choose Reset to shared."
             )
             if not silent:
                 self._setConflictsMessage(
                     "Keep both (merge) is coming soon.\n"
-                    "Choose Reset to shared or Add shared, then mine, then Validate."
+                    "Choose Reset to shared, then Validate."
                 )
             return
 
@@ -963,7 +927,6 @@ class CompareWithSharedDialog(qt.QDialog):
             labels = {
                 self.ACTION_KEEP: "Keep mine",
                 self.ACTION_RESET: "Reset to shared",
-                self.ACTION_LINEAR: "Add shared, then mine",
                 self.ACTION_UPDATE: "Update version tree",
             }
             self._setConflictsMessage(
@@ -976,7 +939,6 @@ class CompareWithSharedDialog(qt.QDialog):
             self.ACTION_UPDATE,
             self.ACTION_KEEP,
             self.ACTION_RESET,
-            self.ACTION_LINEAR,
         ):
             self.action = self._pending
             self.accept()

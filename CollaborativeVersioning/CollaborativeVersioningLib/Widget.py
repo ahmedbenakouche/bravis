@@ -71,7 +71,6 @@ from CollaborativeVersioningLib.GitHubAuth import (
     fetch_remote_updates,
     fetch_local_project_info,
     adopt_shared_lanes,
-    integrate_shared_lanes,
     capture_remote_sync_caps,
     derive_remote_sync_caps_from_history,
     save_remote_sync_caps,
@@ -7357,9 +7356,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if action == CompareWithSharedDialog.ACTION_RESET:
             self._resetToSharedVersions(local_path, reset_lanes or conflict_lanes)
             return
-        if action == CompareWithSharedDialog.ACTION_LINEAR:
-            self._integrateSharedLinear(local_path, conflict_lanes)
-            return
         # Cancel / Keep / Merge-coming: keep frozen tree + keep peek caps (no new remote tips in UI).
         if peek_caps is not None:
             save_remote_sync_caps(local_path, peek_caps)
@@ -7464,69 +7460,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             )
         else:
             self._appendFeed("Reset conflicting branches (%s)." % lanes_label)
-
-    def _integrateSharedLinear(self, local_path: str, conflict_lanes=None) -> None:
-        """Linear-integrate conflicting lanes only onto their shared tips."""
-        lanes = [
-            str(name).strip()
-            for name in (conflict_lanes or ())
-            if str(name).strip()
-        ] or ["main"]
-        lanes_label = ", ".join(lanes)
-        box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Add shared, then mine")
-        box.setIcon(qt.QMessageBox.Warning)
-        box.setText(
-            "On conflicting branches, add shared versions then keep yours on top?\n\n"
-            "Branches: %s\n"
-            "Other local branches stay unchanged.\n\n"
-            "Warning: on those branches, your versions will be placed after the shared versions."
-            % lanes_label
-        )
-        box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
-        box.button(qt.QMessageBox.Ok).setText("Add shared, then mine")
-        box.setDefaultButton(qt.QMessageBox.Cancel)
-        if box.exec_() != qt.QMessageBox.Ok:
-            return
-        project = self._currentProjectName()
-        self._openProgress("Add shared, then mine", "Adding shared, then your work…")
-        try:
-            self._updateProgress("Adding shared, then your work…")
-            integrate_shared_lanes(local_path, lanes)
-            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
-            self._updateProgress("Updating version history…")
-            history = read_project_history(local_path)
-            version_id = self._applyProjectHistoryBundle(history, follow_head=True)
-            stamp = self._newestVersionsSyncStamp() or time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-            )
-            if project and stamp:
-                self._persistReadCursor(project, versions_at=stamp)
-        except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
-            self._closeProgress()
-            if is_offline_error(error):
-                self._showGithubError(error, box=True)
-                return
-            detail = str(error).strip()
-            first = detail.split("\n")[0]
-            self._appendFeed(first, error=True)
-            # Second line often has the real git reason.
-            rest = "\n".join(detail.split("\n")[1:]).strip()
-            if rest and not looks_like_offline_error(rest):
-                self._appendFeed(rest.split("\n")[0], error=True)
-            return
-        self._closeProgress()
-        unshared = self._historyHasUnsharedVersion(history)
-        self._unshared_version = unshared
-        self._updateCommitHistoryPanel()
-        self._updateVersionActionButtons()
-        self._updateNotificationsBadge()
-        if version_id:
-            self._appendFeed(
-                "Added shared, then yours on %s. Tip: %s." % (lanes_label, version_id)
-            )
-        else:
-            self._appendFeed("Added shared, then yours on %s." % lanes_label)
 
     def _openNotificationDetail(self, item: dict) -> None:
         detail = NotificationDetailDialog(
