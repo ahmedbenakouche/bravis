@@ -1028,12 +1028,15 @@ def _build_one_diff_caption(node_id, commit_history_by_id, side):
 
 
 def _build_one_result_caption(node_id, commit_history_by_id, role):
-    """Short label for a Result green mark: from shared vs yours on top."""
+    """Short label for a Result green mark: from shared / yours / merge later."""
     info = (commit_history_by_id or {}).get(node_id) or {}
     when = str(info.get("date") or "").strip() or "recently"
     role = str(role or "").strip().lower()
     if role == "local":
         return "Yours on top\n%s" % when
+    if role == "merge":
+        # Phantom preview node — no real date (not created until Apply).
+        return "Merge of shared + yours\n(not created yet)"
     return "From shared\n%s" % when
 
 

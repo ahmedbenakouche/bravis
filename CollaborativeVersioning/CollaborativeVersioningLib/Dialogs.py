@@ -8,6 +8,7 @@ import qt
 import CollaborativeVersioningLib.GraphCanvas as graph_module
 from CollaborativeVersioningLib.GitHubAuth import (
     GitHubAuthError,
+    build_scoped_reset_preview,
     normalize_task_title,
     set_wait_callback,
     suggest_github_usernames,
@@ -262,6 +263,147 @@ class NotificationsDialog(qt.QDialog):
         self.accept()
 
 
+class ResolveConflictLanesDialog(qt.QDialog):
+    """Per-lane plan: Reset to shared or Compare and merge (tip-conflict lanes only)."""
+
+    CHOICE_RESET = "reset"
+    CHOICE_MERGE = "merge"
+
+    def __init__(
+        self,
+        parent,
+        conflict_lanes,
+        shared_ahead_lanes=None,
+        initial_plan=None,
+    ) -> None:
+        qt.QDialog.__init__(self, parent)
+        self.setWindowTitle("Resolve conflicting branches")
+        self.setModal(True)
+        self.lane_plan = {}
+        lanes = [
+            str(name).strip()
+            for name in (conflict_lanes or ())
+            if str(name).strip()
+        ]
+        ahead = [
+            str(name).strip()
+            for name in (shared_ahead_lanes or ())
+            if str(name).strip()
+        ]
+        initial = dict(initial_plan or {})
+
+        layout = qt.QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+
+        intro = qt.QLabel(
+            "For each conflicting branch, choose one option:"
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(DIALOG_HINT_STYLE)
+        layout.addWidget(intro)
+
+        grid = qt.QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(8)
+        grid.setContentsMargins(4, 4, 4, 4)
+        header_branch = qt.QLabel("Branch")
+        header_reset = qt.QLabel("Reset to shared")
+        header_merge = qt.QLabel("Compare and merge")
+        for header in (header_branch, header_reset, header_merge):
+            header.setStyleSheet("font-weight: 700;")
+        grid.addWidget(header_branch, 0, 0)
+        grid.addWidget(header_reset, 0, 1, 1, 1, qt.Qt.AlignHCenter)
+        grid.addWidget(header_merge, 0, 2, 1, 1, qt.Qt.AlignHCenter)
+
+        self._row_radios = {}
+        for row, lane in enumerate(lanes, start=1):
+            name_lbl = qt.QLabel(lane)
+            name_lbl.setStyleSheet("font-weight: 600;")
+            reset_radio = qt.QRadioButton("")
+            merge_radio = qt.QRadioButton("")
+            reset_radio.setToolTip(
+                "Move this branch tip to the shared tip. "
+                "Conflicting local versions leave this line."
+            )
+            merge_radio.setToolTip(
+                "After Validate, open Compare and merge for this branch "
+                "(local tip with shared tip)."
+            )
+            group = qt.QButtonGroup(self)
+            group.setExclusive(True)
+            group.addButton(reset_radio)
+            group.addButton(merge_radio)
+            choice = str(initial.get(lane) or "").strip().lower()
+            if choice == self.CHOICE_RESET:
+                reset_radio.setChecked(True)
+            else:
+                # Default: Compare and merge
+                merge_radio.setChecked(True)
+            grid.addWidget(name_lbl, row, 0)
+            grid.addWidget(reset_radio, row, 1, 1, 1, qt.Qt.AlignHCenter)
+            grid.addWidget(merge_radio, row, 2, 1, 1, qt.Qt.AlignHCenter)
+            self._row_radios[lane] = (reset_radio, merge_radio)
+
+        layout.addLayout(grid)
+
+        if ahead:
+            ahead_hint = qt.QLabel(
+                "Shared-ahead branches (%s) are not listed here — "
+                "they are caught up automatically on Validate "
+                "(with Reset all or when the plan is applied)."
+                % _lanes_label_simple(ahead)
+            )
+            ahead_hint.setWordWrap(True)
+            ahead_hint.setStyleSheet(DIALOG_HINT_STYLE)
+            layout.addWidget(ahead_hint)
+
+        if not lanes:
+            empty = qt.QLabel("No conflicting branches to plan.")
+            empty.setStyleSheet(DIALOG_HINT_STYLE)
+            layout.addWidget(empty)
+
+        buttons = qt.QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_btn = qt.QPushButton("Cancel")
+        cancel_btn.setStyleSheet(BTN_SECONDARY)
+        cancel_btn.connect("clicked()", self.reject)
+        ok_btn = qt.QPushButton("OK")
+        ok_btn.setStyleSheet(BTN_CREATE)
+        ok_btn.setEnabled(bool(lanes))
+        ok_btn.connect("clicked()", self._onOk)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(ok_btn)
+        layout.addLayout(buttons)
+
+        try:
+            self.resize(520, min(420, 140 + 36 * max(1, len(lanes))))
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+
+    def _onOk(self) -> None:
+        plan = {}
+        for lane, radios in self._row_radios.items():
+            reset_radio, merge_radio = radios
+            if reset_radio.isChecked():
+                plan[lane] = self.CHOICE_RESET
+            else:
+                plan[lane] = self.CHOICE_MERGE
+        self.lane_plan = plan
+        self.accept()
+
+
+def _lanes_label_simple(lanes) -> str:
+    names = [str(name).strip() for name in (lanes or ()) if str(name).strip()]
+    if not names:
+        return "the same branch"
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return "%s and %s" % (names[0], names[1])
+    return "%s, and %s" % (", ".join(names[:-1]), names[-1])
+
+
 class CompareWithSharedDialog(qt.QDialog):
     """Compare local vs shared graphs, preview a choice, then Validate to apply."""
 
@@ -302,6 +444,8 @@ class CompareWithSharedDialog(qt.QDialog):
             self.resize(1280, 820)
         self.action = self.ACTION_NONE
         self._pending = self.ACTION_NONE
+        # Per-lane plan from ResolveConflictLanesDialog: lane -> "reset"|"merge"
+        self.lane_plan = {}
         self._compare = dict(compare or {})
         self._conflict = bool(self._compare.get("conflict"))
         self._conflict_lanes = [
@@ -318,6 +462,11 @@ class CompareWithSharedDialog(qt.QDialog):
         self._reset_lanes = [
             str(name).strip()
             for name in (self._compare.get("reset_lanes") or ())
+            if str(name).strip()
+        ]
+        self._shared_ahead_lanes = [
+            str(name).strip()
+            for name in (self._compare.get("shared_ahead_lanes") or ())
             if str(name).strip()
         ]
         self._aligned = bool(self._compare.get("aligned"))
@@ -480,23 +629,21 @@ class CompareWithSharedDialog(qt.QDialog):
             "Preview: keep this computer's main tip. Shared tip is not applied."
         )
         self._keep_btn.connect("clicked()", lambda: self._selectChoice(self.ACTION_KEEP))
-        self._reset_btn = qt.QPushButton("Reset to shared")
+        self._reset_btn = qt.QPushButton("Reset all to shared")
         self._reset_btn.setStyleSheet(BTN_SECONDARY)
         self._reset_btn.setToolTip(
-            "Replace conflicting local branches with the shared tips. "
+            "Reset every conflicting branch to its shared tip. "
             "Other local branches stay. Conflicting local versions leave those lines."
         )
         self._reset_btn.connect(
             "clicked()", lambda: self._selectChoice(self.ACTION_RESET)
         )
-        self._merge_btn = qt.QPushButton("Keep both (merge) — coming")
+        self._merge_btn = qt.QPushButton("Compare and merge")
         self._merge_btn.setStyleSheet(BTN_SECONDARY)
         self._merge_btn.setToolTip(
-            "Keep both sides by merging annotations. Not available yet."
+            "Choose Reset or Compare and merge per conflicting branch."
         )
-        self._merge_btn.connect(
-            "clicked()", lambda: self._selectChoice(self.ACTION_MERGE)
-        )
+        self._merge_btn.connect("clicked()", self._onMergePlanClicked)
         choice_row.addWidget(self._update_choice_btn)
         choice_row.addWidget(self._keep_btn)
         choice_row.addWidget(self._reset_btn)
@@ -504,12 +651,7 @@ class CompareWithSharedDialog(qt.QDialog):
         choice_row.addStretch(1)
         conflicts_layout.addLayout(choice_row)
 
-        self._conflict_options_help = qt.QLabel(
-            "• Reset to shared — conflicting branches match shared; other local branches stay. "
-            "Warning: conflicting saved versions leave those branch lines.\n"
-            "• Keep both (merge) — coming — keep both sides by merging annotations "
-            "(not available yet)."
-        )
+        self._conflict_options_help = qt.QLabel("")
         self._conflict_options_help.setWordWrap(True)
         self._conflict_options_help.setAlignment(qt.Qt.AlignLeft | qt.Qt.AlignTop)
         self._conflict_options_help.setStyleSheet(
@@ -532,7 +674,7 @@ class CompareWithSharedDialog(qt.QDialog):
         )
         result_layout.addWidget(result_title)
         self._result_legend = qt.QLabel(
-            "Green dashes show which versions come from shared and which stay yours."
+            "Green dashes: From shared, Yours on top, or Compare after Validate."
         )
         self._result_legend.setWordWrap(True)
         self._result_legend.setAlignment(qt.Qt.AlignHCenter)
@@ -668,6 +810,57 @@ class CompareWithSharedDialog(qt.QDialog):
     def _conflictLanesLabel(self) -> str:
         return self._lanesLabel(self._conflict_lanes)
 
+    def _tipConflictLaneCount(self) -> int:
+        return len(
+            [
+                str(name).strip()
+                for name in (self._conflict_lanes or ())
+                if str(name).strip()
+            ]
+        )
+
+    def _tipConflictMergeButtonLabel(self) -> str:
+        """Label for the per-lane plan button."""
+        if self._tipConflictLaneCount() <= 1:
+            return "Compare and merge"
+        return "Reset or Compare and merge"
+
+    def _applyTipConflictActionLabels(self) -> None:
+        """Tip-conflict only: Reset all + merge label from conflict lane count."""
+        merge_label = self._tipConflictMergeButtonLabel()
+        self._reset_btn.setText("Reset all to shared")
+        self._reset_btn.setToolTip(
+            "Reset every conflicting branch to its shared tip. "
+            "Other local branches stay. Conflicting local versions leave those lines."
+        )
+        self._merge_btn.setText(merge_label)
+        if self._tipConflictLaneCount() <= 1:
+            self._merge_btn.setToolTip(
+                "Compare and merge your local tip with the shared tip on this branch "
+                "(use Reset all to shared if you want a full reset instead)."
+            )
+            help_text = (
+                "• Reset all to shared — every conflicting branch matches shared; "
+                "other local branches stay. "
+                "Warning: conflicting saved versions leave those branch lines.\n"
+                "• Compare and merge — merge your local tip with the shared tip "
+                "on this branch (no plan window — only one conflicting branch)."
+            )
+        else:
+            self._merge_btn.setToolTip(
+                "Choose Reset or Compare and merge per conflicting branch."
+            )
+            help_text = (
+                "• Reset all to shared — every conflicting branch matches shared; "
+                "other local branches stay. "
+                "Warning: conflicting saved versions leave those branch lines.\n"
+                "• Reset or Compare and merge — pick Reset or Compare and merge "
+                "for each conflicting branch."
+            )
+        help_lbl = getattr(self, "_conflict_options_help", None)
+        if help_lbl is not None:
+            help_lbl.setText(help_text)
+
     def _setupInitialState(self) -> None:
         # Handled flows: tip conflict alone, obsolete merged alone, shared ahead
         # (Update). Tip conflict + obsolete together → not handled (integration TBD).
@@ -682,11 +875,20 @@ class CompareWithSharedDialog(qt.QDialog):
             self._validate_btn.setEnabled(False)
             return
         if self._conflict:
+            self._applyTipConflictActionLabels()
+            ahead_line = ""
+            if self._shared_ahead_lanes:
+                ahead_line = (
+                    "\nShared-ahead branches (%s) are caught up automatically "
+                    "on Validate with Reset all / plan (not listed in the plan grid)."
+                    % self._lanesLabel(self._shared_ahead_lanes)
+                )
             self._setConflictsMessage(
                 "Local and shared have diverged on: %s.\n"
-                "Reset only changes those branches; other local versions stay.\n"
+                "Reset all to shared resets every conflicting branch; "
+                "other local versions stay.%s\n"
                 "Choose how to integrate, then Validate."
-                % self._conflictLanesLabel()
+                % (self._conflictLanesLabel(), ahead_line)
             )
             self._update_choice_btn.hide()
             self._keep_btn.hide()
@@ -698,6 +900,11 @@ class CompareWithSharedDialog(qt.QDialog):
             return
 
         if self._obsolete_merged:
+            # Obsolete path: single Reset action (not the tip-conflict "Reset all" plan).
+            self._reset_btn.setText("Reset to shared")
+            self._reset_btn.setToolTip(
+                "Move obsolete merged branch tips (and main when listed) to shared."
+            )
             branches = self._lanesLabel(self._obsolete_merged_lanes)
             many = len(self._obsolete_merged_lanes) > 1
             reset_also = self._lanesLabel(
@@ -803,8 +1010,9 @@ class CompareWithSharedDialog(qt.QDialog):
         }
         roles = {}
         if choice == self.ACTION_RESET:
-            # Same as Shared reds → green (taking shared).
-            mark_shas = only_remote
+            # Green: tips taken from shared + local-only versions that stay
+            # (non-reset / local-ahead lanes still present in the scoped reset model).
+            mark_shas = set(only_remote)
             if not mark_shas:
                 remote_model = self._compare.get("remote") or {}
                 remote_sha_by_id = remote_model.get("sha_by_id") or {}
@@ -814,6 +1022,8 @@ class CompareWithSharedDialog(qt.QDialog):
                         mark_shas.add(sha)
             for vid in self._idsForShas(model, mark_shas):
                 roles[vid] = "shared"
+            for vid in self._idsForShas(model, only_local):
+                roles[vid] = "local"
         elif choice == self.ACTION_UPDATE:
             # Shared tips acknowledged + local unshared kept.
             # Include new empty remote lanes (same SHA as main — not in only_remote_shas).
@@ -854,11 +1064,21 @@ class CompareWithSharedDialog(qt.QDialog):
                 str(name).strip().lower() == "main" for name in (reset_names or ())
             )
             detail = "Branches (%s) match shared; other local versions stay" % reset_lanes
+            if self._conflict and self._shared_ahead_lanes:
+                detail += (
+                    "; shared-ahead (%s) caught up"
+                    % self._lanesLabel(self._shared_ahead_lanes)
+                )
             if includes_main:
                 detail += " — unshared main versions leave the tree"
+            reset_title = (
+                "Result — Reset all to shared"
+                if self._conflict
+                else "Result — Reset to shared"
+            )
             return (
                 reset_model,
-                "Result — Reset to shared",
+                reset_title,
                 detail,
             )
         if choice == self.ACTION_UPDATE:
@@ -873,33 +1093,198 @@ class CompareWithSharedDialog(qt.QDialog):
                 "Result — Update from shared",
                 "This computer follows the shared tips",
             )
+        if choice == self.ACTION_MERGE:
+            return self._modelForLanePlan()
         return (
             {},
-            "Result — Keep both (merge)",
+            "Result — Compare and merge",
             "Coming soon",
         )
 
-    def _selectChoice(self, choice: str, silent: bool = False) -> None:
-        self._pending = choice
-        self._refreshChoiceStyles()
-        if choice == self.ACTION_MERGE:
-            self._result_panel.hide()
-            legend = getattr(self, "_result_legend", None)
-            if legend is not None:
-                legend.hide()
-            self._validate_btn.setEnabled(False)
-            self._validate_btn.setToolTip(
-                "Keep both (merge) is not available yet — choose Reset to shared."
-            )
-            if not silent:
-                self._setConflictsMessage(
-                    "Keep both (merge) is coming soon.\n"
-                    "Choose Reset to shared, then Validate."
-                )
-            return
+    def _planResetNames(self) -> list:
+        return [
+            name
+            for name, choice in (self.lane_plan or {}).items()
+            if choice == ResolveConflictLanesDialog.CHOICE_RESET
+        ]
 
-        model, title, description = self._modelForChoice(choice)
-        result_ids, result_roles = self._resultMarksForChoice(choice, model)
+    def _planMergeNames(self) -> list:
+        return [
+            name
+            for name, choice in (self.lane_plan or {}).items()
+            if choice == ResolveConflictLanesDialog.CHOICE_MERGE
+        ]
+
+    def _planPreviewSharedTipLanes(self) -> list:
+        """Lanes whose Result tip is shared: plan Reset + plan Merge + shared-ahead."""
+        ordered = []
+        seen = set()
+        for name in (
+            list(self._planResetNames())
+            + list(self._planMergeNames())
+            + list(self._shared_ahead_lanes or ())
+        ):
+            key = str(name).strip().lower()
+            label = str(name).strip()
+            if not label or key in seen:
+                continue
+            ordered.append(label)
+            seen.add(key)
+        return ordered
+
+    def _tipIdsForLanes(self, model: dict, lanes) -> set:
+        """Tip version ids for the given lanes in a history model (excludes phantoms)."""
+        wanted = {
+            str(name).strip().lower()
+            for name in (lanes or ())
+            if str(name).strip()
+        }
+        if not wanted:
+            return set()
+        ids_on_lane = set()
+        parent_on_lane = set()
+        for spec in (model or {}).get("version_specs") or []:
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("plan_merge_phantom"):
+                continue
+            branch = str(spec.get("branch") or "").strip().lower()
+            vid = str(spec.get("id") or "").strip()
+            if not vid or branch not in wanted:
+                continue
+            ids_on_lane.add(vid)
+            parent = str(spec.get("parent") or "").strip()
+            if parent:
+                parent_on_lane.add(parent)
+        return {vid for vid in ids_on_lane if vid not in parent_on_lane}
+
+    def _preferLaneTipId(self, tip_ids) -> str:
+        ids = [str(vid).strip() for vid in (tip_ids or ()) if str(vid).strip()]
+        if not ids:
+            return ""
+        real = [vid for vid in ids if not vid.lower().endswith("/start")]
+        return sorted(real or ids, key=str)[0]
+
+    def _withPlanMergePhantoms(self, model: dict) -> dict:
+        """After shared tips: one phantom child per Compare-and-merge lane."""
+        out = {
+            "version_specs": [
+                dict(spec) for spec in ((model or {}).get("version_specs") or [])
+                if isinstance(spec, dict)
+            ],
+            "sha_by_id": dict((model or {}).get("sha_by_id") or {}),
+            "tags_by_id": dict((model or {}).get("tags_by_id") or {}),
+            "commit_history": [
+                list(row) for row in ((model or {}).get("commit_history") or [])
+                if row
+            ],
+            "head_id": (model or {}).get("head_id"),
+        }
+        existing = {
+            str(spec.get("id") or "").strip()
+            for spec in out["version_specs"]
+            if str(spec.get("id") or "").strip()
+        }
+        for lane in self._planMergeNames():
+            tip_id = self._preferLaneTipId(self._tipIdsForLanes(out, [lane]))
+            if not tip_id:
+                continue
+            phantom_id = "%s/compare-preview" % lane
+            if phantom_id in existing:
+                continue
+            out["version_specs"].append(
+                {
+                    "id": phantom_id,
+                    "parent": tip_id,
+                    "branch": lane,
+                    "tag": "○",
+                    "merge": False,
+                    "plan_merge_phantom": True,
+                }
+            )
+            out["sha_by_id"][phantom_id] = ""
+            out["tags_by_id"][phantom_id] = "○"
+            out["commit_history"].append(
+                [
+                    phantom_id,
+                    "",
+                    "",
+                    "Merge result after Compare (preview only)",
+                    "local",
+                ]
+            )
+            existing.add(phantom_id)
+        return out
+
+    def _modelForLanePlan(self) -> tuple:
+        """Result: shared tips on plan lanes; phantom merge node on Compare-and-merge lanes."""
+        local_model = self._compare.get("local") or {}
+        remote_model = self._compare.get("remote") or {}
+        reset_names = self._planResetNames()
+        merge_names = self._planMergeNames()
+        shared_tip_lanes = self._planPreviewSharedTipLanes()
+        if shared_tip_lanes:
+            model = build_scoped_reset_preview(
+                local_model, remote_model, shared_tip_lanes
+            )
+        else:
+            model = dict(local_model or {})
+        if merge_names:
+            model = self._withPlanMergePhantoms(model)
+        detail_bits = []
+        if reset_names:
+            detail_bits.append("Reset: %s → shared tip" % self._lanesLabel(reset_names))
+        if merge_names:
+            detail_bits.append(
+                "Compare and merge: %s → shared tip + merge preview"
+                % self._lanesLabel(merge_names)
+            )
+        if self._shared_ahead_lanes:
+            detail_bits.append(
+                "shared-ahead caught up: %s"
+                % self._lanesLabel(self._shared_ahead_lanes)
+            )
+        detail = "; ".join(detail_bits) if detail_bits else "Plan preview"
+        return (
+            model,
+            "Result — plan (Reset / Compare and merge)",
+            detail,
+        )
+
+    def _resultMarksForLanePlan(self, model: dict) -> tuple:
+        """Green marks: From shared on real tips; Compare after Validate on phantoms."""
+        only_remote = set(self._compare.get("only_remote_shas") or ())
+        only_local = set(self._compare.get("only_local_shas") or ())
+        roles = {}
+        phantom_ids = set()
+        for spec in (model or {}).get("version_specs") or []:
+            if not isinstance(spec, dict) or not spec.get("plan_merge_phantom"):
+                continue
+            vid = str(spec.get("id") or "").strip()
+            if vid:
+                phantom_ids.add(vid)
+                roles[vid] = "merge"
+        # Real tips adopted from shared (reset + merge lanes + shared-ahead).
+        for vid in self._tipIdsForLanes(model, self._planPreviewSharedTipLanes()):
+            roles[vid] = "shared"
+        for vid in self._idsForShas(model, only_remote):
+            if vid not in phantom_ids:
+                roles.setdefault(vid, "shared")
+        # Local-only versions that stay on other lanes.
+        for vid in self._idsForShas(model, only_local):
+            if vid in phantom_ids:
+                continue
+            roles.setdefault(vid, "local")
+        return set(roles.keys()), roles
+
+    def _showResultPreview(
+        self, choice: str, model: dict, title: str, description: str, silent: bool
+    ) -> None:
+        """Paint Result canvas for a choice / plan and refresh Validate state."""
+        if choice == self.ACTION_MERGE:
+            result_ids, result_roles = self._resultMarksForLanePlan(model)
+        else:
+            result_ids, result_roles = self._resultMarksForChoice(choice, model)
         gm = self._graph_module
         self._result_canvas.set_compare_content(
             version_specs=list(model.get("version_specs") or []),
@@ -921,12 +1306,137 @@ class CompareWithSharedDialog(qt.QDialog):
                 legend.hide()
         self._result_panel.show()
         qt.QTimer.singleShot(0, self._fitCompareGraphs)
+
+    def _applyLanePlanSelection(self, plan: dict) -> None:
+        """Store plan after Compare and merge / plan OK; show Result (étape 3)."""
+        self.lane_plan = dict(plan or {})
+        reset_names = self._planResetNames()
+        merge_names = self._planMergeNames()
+        # All Reset in the plan ≡ Reset all (Validate applies now).
+        if reset_names and not merge_names:
+            self._selectChoice(self.ACTION_RESET, silent=False)
+            if self._shared_ahead_lanes:
+                self._setConflictsMessage(
+                    "Preview: Reset all to shared (plan = reset on every conflicting "
+                    "branch; shared-ahead %s caught up).\n"
+                    "Click Validate to apply, or pick another option."
+                    % self._lanesLabel(self._shared_ahead_lanes)
+                )
+            else:
+                self._setConflictsMessage(
+                    "Preview: Reset all to shared (plan = reset on every conflicting "
+                    "branch).\n"
+                    "Click Validate to apply, or pick another option."
+                )
+            return
+
+        self._pending = self.ACTION_MERGE
+        self._refreshChoiceStyles()
+        model, title, description = self._modelForLanePlan()
+        self._showResultPreview(self.ACTION_MERGE, model, title, description, False)
+        # Étape 3: Result shown; Validate for merge queue = étape 4+.
+        self._validate_btn.setEnabled(False)
+        self._validate_btn.setToolTip(
+            "Compare and merge after Validate comes next — "
+            "not applied yet for lanes marked Compare after Validate."
+        )
+        parts = ["Preview: plan ready."]
+        if reset_names:
+            parts.append(
+                "Reset to shared (on Validate): %s." % self._lanesLabel(reset_names)
+            )
+        if merge_names:
+            parts.append(
+                "Compare and merge: %s → shared tip + ○ preview "
+                "(Validate for merges comes next)."
+                % self._lanesLabel(merge_names)
+            )
+        if self._shared_ahead_lanes:
+            parts.append(
+                "Shared-ahead (%s) caught up on Validate."
+                % self._lanesLabel(self._shared_ahead_lanes)
+            )
+        if self._tipConflictLaneCount() > 1:
+            parts.append("Reopen the plan to change choices, or use Reset all.")
+        else:
+            parts.append("Use Reset all to shared if you want a full reset instead.")
+        self._setConflictsMessage("\n".join(parts))
+
+    def _onMergePlanClicked(self) -> None:
+        """Étape 2: 1 lane → merge implicite; ≥2 → grille Reset|Compare and merge."""
+        lanes = [
+            str(name).strip()
+            for name in (self._conflict_lanes or ())
+            if str(name).strip()
+        ]
+        if not lanes:
+            return
+        # One conflict lane: Reset all vs Compare and merge already cover the choice.
+        if len(lanes) == 1:
+            self._applyLanePlanSelection(
+                {lanes[0]: ResolveConflictLanesDialog.CHOICE_MERGE}
+            )
+            return
+        plan_dlg = ResolveConflictLanesDialog(
+            self,
+            lanes,
+            shared_ahead_lanes=self._shared_ahead_lanes,
+            initial_plan=self.lane_plan,
+        )
+        if plan_dlg.exec_() != qt.QDialog.Accepted:
+            return
+        self._applyLanePlanSelection(dict(plan_dlg.lane_plan or {}))
+
+    def _selectChoice(self, choice: str, silent: bool = False) -> None:
+        self._pending = choice
+        self._refreshChoiceStyles()
+        if choice == self.ACTION_MERGE:
+            # Plan path owns Result; keep a safe fallback if called without a plan.
+            if self.lane_plan:
+                model, title, description = self._modelForLanePlan()
+                self._showResultPreview(
+                    self.ACTION_MERGE, model, title, description, silent
+                )
+                has_merge = bool(self._planMergeNames())
+                self._validate_btn.setEnabled(not has_merge)
+                if has_merge:
+                    self._validate_btn.setToolTip(
+                        "Compare and merge after Validate comes next."
+                    )
+                else:
+                    self._validate_btn.setToolTip("Apply this choice to this computer.")
+                return
+            self._result_panel.hide()
+            legend = getattr(self, "_result_legend", None)
+            if legend is not None:
+                legend.hide()
+            self._validate_btn.setEnabled(False)
+            self._validate_btn.setToolTip(
+                "Open the per-branch plan, then preview the Result."
+            )
+            if not silent:
+                if self._tipConflictLaneCount() <= 1:
+                    self._setConflictsMessage(
+                        "Compare and merge selects this branch for merge after Validate "
+                        "(or use Reset all to shared)."
+                    )
+                else:
+                    self._setConflictsMessage(
+                        "Open %s to choose Reset or Compare and merge per branch."
+                        % self._tipConflictMergeButtonLabel()
+                    )
+            return
+
+        model, title, description = self._modelForChoice(choice)
+        self._showResultPreview(choice, model, title, description, silent)
         self._validate_btn.setEnabled(True)
         self._validate_btn.setToolTip("Apply this choice to this computer.")
         if not silent:
             labels = {
                 self.ACTION_KEEP: "Keep mine",
-                self.ACTION_RESET: "Reset to shared",
+                self.ACTION_RESET: (
+                    "Reset all to shared" if self._conflict else "Reset to shared"
+                ),
                 self.ACTION_UPDATE: "Update version tree",
             }
             self._setConflictsMessage(

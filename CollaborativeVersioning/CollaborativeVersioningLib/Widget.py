@@ -7401,7 +7401,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._appendFeed("Updated the version tree from the shared project.")
 
     def _resetToSharedVersions(self, local_path: str, conflict_lanes=None) -> None:
-        """Adopt shared tips for conflicting lanes only (others stay local)."""
+        """Adopt shared tips for reset lanes (conflicts + shared-ahead catch-up)."""
         lanes = [
             str(name).strip()
             for name in (conflict_lanes or ())
@@ -7409,7 +7409,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         ] or ["main"]
         lanes_label = ", ".join(lanes)
         box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Reset to shared")
+        box.setWindowTitle("Reset all to shared")
         box.setIcon(qt.QMessageBox.Warning)
         includes_main = any(str(name).strip().lower() == "main" for name in lanes)
         warn_main = (
@@ -7418,22 +7418,25 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             else ""
         )
         box.setText(
-            "Reset these branches to the shared tips?\n\n"
+            "Move these branches to the shared tips?\n\n"
             "Branches: %s\n"
+            "(Includes tip-conflict resets and any shared-ahead catch-up.)\n"
             "Other local branches stay unchanged.\n\n"
-            "Warning: saved versions on the reset branches leave those lines."
+            "Warning: saved versions on reset conflict branches leave those lines."
             "%s"
             % (lanes_label, warn_main)
         )
         box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
-        box.button(qt.QMessageBox.Ok).setText("Reset to shared")
+        box.button(qt.QMessageBox.Ok).setText("Reset all to shared")
         box.setDefaultButton(qt.QMessageBox.Cancel)
         if box.exec_() != qt.QMessageBox.Ok:
             return
         project = self._currentProjectName()
-        self._openProgress("Reset to shared", "Moving conflicting branches to shared…")
+        self._openProgress(
+            "Reset all to shared", "Moving branches to shared tips…"
+        )
         try:
-            self._updateProgress("Moving conflicting branches to shared…")
+            self._updateProgress("Moving branches to shared tips…")
             adopt_shared_lanes(local_path, lanes)
             save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
@@ -7456,10 +7459,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateNotificationsBadge()
         if version_id:
             self._appendFeed(
-                "Reset conflicting branches (%s). Tip: %s." % (lanes_label, version_id)
+                "Reset/updated branches to shared (%s). Tip: %s."
+                % (lanes_label, version_id)
             )
         else:
-            self._appendFeed("Reset conflicting branches (%s)." % lanes_label)
+            self._appendFeed(
+                "Reset/updated branches to shared (%s)." % lanes_label
+            )
 
     def _openNotificationDetail(self, item: dict) -> None:
         detail = NotificationDetailDialog(

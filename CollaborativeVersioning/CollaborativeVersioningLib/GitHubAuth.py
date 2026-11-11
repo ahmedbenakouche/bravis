@@ -1301,19 +1301,14 @@ def git_branch_for_history_lane(lane: str) -> str:
 
 
 def is_viewing_older_than_branch_tip(repo_dir: str, lane: str = "main") -> bool:
-    """True when HEAD is a strict ancestor of the lane's effective tip.
+    """True when HEAD is a strict ancestor of the lane's **local** tip.
 
     Happens after Switch to an older version: the tip (e.g. unshared main/2–3)
     stays on the branch while the worktree shows an earlier commit.
 
-    For ``main``, only the local tip counts (origin ahead without Update must not
-    force Create a branch).
-
-    For side lanes (``cv-review/*``), also consider ``origin/cv-review/<slug>``:
-    task work is often Shared by a junior first, so the Version tree can show
-    ``…/2`` from origin while ``refs/heads/cv-review/…`` still points at ``…/1``.
-    Without the remote tip, Save on ``…/1`` looked like the tip and skipped
-    Create a branch (``…/start`` still worked because its SHA is main).
+    Only ``refs/heads/…`` counts (main and side lanes). Origin ahead without
+    Validate Update must not force Create a branch — same rule as main — so a
+    user on the local tip can Save to diverge when shared has advanced.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return False
@@ -1321,29 +1316,7 @@ def is_viewing_older_than_branch_tip(repo_dir: str, lane: str = "main") -> bool:
     head = _git_rev_parse(repo_dir, "HEAD")
     if not head:
         return False
-    candidates = []
-    local_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
-    if local_tip:
-        candidates.append(local_tip)
-    # Side lanes only — do not pull origin/main into this check (main Update flow).
-    if branch != "main":
-        remote_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch)
-        if remote_tip and remote_tip not in candidates:
-            candidates.append(remote_tip)
-    if not candidates:
-        return False
-    tip = candidates[0]
-    for cand in candidates[1:]:
-        if tip == cand:
-            continue
-        if _is_ancestor(repo_dir, tip, cand):
-            tip = cand
-        elif not _is_ancestor(repo_dir, cand, tip):
-            # Diverged tips: prefer the one that still has HEAD as ancestor.
-            if _is_ancestor(repo_dir, head, cand) and not _is_ancestor(
-                repo_dir, head, tip
-            ):
-                tip = cand
+    tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
     if not tip or tip == head:
         return False
     return _is_ancestor(repo_dir, head, tip)
@@ -4281,11 +4254,65 @@ def read_compare_project_histories(
                 continue
             obsolete_merged_lanes.append(str(slug))
     obsolete_merged = bool(obsolete_merged_lanes)
+
+    # Shared ahead, no tip fork: local tip is a strict ancestor of remote tip (or
+    # remote tip exists with no local tip). Safe to fast-forward like Update.
+    shared_ahead_lanes: list[str] = []
+    conflict_keys = {
+        str(name).strip().lower()
+        for name in conflict_lanes
+        if str(name).strip()
+    }
+    if commit_by_sha:
+        if (
+            origin
+            and local_main
+            and origin != local_main
+            and "main" not in conflict_keys
+            and not _tips_diverged(commit_by_sha, local_main, origin)
+            and _sha_is_ancestor_in_map(commit_by_sha, local_main, origin)
+        ):
+            shared_ahead_lanes.append("main")
+        for slug in sorted(
+            set(local_review_tips.keys()) | set(remote_review_tips.keys()),
+            key=lambda name: str(name).lower(),
+        ):
+            key = str(slug or "").strip().lower()
+            if not key or key in conflict_keys:
+                continue
+            local_tip = _first_tip(local_review_tips.get(slug))
+            remote_tip = _first_tip(remote_review_tips.get(slug))
+            if not remote_tip:
+                continue
+            if not local_tip:
+                shared_ahead_lanes.append(str(slug))
+                continue
+            if local_tip == remote_tip:
+                continue
+            if _tips_diverged(commit_by_sha, local_tip, remote_tip):
+                continue
+            if _sha_is_ancestor_in_map(commit_by_sha, local_tip, remote_tip):
+                shared_ahead_lanes.append(str(slug))
+        ahead_keys = {str(name).strip().lower() for name in shared_ahead_lanes}
+        for name in new_remote_lanes:
+            key = str(name or "").strip().lower()
+            if key and key not in conflict_keys and key not in ahead_keys:
+                shared_ahead_lanes.append(str(name).strip())
+                ahead_keys.add(key)
+
     reset_lanes = list(conflict_lanes)
     if obsolete_merged and not conflict:
         reset_lanes = ["main"] + [
             name for name in obsolete_merged_lanes if name.lower() != "main"
         ]
+    elif conflict:
+        # Reset all / later per-lane plan: also catch up shared-ahead (non-conflict) lanes.
+        seen_reset = {str(name).strip().lower() for name in reset_lanes}
+        for name in shared_ahead_lanes:
+            key = str(name).strip().lower()
+            if key and key not in seen_reset:
+                reset_lanes.append(str(name).strip())
+                seen_reset.add(key)
 
     # Result preview: pedagogical union (merge coming — not applied).
     result_model = empty
@@ -4307,7 +4334,7 @@ def read_compare_project_histories(
         )
 
     if reset_lanes:
-        # Scoped reset preview: keep non-conflicting local lanes, take shared tips for conflicts.
+        # Scoped reset preview: shared tips for conflict + shared-ahead lanes.
         reset_model = _build_scoped_reset_preview(
             local_model, remote_model, reset_lanes
         )
@@ -4356,6 +4383,7 @@ def read_compare_project_histories(
         "conflict_includes_main": conflict_includes_main,
         "obsolete_merged": obsolete_merged,
         "obsolete_merged_lanes": list(obsolete_merged_lanes),
+        "shared_ahead_lanes": list(shared_ahead_lanes),
         "reset_lanes": list(reset_lanes),
         "has_local_extras": has_local_extras,
         "has_remote_extras": has_remote_extras,
@@ -4434,12 +4462,28 @@ def _tips_diverged(commit_by_sha: dict[str, dict], tip_a: str, tip_b: str) -> bo
     return tip_a not in b_reach and tip_b not in a_reach
 
 
+def build_scoped_reset_preview(
+    local_model: dict[str, Any],
+    remote_model: dict[str, Any],
+    conflict_lanes: list[str],
+) -> dict[str, Any]:
+    """Local graph, but listed lanes replaced by the shared (remote) tips.
+
+    ``conflict_lanes`` may also include shared-ahead (non-conflict) lanes to catch up.
+    Used by Compare Reset all and by the per-lane plan Result preview.
+    """
+    return _build_scoped_reset_preview(local_model, remote_model, conflict_lanes)
+
+
 def _build_scoped_reset_preview(
     local_model: dict[str, Any],
     remote_model: dict[str, Any],
     conflict_lanes: list[str],
 ) -> dict[str, Any]:
-    """Local graph, but conflicting lanes replaced by the shared (remote) tips."""
+    """Local graph, but listed lanes replaced by the shared (remote) tips.
+
+    ``conflict_lanes`` may also include shared-ahead (non-conflict) lanes to catch up.
+    """
     lanes = {str(name).strip().lower() for name in (conflict_lanes or []) if name}
     if not lanes:
         return dict(remote_model or _empty_history_model())
