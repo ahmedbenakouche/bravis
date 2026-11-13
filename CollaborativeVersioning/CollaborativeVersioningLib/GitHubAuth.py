@@ -2083,15 +2083,29 @@ def lane_local_and_origin_tips(repo_dir: str, lane: str) -> tuple[str, str]:
     return local_tip, origin_tip
 
 
+def _is_tip_conflict_resolve_commit(
+    commit_by_sha: dict[str, dict], merge_sha: str
+) -> bool:
+    """True for tip-conflict cube resolves (not Accept lane→parent merges)."""
+    message = str((commit_by_sha.get(merge_sha) or {}).get("message") or "")
+    if re.search(r"Resolve tip conflict on\s+\S+", message, re.I):
+        return True
+    # Legacy 2-parent Apply message (wrong Accept-like topology) — still skip
+    # task-lane mapping so history/Compare can open again.
+    if re.search(r"Merge cubes \(shared \+ local\) on\s+\S+", message, re.I):
+        return True
+    return False
+
+
 def merge_cube_manifest_resolving_tip_conflict(
     repo_dir: str,
     lane: str,
     merged_manifest: dict,
 ) -> str:
-    """Resolve a same-lane tip conflict via cube merge (shared + local → new local tip).
+    """Resolve a same-lane tip conflict via cube content on top of the shared tip.
 
-    First parent = origin tip (shared); second parent = local conflict tip.
-    Updates the local branch only — result stays unshared until Share.
+    Not an Accept-style 2-parent merge: one parent = shared tip, new local tip
+    with merged cubes (unshared until Share). Avoids Version-tree task-lane mapping.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -2132,6 +2146,7 @@ def merge_cube_manifest_resolving_tip_conflict(
     digests = _cv_seg_digests(merged_manifest)
     restored_early = False
     try:
+        # Base = shared tip; pull any missing cube blocks from the local tip.
         checkout_local_version(repo_dir, origin_tip, display, attach_branch=False)
         _fill_missing_cv_seg_blocks_from_commit(repo_dir, local_tip, digests)
         SegmentationCubes.save_manifest(repo_dir, merged_manifest)
@@ -2153,22 +2168,21 @@ def merge_cube_manifest_resolving_tip_conflict(
             raise GitHubAuthError(
                 "Could not apply the cube merge.\n%s" % detail[:400]
             )
+        # Single parent (shared tip) — ordinary local version, not Accept topology.
         commit = _run_git(
             [
                 "commit-tree",
                 tree_sha,
                 "-p",
                 origin_tip,
-                "-p",
-                local_tip,
                 "-m",
-                "Merge cubes (shared + local) on %s" % display,
+                "Resolve tip conflict on %s" % display,
             ],
             cwd=repo_dir,
             timeout=30,
         )
-        merge_sha = (commit.stdout or "").strip()
-        if commit.returncode != 0 or not merge_sha:
+        new_sha = (commit.stdout or "").strip()
+        if commit.returncode != 0 or not new_sha:
             detail = (commit.stderr or commit.stdout or "").strip()
             raise GitHubAuthError(
                 "Could not apply the cube merge.\n%s" % detail[:400]
@@ -2185,9 +2199,9 @@ def merge_cube_manifest_resolving_tip_conflict(
             _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
             restored_early = True
 
-        # Local tip only — do not push; Share publishes later.
+        # Local tip only — do not push; no remote activity (Share when ready).
         _run_git(
-            ["update-ref", "refs/heads/%s" % branch, merge_sha],
+            ["update-ref", "refs/heads/%s" % branch, new_sha],
             cwd=repo_dir,
             timeout=20,
         )
@@ -3508,6 +3522,10 @@ def build_project_history_model(
         for tip in tips:
             remember_side(slug, tip)
     for merge_sha in main_chain:
+        # Tip-conflict resolves are same-lane cube commits (or legacy 2-parent
+        # mistakes) — not Accept lane→main. Do not map 2nd parents to task lanes.
+        if _is_tip_conflict_resolve_commit(commit_by_sha, merge_sha):
+            continue
         parents = (commit_by_sha.get(merge_sha) or {}).get("parents") or []
         for extra in parents[1:]:
             if not extra:

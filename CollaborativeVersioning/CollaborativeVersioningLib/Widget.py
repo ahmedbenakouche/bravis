@@ -2248,37 +2248,38 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._armLoadSettle()
         self._updateActiveVersionIndicators()
         self._updateTaskButtonUi()
-        self._updateProgress("Recording activity…")
-        if tip_conflict:
-            self._recordActivity(
-                full_name,
-                "accept",
-                "%s merged shared + local cubes on %s."
-                % (me or "Someone", conflict_lane or source_lane),
-            )
-        elif target_lane == "main":
-            task = self._activeTaskForBranchSlug(source_lane)
-            if task is not None and str(task.get("status") or "") != "accepted":
-                self._markTaskAccepted(task)
+        # Tip-conflict Apply is local-only (no Share / no remote activity notify).
+        if not tip_conflict:
+            self._updateProgress("Recording activity…")
+            if target_lane == "main":
+                task = self._activeTaskForBranchSlug(source_lane)
+                if task is not None and str(task.get("status") or "") != "accepted":
+                    self._markTaskAccepted(task)
+                else:
+                    self._recordActivity(
+                        full_name,
+                        "accept",
+                        "%s merged cubes from %s onto main."
+                        % (me or "Someone", source_lane),
+                    )
             else:
                 self._recordActivity(
                     full_name,
                     "accept",
-                    "%s merged cubes from %s onto main."
-                    % (me or "Someone", source_lane),
+                    "%s merged cubes from %s onto %s."
+                    % (me or "Someone", source_lane, target_lane),
                 )
-        else:
-            self._recordActivity(
-                full_name,
-                "accept",
-                "%s merged cubes from %s onto %s."
-                % (me or "Someone", source_lane, target_lane),
-            )
         self._closeProgress()
         applied_lane = conflict_lane or target_lane
         self._appendFeed(
-            "Applied cube merge: %d cube(s) (%d upper, %d lower) onto %s."
-            % (len(cubes), upper_n, lower_n, applied_lane)
+            "Applied cube merge: %d cube(s) (%d upper, %d lower) onto %s%s."
+            % (
+                len(cubes),
+                upper_n,
+                lower_n,
+                applied_lane,
+                " (local only — Share when ready)" if tip_conflict else "",
+            )
         )
         self._refreshOpenVersionTreeIfNeeded()
         if tip_conflict:
