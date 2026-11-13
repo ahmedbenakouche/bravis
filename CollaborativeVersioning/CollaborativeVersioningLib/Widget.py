@@ -90,6 +90,8 @@ from CollaborativeVersioningLib.GitHubAuth import (
     review_parent_lane_already_merged_upward,
     is_nested_lane_path,
     merge_cube_manifest_onto_lane,
+    merge_cube_manifest_resolving_tip_conflict,
+    lane_local_and_origin_tips,
     parent_lane_slug,
     delete_local_unshared_version,
     sha_is_shared_on_remote,
@@ -266,6 +268,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._rightDockContainer = None
         self._server_pulled = False
         self._pending_versions_behind_hint = False
+        # Étape 5: Compare-and-merge lanes not yet Applied — keeps Compare with shared.
+        self._pending_plan_merge_lanes = []
+        self._plan_merge_queue = []
         self._ontology_document = None
         self._ontology_preset_ids = [preset_id for preset_id, _label in preset_choices()]
         self._connected = False
@@ -1666,11 +1671,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         sha, lane = self._shaAndLaneForVersion(version_id)
         if not local_path or not sha:
             raise RuntimeError("Could not resolve %s." % self._versionDisplayTag(version_id))
+        return self._loadCompareSegmentationAtSha(sha, lane, version_id)
+
+    def _loadCompareSegmentationAtSha(self, sha: str, lane: str, stem_key: str):
+        """Checkout ``sha`` briefly and build a new CVCompare_* segmentation node."""
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        tip = str(sha or "").strip()
+        branch = str(lane or "").strip() or "main"
+        if not local_path or not tip:
+            raise RuntimeError("Could not resolve compare tip.")
         # Detached: Compare must never rewrite cv-review/* tips via branch -f.
-        checkout_local_version(local_path, sha, lane, attach_branch=False)
+        checkout_local_version(local_path, tip, branch, attach_branch=False)
         manager = DataManager()
         files = manager.discover_project_files(local_path)
-        stem = self._compareNodeStem(version_id)
+        stem = self._compareNodeStem(stem_key)
         # Drop a leftover node with the same compare name before recreating.
         manager.remove_scene_nodes_by_names({"%s_segmentation" % stem})
         if files.get("segmentation_store"):
@@ -1682,9 +1696,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             if node is not None:
                 node.SetName("%s_segmentation" % stem)
             return node
-        raise RuntimeError(
-            "No segmentation at %s." % self._versionDisplayTag(version_id)
-        )
+        raise RuntimeError("No segmentation at %s." % (stem_key or tip[:8]))
 
     def _startMergeCompare(self, source_lane: str, target_lane: str) -> None:
         """Load target+source tips into temp nodes, show 2-row linked compare layout."""
@@ -2149,6 +2161,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         source_lane = str(session.get("source_lane") or "").strip()
         target_lane = str(session.get("target_lane") or "").strip() or "main"
+        tip_conflict = bool(session.get("tip_conflict"))
+        conflict_lane = str(session.get("conflict_lane") or source_lane).strip()
         if self._isMainHistoryLane(target_lane):
             target_lane = "main"
         if not source_lane:
@@ -2162,7 +2176,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         lower_n = sum(1 for v in choices.values() if v == "lower")
         full_name = self._currentProjectName() or ""
         pr_number = None
-        if target_lane == "main" and full_name:
+        if (not tip_conflict) and target_lane == "main" and full_name:
             try:
                 req = find_open_review_request_for_branch(full_name, source_lane)
             except Exception:
@@ -2171,30 +2185,48 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 pr_number = req.get("number")
         me = (self._githubLogin() or "").strip()
         # Leave Compare before checkouts so temp segs/layout are gone.
-        self._exitMergeCompare(feed_message=None)
+        # tip-conflict Apply: suppress Quit→queue offer (we advance after success).
+        self._plan_merge_advancing = True
+        try:
+            self._exitMergeCompare(feed_message=None)
+        finally:
+            self._plan_merge_advancing = False
         self._openProgress("Merge", "Applying cube merge…")
         try:
-            local_freeze = copy.deepcopy(
-                getattr(self, "_project_history_bundle", None)
-            )
-            ensure_can_share_with_shared(
-                local_path, local_history=local_freeze, action="merge"
-            )
-            self._updateProgress("Writing merged cubes onto %s…" % target_lane)
-            merge_cube_manifest_onto_lane(
-                local_path,
-                source_lane,
-                target_lane,
-                merged,
-                full_name=full_name,
-                pr_number=pr_number,
-            )
+            if tip_conflict:
+                self._updateProgress(
+                    "Writing merged cubes on %s…" % (conflict_lane or source_lane)
+                )
+                merge_cube_manifest_resolving_tip_conflict(
+                    local_path,
+                    conflict_lane or source_lane,
+                    merged,
+                )
+            else:
+                local_freeze = copy.deepcopy(
+                    getattr(self, "_project_history_bundle", None)
+                )
+                ensure_can_share_with_shared(
+                    local_path, local_history=local_freeze, action="merge"
+                )
+                self._updateProgress("Writing merged cubes onto %s…" % target_lane)
+                merge_cube_manifest_onto_lane(
+                    local_path,
+                    source_lane,
+                    target_lane,
+                    merged,
+                    full_name=full_name,
+                    pr_number=pr_number,
+                )
             save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._showGithubError(error, box=True)
+            if tip_conflict:
+                # Keep pending; offer next / cancel for the rest of the queue.
+                self._offerNextPlanMergeCompare()
             return
         # Keep progress open through UI rebuild + activity (same freeze as Share).
         unshared = self._historyHasUnsharedVersion(history)
@@ -2217,7 +2249,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateActiveVersionIndicators()
         self._updateTaskButtonUi()
         self._updateProgress("Recording activity…")
-        if target_lane == "main":
+        if tip_conflict:
+            self._recordActivity(
+                full_name,
+                "accept",
+                "%s merged shared + local cubes on %s."
+                % (me or "Someone", conflict_lane or source_lane),
+            )
+        elif target_lane == "main":
             task = self._activeTaskForBranchSlug(source_lane)
             if task is not None and str(task.get("status") or "") != "accepted":
                 self._markTaskAccepted(task)
@@ -2236,11 +2275,15 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 % (me or "Someone", source_lane, target_lane),
             )
         self._closeProgress()
+        applied_lane = conflict_lane or target_lane
         self._appendFeed(
             "Applied cube merge: %d cube(s) (%d upper, %d lower) onto %s."
-            % (len(cubes), upper_n, lower_n, target_lane)
+            % (len(cubes), upper_n, lower_n, applied_lane)
         )
         self._refreshOpenVersionTreeIfNeeded()
+        if tip_conflict:
+            self._markPlanMergeLaneApplied(conflict_lane or source_lane)
+            self._offerNextPlanMergeCompare()
 
     def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
         session = getattr(self, "_merge_compare_session", None)
@@ -2285,6 +2328,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         session = getattr(self, "_merge_compare_session", None)
         if not session:
             return
+        tip_conflict = bool(session.get("tip_conflict"))
+        conflict_lane = str(session.get("conflict_lane") or "").strip()
         # Prevent re-entry while we tear down.
         self._merge_compare_session = None
         self._openProgress("Compare and Merge", "Leaving Compare and Merge…")
@@ -2347,6 +2392,266 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed(str(feed_message))
         finally:
             self._closeProgress()
+        # Étape 5 queue: Quit without Apply → keep pending flag, offer next.
+        if (
+            tip_conflict
+            and feed_message is not None
+            and not getattr(self, "_plan_merge_advancing", False)
+        ):
+            self._skipPlanMergeLaneInQueue(conflict_lane)
+            self._offerNextPlanMergeCompare()
+
+    def _startNextPlanMergeCompare(self) -> None:
+        """Open MergeCompare for the next queued tip-conflict lane."""
+        queue = list(getattr(self, "_plan_merge_queue", None) or [])
+        if not queue:
+            if self._planMergeComparePending():
+                self._appendFeed(
+                    "Compare and merge still pending: %s."
+                    % ", ".join(getattr(self, "_pending_plan_merge_lanes", None) or [])
+                )
+            else:
+                self._appendFeed("Compare and merge plan finished.")
+            self._updateNotificationsBadge()
+            return
+        lane = queue[0]
+        self._startTipConflictMergeCompare(lane)
+
+    def _offerNextPlanMergeCompare(self) -> None:
+        """After Apply/Quit: Compare next or Cancel remaining."""
+        queue = list(getattr(self, "_plan_merge_queue", None) or [])
+        pending = list(getattr(self, "_pending_plan_merge_lanes", None) or [])
+        if not queue:
+            if pending:
+                self._appendFeed(
+                    "Stopped — still pending Compare and merge: %s."
+                    % ", ".join(pending)
+                )
+            else:
+                self._appendFeed("Compare and merge plan finished.")
+            self._updateNotificationsBadge()
+            return
+        next_lane = queue[0]
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Compare and merge")
+        box.setIcon(qt.QMessageBox.Question)
+        box.setText("Continue Compare and merge?")
+        box.setInformativeText(
+            "Next branch: %s\n"
+            "Still pending Apply: %s"
+            % (next_lane, ", ".join(pending) if pending else "(none)")
+        )
+        next_btn = box.addButton("Compare next", qt.QMessageBox.AcceptRole)
+        cancel_btn = box.addButton("Cancel remaining", qt.QMessageBox.RejectRole)
+        box.setDefaultButton(next_btn)
+        box.exec_()
+        if box.clickedButton() == next_btn:
+            self._startNextPlanMergeCompare()
+            return
+        # Cancel remaining: clear run queue; keep pending flag for the bell.
+        self._plan_merge_queue = []
+        self._appendFeed(
+            "Cancelled remaining Compare and merge — still pending: %s."
+            % (", ".join(pending) if pending else "(none)")
+        )
+        self._updateNotificationsBadge()
+        _ = cancel_btn
+
+    def _startTipConflictMergeCompare(self, lane: str) -> None:
+        """Compare shared tip (upper) vs local tip (lower) on the same conflicted lane."""
+        if getattr(self, "_merge_compare_session", None):
+            self._appendFeed("Compare is already open — quit it first.", error=True)
+            return
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
+            self._appendFeed("Open the project first.", error=True)
+            return
+        if not self._projectDataIsLoaded():
+            self._appendFeed("Open the project first.", error=True)
+            return
+        self._closeHistoryDialog()
+        display = normalize_lane_path(lane) or str(lane or "").strip()
+        if self._isMainHistoryLane(display):
+            display = "main"
+        if not display:
+            self._appendFeed("Could not find the conflicted branch.", error=True)
+            return
+        try:
+            fetch_remote_updates(local_path)
+        except (GitHubAuthError, OSError, RuntimeError, ValueError):
+            pass
+        local_tip, shared_tip = lane_local_and_origin_tips(local_path, display)
+        if not local_tip or not shared_tip:
+            self._appendFeed(
+                "Could not find local/shared tips for %s." % display,
+                error=True,
+            )
+            return
+        if local_tip == shared_tip:
+            self._appendFeed(
+                "Branch %s already matches shared — skipping." % display
+            )
+            self._markPlanMergeLaneApplied(display)
+            self._startNextPlanMergeCompare()
+            return
+
+        target_label = "%s (shared)" % display
+        source_label = "%s (local)" % display
+        restore_vid = str(getattr(self, "_currentVersionId", None) or "").strip()
+        restore_sha, restore_lane = self._shaAndLaneForVersion(restore_vid)
+        if not restore_sha:
+            restore_sha = ""
+            restore_lane = restore_lane or "main"
+        volume_node = self._selectorCurrentNode("volumeSelector")
+        work_seg = self._selectorCurrentNode("segmentationSelector")
+        target_node = None
+        source_node = None
+        target_manifest = None
+        source_manifest = None
+        need_checkout_restore = False
+        previous_layout = None
+        compare_ok = False
+        cube_overlay = None
+
+        MergeCompare.hide_all_scene_segmentations()
+        MergeCompare.reset_compare_slice_views()
+        self._openProgress("Compare and Merge", "Opening comparison views…")
+        try:
+            previous_layout = MergeCompare.apply_compare_layout(
+                target_label, source_label
+            )
+            MergeCompare.assign_volume_only(volume_node)
+            try:
+                slicer.app.processEvents()
+            except Exception:
+                pass
+
+            target_node = self._loadCompareSegmentationAtSha(
+                shared_tip, display, "%s_shared" % display
+            )
+            target_manifest = SegmentationCubes.try_load_manifest(local_path)
+            MergeCompare.hide_all_scene_segmentations()
+            need_checkout_restore = True
+
+            source_node = self._loadCompareSegmentationAtSha(
+                local_tip, display, "%s_local" % display
+            )
+            source_manifest = SegmentationCubes.try_load_manifest(local_path)
+            MergeCompare.hide_all_scene_segmentations()
+
+            if need_checkout_restore and restore_sha:
+                checkout_local_version(local_path, restore_sha, restore_lane)
+            MergeCompare.hide_all_scene_segmentations()
+            MergeCompare.assign_volume_only(volume_node)
+            try:
+                slicer.app.processEvents()
+            except Exception:
+                pass
+            if target_node is None or source_node is None:
+                raise RuntimeError("Could not load both segmentations for compare.")
+
+            rows = MergeCompare.segment_presence_rows(
+                target_node, source_node, target_label, source_label
+            )
+            names = [str(row.get("name") or "") for row in rows]
+            panel = getattr(self, "comparePanel", None)
+            show_cube_diffs = True
+            if panel is not None:
+                panel.reset_controls()
+                panel.set_version_labels(target_label, source_label)
+                panel.set_segments(rows)
+                show_cube_diffs = bool(panel.showCubeDiffsCheck.isChecked())
+            cube_overlay = MergeCompare.CubeDiffOverlay()
+            cube_count = cube_overlay.configure(
+                target_manifest, source_manifest, volume_node
+            )
+            cube_rows = list(cube_overlay.cubes)
+            cube_choices: dict[str, str] = {}
+            self._merge_compare_session = {
+                "tip_conflict": True,
+                "conflict_lane": display,
+                "source_lane": display,
+                "target_lane": display,
+                "local_tip_sha": local_tip,
+                "shared_tip_sha": shared_tip,
+                "target_node_id": target_node.GetID(),
+                "source_node_id": source_node.GetID(),
+                "work_seg_id": work_seg.GetID() if work_seg is not None else "",
+                "volume_id": volume_node.GetID() if volume_node is not None else "",
+                "segment_names": names,
+                "segment_index": 0,
+                "show_3d": False,
+                "show_all": False,
+                "cube_overlay": cube_overlay,
+                "cube_diff_count": cube_count,
+                "cube_rows": cube_rows,
+                "cube_choices": cube_choices,
+                "target_manifest": target_manifest,
+                "source_manifest": source_manifest,
+                "previous_layout": previous_layout,
+                "panel": panel,
+            }
+            MergeCompare.assign_volume_and_segmentations(
+                volume_node, target_node, source_node, show_3d=False, reveal=False
+            )
+            if names:
+                self._mergeCompareFocusIndex(0)
+            else:
+                MergeCompare.assign_volume_only(volume_node)
+            cube_overlay.start(
+                enabled=show_cube_diffs,
+                click_callback=self._mergeCompareCubeClicked,
+            )
+            self._setCompareModeUi(True)
+            compare_ok = True
+        except Exception as error:
+            try:
+                if restore_sha and need_checkout_restore:
+                    checkout_local_version(local_path, restore_sha, restore_lane)
+            except Exception:
+                pass
+            if cube_overlay is not None:
+                try:
+                    cube_overlay.stop()
+                except Exception:
+                    pass
+            self._removeCompareSegmentationNodes()
+            MergeCompare.hide_all_scene_segmentations()
+            MergeCompare.reset_compare_slice_views()
+            self._merge_compare_session = None
+            self._setCompareModeUi(False)
+            if previous_layout is not None:
+                MergeCompare.restore_layout(previous_layout)
+                MergeCompare.set_linked_2d(False)
+                MergeCompare.set_linked_3d(False)
+                try:
+                    if work_seg is not None:
+                        MergeCompare.show_all_segments(work_seg)
+                    DataManager().present_in_slice_views(volume_node, work_seg)
+                except Exception:
+                    pass
+            self._showGithubError(error, box=True)
+        finally:
+            self._closeProgress()
+
+        if not compare_ok:
+            return
+        self._appendFeed(
+            "Compare tip conflict on %s: shared (top) vs local (bottom)."
+            % display
+        )
+        cube_n = int(
+            (getattr(self, "_merge_compare_session", None) or {}).get(
+                "cube_diff_count"
+            )
+            or 0
+        )
+        if cube_n > 0:
+            self._appendFeed("Cube diffs: %d changed cube(s)." % cube_n)
+        elif target_manifest is None and source_manifest is None:
+            self._appendFeed("Cube diffs: no manifests (legacy segmentation?).")
+        else:
+            self._appendFeed("Cube diffs: none (identical cube hashes).")
 
     def _githubLogin(self) -> str:
         session = getattr(self, "_github_session", None) or {}
@@ -5341,6 +5646,62 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _projectVersionsBehind(self) -> bool:
         return bool(self._laggingVersionNotificationKeys())
 
+    def _planMergeComparePending(self) -> bool:
+        """True while planned Compare-and-merge lanes are not all Applied yet."""
+        return bool(getattr(self, "_pending_plan_merge_lanes", None) or [])
+
+    def _sortPlanMergeLanes(self, lanes) -> list:
+        """Parent lanes before nested children, then name."""
+        ordered = []
+        seen = set()
+        for name in lanes or ():
+            label = str(name).strip()
+            key = label.lower()
+            if not label or key in seen:
+                continue
+            ordered.append(label)
+            seen.add(key)
+        ordered.sort(key=lambda item: (str(item).count("/"), str(item).lower()))
+        return ordered
+
+    def _setPendingPlanMergeLanes(self, lanes) -> None:
+        pending = self._sortPlanMergeLanes(lanes)
+        self._pending_plan_merge_lanes = list(pending)
+        self._plan_merge_queue = list(pending)
+        self._updateNotificationsBadge()
+
+    def _clearPendingPlanMergeLanes(self) -> None:
+        self._pending_plan_merge_lanes = []
+        self._plan_merge_queue = []
+        self._updateNotificationsBadge()
+
+    def _markPlanMergeLaneApplied(self, lane: str) -> None:
+        key = str(lane or "").strip().lower()
+        if not key:
+            return
+        self._pending_plan_merge_lanes = [
+            name
+            for name in (getattr(self, "_pending_plan_merge_lanes", None) or [])
+            if str(name).strip().lower() != key
+        ]
+        self._plan_merge_queue = [
+            name
+            for name in (getattr(self, "_plan_merge_queue", None) or [])
+            if str(name).strip().lower() != key
+        ]
+        self._updateNotificationsBadge()
+
+    def _skipPlanMergeLaneInQueue(self, lane: str) -> None:
+        """Quit without Apply: keep pending flag, advance the run queue."""
+        key = str(lane or "").strip().lower()
+        if not key:
+            return
+        self._plan_merge_queue = [
+            name
+            for name in (getattr(self, "_plan_merge_queue", None) or [])
+            if str(name).strip().lower() != key
+        ]
+
     def _newestVersionsSyncStamp(self) -> str:
         newest = ""
         for item in getattr(self, "_notification_activity", []) or []:
@@ -5413,7 +5774,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         behind = bool(
             self._projectDataIsLoaded()
             and not self._projectUsesLocalInfoOnly()
-            and self._projectVersionsBehind()
+            and (
+                self._projectVersionsBehind() or self._planMergeComparePending()
+            )
         )
         if badge is not None:
             if count <= 0:
@@ -7248,7 +7611,14 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         # (not shared) / offline snapshot: no "aligned with shared" — there is no remote.
         sync_eligible = bool(project_open and not self._projectUsesLocalInfoOnly())
         behind = bool(sync_eligible and self._projectVersionsBehind())
-        if sync_eligible and behind:
+        plan_merge_pending = bool(sync_eligible and self._planMergeComparePending())
+        show_compare = bool(behind or plan_merge_pending)
+        if sync_eligible and plan_merge_pending:
+            sync_status = (
+                "⚠  Compare and merge still pending for: %s."
+                % ", ".join(getattr(self, "_pending_plan_merge_lanes", None) or [])
+            )
+        elif sync_eligible and behind:
             sync_status = "⚠  Local project is not aligned with the remote copy."
         elif sync_eligible:
             sync_status = "✅  Local project is aligned with the shared project."
@@ -7261,7 +7631,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             unread_keys=self._unreadNotificationKeys(),
             lagging_keys=self._laggingVersionNotificationKeys() if sync_eligible else set(),
             sync_status_text=sync_status,
-            show_sync_button=bool(sync_eligible and behind),
+            show_sync_button=bool(sync_eligible and show_compare),
         )
         self._notifications_popup_open = True
         try:
@@ -7357,8 +7727,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._resetToSharedVersions(local_path, reset_lanes or conflict_lanes)
             return
         if action == CompareWithSharedDialog.ACTION_MERGE:
-            # Étape 4 (option 1): apply plan Reset + shared-ahead only.
-            # Compare-and-merge lanes stay tip-conflicted (MergeCompare = étape 5).
+            # Étape 4+5: Reset/shared-ahead, then MergeCompare queue for merge lanes.
             lane_plan = dict(getattr(dialog, "lane_plan", None) or {})
             plan_reset = [
                 str(name).strip()
@@ -7378,17 +7747,27 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     continue
                 apply_lanes.append(name)
                 seen_apply.add(key)
-            remaining_merge = [
-                str(name).strip()
-                for name, choice in lane_plan.items()
-                if str(choice).strip().lower() == "merge" and str(name).strip()
-            ]
+            remaining_merge = self._sortPlanMergeLanes(
+                [
+                    str(name).strip()
+                    for name, choice in lane_plan.items()
+                    if str(choice).strip().lower() == "merge" and str(name).strip()
+                ]
+            )
             if apply_lanes:
-                self._resetToSharedVersions(
+                if not self._resetToSharedVersions(
                     local_path,
                     apply_lanes,
                     remaining_merge_lanes=remaining_merge,
+                ):
+                    return
+            if remaining_merge:
+                self._setPendingPlanMergeLanes(remaining_merge)
+                self._appendFeed(
+                    "Compare and merge pending: %s."
+                    % ", ".join(remaining_merge)
                 )
+                self._startNextPlanMergeCompare()
             return
         # Cancel / Keep / Merge deferred: keep frozen tree + keep peek caps.
         if peek_caps is not None:
@@ -7436,8 +7815,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
     def _resetToSharedVersions(
         self, local_path: str, conflict_lanes=None, remaining_merge_lanes=None
-    ) -> None:
-        """Adopt shared tips for reset lanes (conflicts + shared-ahead catch-up)."""
+    ) -> bool:
+        """Adopt shared tips for reset lanes. Returns False if cancelled / failed."""
         lanes = [
             str(name).strip()
             for name in (conflict_lanes or ())
@@ -7463,7 +7842,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             else ""
         )
         remaining_line = (
-            "\n\nStill conflicted (Compare and merge later): %s"
+            "\n\nNext: Compare and merge for %s"
             % remaining_label
             if partial
             else ""
@@ -7483,7 +7862,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         )
         box.setDefaultButton(qt.QMessageBox.Cancel)
         if box.exec_() != qt.QMessageBox.Ok:
-            return
+            return False
         project = self._currentProjectName()
         self._openProgress(
             "Apply plan resets" if partial else "Reset all to shared",
@@ -7504,7 +7883,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._showGithubError(error, box=True)
-            return
+            return False
         self._closeProgress()
         unshared = self._historyHasUnsharedVersion(history)
         self._unshared_version = unshared
@@ -7520,11 +7899,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._appendFeed(
                 "Reset/updated branches to shared (%s)." % lanes_label
             )
-        if remaining:
-            self._appendFeed(
-                "Still conflicted — Compare and merge later: %s."
-                % remaining_label
-            )
+        return True
 
     def _openNotificationDetail(self, item: dict) -> None:
         detail = NotificationDetailDialog(

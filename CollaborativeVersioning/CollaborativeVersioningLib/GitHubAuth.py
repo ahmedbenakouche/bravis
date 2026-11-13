@@ -2061,6 +2061,151 @@ def merge_cube_manifest_onto_lane(
     return target_display
 
 
+def lane_local_and_origin_tips(repo_dir: str, lane: str) -> tuple[str, str]:
+    """Return ``(local_tip, origin_tip)`` SHAs for main or a review lane."""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return "", ""
+    raw = str(lane or "").strip() or "main"
+    if raw.lower() == "main":
+        local_tip = _git_rev_parse(repo_dir, "refs/heads/main") or ""
+        origin_tip = (
+            _git_rev_parse(repo_dir, "refs/remotes/origin/main")
+            or _git_rev_parse(repo_dir, "origin/main")
+            or ""
+        )
+        return local_tip, origin_tip
+    path = normalize_lane_path(raw)
+    if not path:
+        return "", ""
+    branch = review_branch_for(path)
+    local_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch) or ""
+    origin_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch) or ""
+    return local_tip, origin_tip
+
+
+def merge_cube_manifest_resolving_tip_conflict(
+    repo_dir: str,
+    lane: str,
+    merged_manifest: dict,
+) -> str:
+    """Resolve a same-lane tip conflict via cube merge (shared + local → new local tip).
+
+    First parent = origin tip (shared); second parent = local conflict tip.
+    Updates the local branch only — result stays unshared until Share.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        raise GitHubAuthError("Open the project first.")
+    if not isinstance(merged_manifest, dict):
+        raise GitHubAuthError("Could not apply the cube merge.")
+    raw = str(lane or "").strip() or "main"
+    if raw.lower() == "main":
+        display = "main"
+        branch = "main"
+    else:
+        path = normalize_lane_path(raw)
+        if not path:
+            raise GitHubAuthError("Could not apply the cube merge.")
+        display = path
+        branch = review_branch_for(display)
+    local_tip, origin_tip = lane_local_and_origin_tips(repo_dir, display)
+    if not origin_tip:
+        raise GitHubAuthError(
+            "Could not find the shared tip for branch '%s'." % display
+        )
+    if not local_tip:
+        raise GitHubAuthError(
+            "Could not find the local tip for branch '%s'." % display
+        )
+    if local_tip == origin_tip:
+        raise GitHubAuthError(
+            "Branch %s already matches shared — nothing to Apply." % display
+        )
+
+    login = current_login()
+    if login:
+        _configure_repo_identity(repo_dir, login)
+
+    from CollaborativeVersioningLib import SegmentationCubes
+
+    restore_sha = _git_rev_parse(repo_dir, "HEAD") or ""
+    restore_lane = _checkout_lane_for_branch_name(_current_branch_name(repo_dir))
+    digests = _cv_seg_digests(merged_manifest)
+    restored_early = False
+    try:
+        checkout_local_version(repo_dir, origin_tip, display, attach_branch=False)
+        _fill_missing_cv_seg_blocks_from_commit(repo_dir, local_tip, digests)
+        SegmentationCubes.save_manifest(repo_dir, merged_manifest)
+
+        add = _run_git(
+            ["add", "-A", "--", SegmentationCubes.STORE_DIRNAME],
+            cwd=repo_dir,
+            timeout=120,
+        )
+        if add.returncode != 0:
+            detail = (add.stderr or add.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not apply the cube merge.\n%s" % detail[:400]
+            )
+        tree = _run_git(["write-tree"], cwd=repo_dir, timeout=60)
+        tree_sha = (tree.stdout or "").strip()
+        if tree.returncode != 0 or not tree_sha:
+            detail = (tree.stderr or tree.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not apply the cube merge.\n%s" % detail[:400]
+            )
+        commit = _run_git(
+            [
+                "commit-tree",
+                tree_sha,
+                "-p",
+                origin_tip,
+                "-p",
+                local_tip,
+                "-m",
+                "Merge cubes (shared + local) on %s" % display,
+            ],
+            cwd=repo_dir,
+            timeout=30,
+        )
+        merge_sha = (commit.stdout or "").strip()
+        if commit.returncode != 0 or not merge_sha:
+            detail = (commit.stderr or commit.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not apply the cube merge.\n%s" % detail[:400]
+            )
+        reset = _run_git(
+            ["reset", "--hard", origin_tip], cwd=repo_dir, timeout=120
+        )
+        if reset.returncode != 0:
+            detail = (reset.stderr or reset.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not apply the cube merge.\n%s" % detail[:400]
+            )
+        if restore_sha:
+            _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
+            restored_early = True
+
+        # Local tip only — do not push; Share publishes later.
+        _run_git(
+            ["update-ref", "refs/heads/%s" % branch, merge_sha],
+            cwd=repo_dir,
+            timeout=20,
+        )
+        if branch == "main":
+            _run_git(
+                ["branch", "--set-upstream-to=origin/main", "main"],
+                cwd=repo_dir,
+                timeout=20,
+            )
+    finally:
+        if restore_sha and not restored_early:
+            try:
+                _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
+            except Exception:
+                pass
+    return display
+
+
 def review_branch_for(name: str) -> str:
     """Git branch for a lane: ``cv-review/sos`` or ``cv-review/sos+kg`` (nested)."""
     safe = lane_path_to_git_suffix(name) or "branch"
