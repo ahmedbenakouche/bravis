@@ -674,7 +674,7 @@ class CompareWithSharedDialog(qt.QDialog):
         )
         result_layout.addWidget(result_title)
         self._result_legend = qt.QLabel(
-            "Green dashes: From shared, Yours on top, or Compare after Validate."
+            "Green dashes: From shared, Yours on top, or Merge of shared + yours."
         )
         self._result_legend.setWordWrap(True)
         self._result_legend.setAlignment(qt.Qt.AlignHCenter)
@@ -1269,7 +1269,7 @@ class CompareWithSharedDialog(qt.QDialog):
         )
 
     def _resultMarksForLanePlan(self, model: dict) -> tuple:
-        """Green marks: From shared on real tips; Compare after Validate on phantoms."""
+        """Green marks: From shared on real tips; Merge of shared + yours on phantoms."""
         only_remote = set(self._compare.get("only_remote_shas") or ())
         only_local = set(self._compare.get("only_local_shas") or ())
         roles = {}

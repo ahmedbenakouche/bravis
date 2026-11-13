@@ -72,6 +72,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     fetch_local_project_info,
     adopt_shared_lanes,
     capture_remote_sync_caps,
+    acknowledge_remote_sync_caps_for_lanes,
     derive_remote_sync_caps_from_history,
     save_remote_sync_caps,
     people_access_for,
@@ -2202,6 +2203,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     conflict_lane or source_lane,
                     merged,
                 )
+                # Do NOT capture_remote_sync_caps here — that would ack every
+                # origin tip (e.g. paint main/6 shared while main is still pending).
             else:
                 local_freeze = copy.deepcopy(
                     getattr(self, "_project_history_bundle", None)
@@ -2218,7 +2221,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     full_name=full_name,
                     pr_number=pr_number,
                 )
-            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
+                save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
@@ -2283,7 +2286,26 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         )
         self._refreshOpenVersionTreeIfNeeded()
         if tip_conflict:
+            # Freeze caps to the rebuilt tree only (scrub accidental absorbs of
+            # still-pending conflict lanes from a prior full capture).
+            try:
+                save_remote_sync_caps(
+                    local_path,
+                    derive_remote_sync_caps_from_history(local_path, history),
+                )
+            except (GitHubAuthError, OSError, RuntimeError, TypeError, ValueError):
+                pass
             self._markPlanMergeLaneApplied(conflict_lane or source_lane)
+            if not self._planMergeComparePending():
+                # Only when the whole plan is done — a partial Apply must not
+                # ack versions_at while other tip conflicts remain untreated.
+                self._clearPendingPlanMergeLanes()
+                project = full_name or self._currentProjectName()
+                stamp = self._newestVersionsSyncStamp() or time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                )
+                if project and stamp:
+                    self._persistReadCursor(project, versions_at=stamp)
             self._offerNextPlanMergeCompare()
 
     def _mergeCompareSetShow3d(self, checked: bool = False) -> None:
@@ -2406,6 +2428,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         """Open MergeCompare for the next queued tip-conflict lane."""
         queue = list(getattr(self, "_plan_merge_queue", None) or [])
         if not queue:
+            self._closeProgress()
             if self._planMergeComparePending():
                 self._appendFeed(
                     "Compare and merge still pending: %s."
@@ -2429,6 +2452,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                     % ", ".join(pending)
                 )
             else:
+                self._clearPendingPlanMergeLanes()
                 self._appendFeed("Compare and merge plan finished.")
             self._updateNotificationsBadge()
             return
@@ -2451,6 +2475,18 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         # Cancel remaining: clear run queue; keep pending flag for the bell.
         self._plan_merge_queue = []
+        # Re-freeze caps to the Version tree so untreated pending lanes do not
+        # keep showing shared tips as if already Validated.
+        local_path = str(getattr(self, "_local_project_path", None) or "").strip()
+        bundle = getattr(self, "_project_history_bundle", None)
+        if local_path and bundle:
+            try:
+                save_remote_sync_caps(
+                    local_path,
+                    derive_remote_sync_caps_from_history(local_path, bundle),
+                )
+            except (GitHubAuthError, OSError, RuntimeError, TypeError, ValueError):
+                pass
         self._appendFeed(
             "Cancelled remaining Compare and merge — still pending: %s."
             % (", ".join(pending) if pending else "(none)")
@@ -2461,13 +2497,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
     def _startTipConflictMergeCompare(self, lane: str) -> None:
         """Compare shared tip (upper) vs local tip (lower) on the same conflicted lane."""
         if getattr(self, "_merge_compare_session", None):
+            self._closeProgress()
             self._appendFeed("Compare is already open — quit it first.", error=True)
             return
         local_path = str(getattr(self, "_local_project_path", None) or "").strip()
         if not local_path or not os.path.isdir(os.path.join(local_path, ".git")):
+            self._closeProgress()
             self._appendFeed("Open the project first.", error=True)
             return
         if not self._projectDataIsLoaded():
+            self._closeProgress()
             self._appendFeed("Open the project first.", error=True)
             return
         self._closeHistoryDialog()
@@ -2475,14 +2514,19 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if self._isMainHistoryLane(display):
             display = "main"
         if not display:
+            self._closeProgress()
             self._appendFeed("Could not find the conflicted branch.", error=True)
             return
+        self._openOrUpdateProgress(
+            "Compare and Merge", "Reading tips for %s…" % display
+        )
         try:
             fetch_remote_updates(local_path)
         except (GitHubAuthError, OSError, RuntimeError, ValueError):
             pass
         local_tip, shared_tip = lane_local_and_origin_tips(local_path, display)
         if not local_tip or not shared_tip:
+            self._closeProgress()
             self._appendFeed(
                 "Could not find local/shared tips for %s." % display,
                 error=True,
@@ -2516,7 +2560,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
 
         MergeCompare.hide_all_scene_segmentations()
         MergeCompare.reset_compare_slice_views()
-        self._openProgress("Compare and Merge", "Opening comparison views…")
+        self._openOrUpdateProgress(
+            "Compare and Merge", "Opening comparison views…"
+        )
         try:
             previous_layout = MergeCompare.apply_compare_layout(
                 target_label, source_label
@@ -3816,6 +3862,22 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._rightDock.deleteLater()
         self._rightDock = None
         self.removeObservers()
+
+    def _progressIsOpen(self) -> bool:
+        return getattr(self, "_progressDialog", None) is not None
+
+    def _openOrUpdateProgress(self, title: str, label: str) -> None:
+        """Reuse the open progress dialog when chaining plan Reset → MergeCompare."""
+        if self._progressIsOpen():
+            dialog = getattr(self, "_progressDialog", None)
+            if dialog is not None:
+                try:
+                    dialog.setWindowTitle(str(title or ""))
+                except (RuntimeError, ValueError, AttributeError):
+                    pass
+            self._updateProgress(label)
+            return
+        self._openProgress(title, label)
 
     def _openProgress(self, title: str, label: str) -> None:
         self._closeProgress()
@@ -7705,6 +7767,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._showGithubError(error, box=True)
             return
         self._closeProgress()
+        # Quit/Cancel remaining left a pending-merge flag for the bell. If this
+        # Compare sees no tip conflict anymore, drop it (Keep mine / aligned /
+        # local-ahead only must not keep "behind").
+        if not bool((compare or {}).get("conflict")):
+            self._clearPendingPlanMergeLanes()
         # Re-assert frozen UI (fetch must never rewrite the Version tree panel).
         self._project_history_bundle = saved_bundle
         self._currentVersionId = saved_version_id
@@ -7716,6 +7783,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         accepted = dialog.exec_() == qt.QDialog.Accepted
         action = str(getattr(dialog, "action", "") or "") if accepted else ""
         if action == CompareWithSharedDialog.ACTION_UPDATE:
+            self._clearPendingPlanMergeLanes()
             self._applySharedVersionsUpdate(local_path, fetched=True)
             return
         conflict_lanes = list(getattr(dialog, "_conflict_lanes", None) or [])
@@ -7725,7 +7793,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if not reset_lanes:
             reset_lanes = list((compare or {}).get("reset_lanes") or conflict_lanes)
         if action == CompareWithSharedDialog.ACTION_RESET:
-            self._resetToSharedVersions(local_path, reset_lanes or conflict_lanes)
+            # Full Reset all (no merge queue after) clears pending merges.
+            if self._resetToSharedVersions(local_path, reset_lanes or conflict_lanes):
+                self._clearPendingPlanMergeLanes()
             return
         if action == CompareWithSharedDialog.ACTION_MERGE:
             # Étape 4+5: Reset/shared-ahead, then MergeCompare queue for merge lanes.
@@ -7756,10 +7826,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 ]
             )
             if apply_lanes:
+                # Keep progress open when MergeCompare follows (no gap between phases).
                 if not self._resetToSharedVersions(
                     local_path,
                     apply_lanes,
                     remaining_merge_lanes=remaining_merge,
+                    keep_progress_open=bool(remaining_merge),
                 ):
                     return
             if remaining_merge:
@@ -7767,6 +7839,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._appendFeed(
                     "Compare and merge pending: %s."
                     % ", ".join(remaining_merge)
+                )
+                self._openOrUpdateProgress(
+                    "Compare and Merge", "Opening comparison views…"
                 )
                 self._startNextPlanMergeCompare()
             return
@@ -7778,11 +7853,13 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._unshared_version = saved_unshared
         self._updateCommitHistoryPanel()
         self._updateVersionActionButtons()
-        self._updateNotificationsBadge()
         if action == CompareWithSharedDialog.ACTION_KEEP:
+            # No tip conflict to merge — pending bell flag must not stick.
+            self._clearPendingPlanMergeLanes()
             self._appendFeed(
                 "Kept your local versions. Version tree unchanged until you update."
             )
+        self._updateNotificationsBadge()
 
     def _applySharedVersionsUpdate(self, local_path: str, fetched: bool = False) -> None:
         """Rebuild the version tree from origin refs; does not change open assets."""
@@ -7815,7 +7892,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._appendFeed("Updated the version tree from the shared project.")
 
     def _resetToSharedVersions(
-        self, local_path: str, conflict_lanes=None, remaining_merge_lanes=None
+        self,
+        local_path: str,
+        conflict_lanes=None,
+        remaining_merge_lanes=None,
+        keep_progress_open: bool = False,
     ) -> bool:
         """Adopt shared tips for reset lanes. Returns False if cancelled / failed."""
         lanes = [
@@ -7865,27 +7946,46 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if box.exec_() != qt.QMessageBox.Ok:
             return False
         project = self._currentProjectName()
-        self._openProgress(
-            "Apply plan resets" if partial else "Reset all to shared",
-            "Moving branches to shared tips…",
+        progress_title = (
+            "Apply plan" if (partial and keep_progress_open) else (
+                "Apply plan resets" if partial else "Reset all to shared"
+            )
         )
+        self._openProgress(progress_title, "Moving branches to shared tips…")
         try:
             self._updateProgress("Moving branches to shared tips…")
             adopt_shared_lanes(local_path, lanes)
-            save_remote_sync_caps(local_path, capture_remote_sync_caps(local_path))
+            # When MergeCompare lanes remain, only ack the reset/shared-ahead
+            # lanes — do not absorb pending tip-conflict shared tips into the tree.
+            if remaining:
+                acknowledge_remote_sync_caps_for_lanes(local_path, lanes)
+            else:
+                save_remote_sync_caps(
+                    local_path, capture_remote_sync_caps(local_path)
+                )
             self._updateProgress("Updating version history…")
             history = read_project_history(local_path)
             version_id = self._applyProjectHistoryBundle(history, follow_head=True)
+            if remaining:
+                # Lock caps to the post-reset tree so pending merge lanes stay frozen.
+                save_remote_sync_caps(
+                    local_path,
+                    derive_remote_sync_caps_from_history(local_path, history),
+                )
             stamp = self._newestVersionsSyncStamp() or time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
             )
             if project and stamp:
-                self._persistReadCursor(project, versions_at=stamp)
+                # Partial plan (resets then merge queue): do not clear versions
+                # notifications until merge lanes are finished too.
+                if not remaining:
+                    self._persistReadCursor(project, versions_at=stamp)
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._showGithubError(error, box=True)
             return False
-        self._closeProgress()
+        if not keep_progress_open:
+            self._closeProgress()
         unshared = self._historyHasUnsharedVersion(history)
         self._unshared_version = unshared
         self._updateCommitHistoryPanel()

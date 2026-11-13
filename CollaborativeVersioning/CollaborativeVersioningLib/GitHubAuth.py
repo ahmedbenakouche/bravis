@@ -3910,6 +3910,10 @@ def _prefer_ahead_tip(repo_dir: str, capped: str, local_tip: str) -> str:
 
     Stale sync caps must not hide versions that already exist on local main / HEAD
     (e.g. just Shared from this computer).
+
+    When local and capped tips have diverged (tip conflict), prefer the local tip so
+    a polluted cap (e.g. full capture after Apply on another lane) cannot paint the
+    shared tip as if Update/Reset had already been Validated.
     """
     capped = str(capped or "").strip()
     local_tip = str(local_tip or "").strip()
@@ -3921,7 +3925,57 @@ def _prefer_ahead_tip(repo_dir: str, capped: str, local_tip: str) -> str:
         return local_tip
     if _is_ancestor(repo_dir, capped, local_tip):
         return local_tip
-    return capped
+    if _is_ancestor(repo_dir, local_tip, capped):
+        # Local behind acknowledged shared — show shared (Update/Reset already ack'd).
+        return capped
+    # Diverged: keep local tip until the user Validates Update / Reset / merge.
+    return local_tip
+
+
+def acknowledge_remote_sync_caps_for_lanes(repo_dir: str, lanes=None) -> None:
+    """Advance Version-tree UI caps only for the listed lanes.
+
+    Other lanes keep their previous freeze so Apply/Reset on one branch cannot
+    absorb shared tips the user has not treated yet.
+    """
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in lanes or ():
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(name)
+    if not ordered:
+        return
+    previous = load_remote_sync_caps(repo_dir) or {}
+    caps = {
+        "origin_main": str(previous.get("origin_main") or "").strip(),
+        "review_tips": dict(previous.get("review_tips") or {}),
+        "task_start_slugs": list(previous.get("task_start_slugs") or []),
+    }
+    tips = dict(caps.get("review_tips") or {})
+    for name in ordered:
+        if str(name).strip().lower() == "main":
+            origin = _git_rev_parse(repo_dir, "origin/main") or ""
+            if origin:
+                caps["origin_main"] = origin
+            continue
+        path = normalize_lane_path(name) or name
+        key = str(path).strip().lower()
+        if not key:
+            continue
+        _local_tip, origin_tip = lane_local_and_origin_tips(repo_dir, path)
+        _ = _local_tip
+        if origin_tip:
+            tips[key] = origin_tip
+    caps["review_tips"] = tips
+    save_remote_sync_caps(repo_dir, caps)
 
 
 def derive_remote_sync_caps_from_history(
@@ -4648,13 +4702,14 @@ def _build_scoped_reset_preview(
     ``conflict_lanes`` may also include shared-ahead (non-conflict) lanes to catch up.
     """
     lanes = {str(name).strip().lower() for name in (conflict_lanes or []) if name}
+    # No lanes to replace → local graph unchanged (never collapse to remote-only).
     if not lanes:
-        return dict(remote_model or _empty_history_model())
-    if "main" in lanes and len(lanes) == 1:
-        return dict(remote_model or _empty_history_model())
+        return dict(local_model or _empty_history_model())
 
     local_specs = list((local_model or {}).get("version_specs") or [])
     remote_specs = list((remote_model or {}).get("version_specs") or [])
+    # Always: keep non-listed local lanes; swap listed lanes to shared tips.
+    # (Former shortcut "main alone → entire remote" dropped local-only branches.)
     kept = [
         dict(spec)
         for spec in local_specs
@@ -4673,10 +4728,14 @@ def _build_scoped_reset_preview(
         vid = str((spec or {}).get("id") or "")
         if not vid:
             continue
-        sha_by_id[vid] = remote_sha.get(vid) or local_sha.get(vid) or ""
+        branch = str((spec or {}).get("branch") or "main").strip().lower()
+        if branch in lanes:
+            sha_by_id[vid] = remote_sha.get(vid) or local_sha.get(vid) or ""
+        else:
+            sha_by_id[vid] = local_sha.get(vid) or remote_sha.get(vid) or ""
     tags = dict((local_model or {}).get("tags_by_id") or {})
     tags.update(dict((remote_model or {}).get("tags_by_id") or {}))
-    # Prefer remote history rows for conflicting lanes, else local.
+    # Prefer remote history rows for replaced lanes, else local.
     history_rows = []
     seen = set()
     for row in list((remote_model or {}).get("commit_history") or []) + list(
@@ -4689,7 +4748,12 @@ def _build_scoped_reset_preview(
             continue
         seen.add(vid)
         history_rows.append(list(row))
-    head_id = (remote_model or {}).get("head_id") or (local_model or {}).get("head_id")
+    # Head: keep local head when it still exists; else shared.
+    local_head = (local_model or {}).get("head_id")
+    remote_head = (remote_model or {}).get("head_id")
+    head_id = local_head if local_head in sha_by_id else remote_head
+    if head_id not in sha_by_id:
+        head_id = remote_head or local_head
     return {
         "commit_history": history_rows,
         "version_specs": specs,
