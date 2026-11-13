@@ -7356,7 +7356,41 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         if action == CompareWithSharedDialog.ACTION_RESET:
             self._resetToSharedVersions(local_path, reset_lanes or conflict_lanes)
             return
-        # Cancel / Keep / Merge-coming: keep frozen tree + keep peek caps (no new remote tips in UI).
+        if action == CompareWithSharedDialog.ACTION_MERGE:
+            # Étape 4 (option 1): apply plan Reset + shared-ahead only.
+            # Compare-and-merge lanes stay tip-conflicted (MergeCompare = étape 5).
+            lane_plan = dict(getattr(dialog, "lane_plan", None) or {})
+            plan_reset = [
+                str(name).strip()
+                for name, choice in lane_plan.items()
+                if str(choice).strip().lower() == "reset" and str(name).strip()
+            ]
+            shared_ahead = list(getattr(dialog, "_shared_ahead_lanes", None) or [])
+            if not shared_ahead:
+                shared_ahead = list((compare or {}).get("shared_ahead_lanes") or [])
+            apply_lanes = []
+            seen_apply = set()
+            for name in plan_reset + [
+                str(item).strip() for item in shared_ahead if str(item).strip()
+            ]:
+                key = name.lower()
+                if key in seen_apply:
+                    continue
+                apply_lanes.append(name)
+                seen_apply.add(key)
+            remaining_merge = [
+                str(name).strip()
+                for name, choice in lane_plan.items()
+                if str(choice).strip().lower() == "merge" and str(name).strip()
+            ]
+            if apply_lanes:
+                self._resetToSharedVersions(
+                    local_path,
+                    apply_lanes,
+                    remaining_merge_lanes=remaining_merge,
+                )
+            return
+        # Cancel / Keep / Merge deferred: keep frozen tree + keep peek caps.
         if peek_caps is not None:
             save_remote_sync_caps(local_path, peek_caps)
         self._project_history_bundle = saved_bundle
@@ -7400,21 +7434,38 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateNotificationsBadge()
         self._appendFeed("Updated the version tree from the shared project.")
 
-    def _resetToSharedVersions(self, local_path: str, conflict_lanes=None) -> None:
+    def _resetToSharedVersions(
+        self, local_path: str, conflict_lanes=None, remaining_merge_lanes=None
+    ) -> None:
         """Adopt shared tips for reset lanes (conflicts + shared-ahead catch-up)."""
         lanes = [
             str(name).strip()
             for name in (conflict_lanes or ())
             if str(name).strip()
         ] or ["main"]
+        remaining = [
+            str(name).strip()
+            for name in (remaining_merge_lanes or ())
+            if str(name).strip()
+        ]
         lanes_label = ", ".join(lanes)
+        remaining_label = ", ".join(remaining)
         box = qt.QMessageBox(slicer.util.mainWindow())
-        box.setWindowTitle("Reset all to shared")
+        partial = bool(remaining)
+        box.setWindowTitle(
+            "Apply plan resets" if partial else "Reset all to shared"
+        )
         box.setIcon(qt.QMessageBox.Warning)
         includes_main = any(str(name).strip().lower() == "main" for name in lanes)
         warn_main = (
             "\n\nWarning: main is included — unshared versions on main leave the tree."
             if includes_main
+            else ""
+        )
+        remaining_line = (
+            "\n\nStill conflicted (Compare and merge later): %s"
+            % remaining_label
+            if partial
             else ""
         )
         box.setText(
@@ -7423,17 +7474,20 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             "(Includes tip-conflict resets and any shared-ahead catch-up.)\n"
             "Other local branches stay unchanged.\n\n"
             "Warning: saved versions on reset conflict branches leave those lines."
-            "%s"
-            % (lanes_label, warn_main)
+            "%s%s"
+            % (lanes_label, remaining_line, warn_main)
         )
         box.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
-        box.button(qt.QMessageBox.Ok).setText("Reset all to shared")
+        box.button(qt.QMessageBox.Ok).setText(
+            "Apply resets" if partial else "Reset all to shared"
+        )
         box.setDefaultButton(qt.QMessageBox.Cancel)
         if box.exec_() != qt.QMessageBox.Ok:
             return
         project = self._currentProjectName()
         self._openProgress(
-            "Reset all to shared", "Moving branches to shared tips…"
+            "Apply plan resets" if partial else "Reset all to shared",
+            "Moving branches to shared tips…",
         )
         try:
             self._updateProgress("Moving branches to shared tips…")
@@ -7465,6 +7519,11 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         else:
             self._appendFeed(
                 "Reset/updated branches to shared (%s)." % lanes_label
+            )
+        if remaining:
+            self._appendFeed(
+                "Still conflicted — Compare and merge later: %s."
+                % remaining_label
             )
 
     def _openNotificationDetail(self, item: dict) -> None:

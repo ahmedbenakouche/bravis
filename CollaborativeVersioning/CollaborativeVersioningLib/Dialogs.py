@@ -1115,6 +1115,23 @@ class CompareWithSharedDialog(qt.QDialog):
             if choice == ResolveConflictLanesDialog.CHOICE_MERGE
         ]
 
+    def _planStep4ApplyLanes(self) -> list:
+        """Lanes adopted on Validate for a mixed plan (Reset choices + shared-ahead).
+
+        Compare-and-merge lanes are intentionally omitted (option 1): they stay
+        tip-conflicted until the MergeCompare step.
+        """
+        ordered = []
+        seen = set()
+        for name in list(self._planResetNames()) + list(self._shared_ahead_lanes or ()):
+            key = str(name).strip().lower()
+            label = str(name).strip()
+            if not label or key in seen:
+                continue
+            ordered.append(label)
+            seen.add(key)
+        return ordered
+
     def _planPreviewSharedTipLanes(self) -> list:
         """Lanes whose Result tip is shared: plan Reset + plan Merge + shared-ahead."""
         ordered = []
@@ -1334,12 +1351,20 @@ class CompareWithSharedDialog(qt.QDialog):
         self._refreshChoiceStyles()
         model, title, description = self._modelForLanePlan()
         self._showResultPreview(self.ACTION_MERGE, model, title, description, False)
-        # Étape 3: Result shown; Validate for merge queue = étape 4+.
-        self._validate_btn.setEnabled(False)
-        self._validate_btn.setToolTip(
-            "Compare and merge after Validate comes next — "
-            "not applied yet for lanes marked Compare after Validate."
-        )
+        # Étape 4 (option 1): Validate applies plan Reset + shared-ahead only;
+        # Compare-and-merge lanes stay conflicted until étape 5.
+        apply_lanes = self._planStep4ApplyLanes()
+        self._validate_btn.setEnabled(bool(apply_lanes))
+        if apply_lanes:
+            self._validate_btn.setToolTip(
+                "Apply Reset / shared-ahead now. Compare and merge lanes stay "
+                "in conflict until the next step."
+            )
+        else:
+            self._validate_btn.setToolTip(
+                "No Reset / shared-ahead in this plan — Compare and merge "
+                "comes in the next step."
+            )
         parts = ["Preview: plan ready."]
         if reset_names:
             parts.append(
@@ -1347,8 +1372,8 @@ class CompareWithSharedDialog(qt.QDialog):
             )
         if merge_names:
             parts.append(
-                "Compare and merge: %s → shared tip + ○ preview "
-                "(Validate for merges comes next)."
+                "Compare and merge: %s → still conflicted after Validate "
+                "(merge step next); ○ is preview only."
                 % self._lanesLabel(merge_names)
             )
         if self._shared_ahead_lanes:
@@ -1356,6 +1381,10 @@ class CompareWithSharedDialog(qt.QDialog):
                 "Shared-ahead (%s) caught up on Validate."
                 % self._lanesLabel(self._shared_ahead_lanes)
             )
+        if apply_lanes:
+            parts.append("Click Validate to apply Reset / shared-ahead only.")
+        else:
+            parts.append("Validate disabled here — nothing to reset in this plan.")
         if self._tipConflictLaneCount() > 1:
             parts.append("Reopen the plan to change choices, or use Reset all.")
         else:
@@ -1397,14 +1426,18 @@ class CompareWithSharedDialog(qt.QDialog):
                 self._showResultPreview(
                     self.ACTION_MERGE, model, title, description, silent
                 )
-                has_merge = bool(self._planMergeNames())
-                self._validate_btn.setEnabled(not has_merge)
-                if has_merge:
+                apply_lanes = self._planStep4ApplyLanes()
+                self._validate_btn.setEnabled(bool(apply_lanes))
+                if apply_lanes:
                     self._validate_btn.setToolTip(
-                        "Compare and merge after Validate comes next."
+                        "Apply Reset / shared-ahead now. Compare and merge lanes "
+                        "stay in conflict until the next step."
                     )
                 else:
-                    self._validate_btn.setToolTip("Apply this choice to this computer.")
+                    self._validate_btn.setToolTip(
+                        "No Reset / shared-ahead in this plan — Compare and merge "
+                        "comes in the next step."
+                    )
                 return
             self._result_panel.hide()
             legend = getattr(self, "_result_legend", None)
@@ -1451,6 +1484,13 @@ class CompareWithSharedDialog(qt.QDialog):
             self.ACTION_RESET,
         ):
             self.action = self._pending
+            self.accept()
+            return
+        if self._pending == self.ACTION_MERGE:
+            # Étape 4: accept only when there is something to reset / catch up.
+            if not self._planStep4ApplyLanes():
+                return
+            self.action = self.ACTION_MERGE
             self.accept()
 
 
