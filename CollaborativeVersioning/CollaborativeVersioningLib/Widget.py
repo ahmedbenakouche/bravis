@@ -2236,8 +2236,36 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._updateProgress("Updating the Version tree…")
         self._suppress_dirty += 1
         self._suppress_asset_ui_updates += 1
+        version_id = None
         try:
-            self._applyProjectHistoryBundle(history)
+            # Tip-conflict: land on the merged unshared tip of the conflict lane
+            # (dotted node) — do not restore the pre-Compare version (that could
+            # move main back onto an abandoned local tip after Reset).
+            # Accept merge: follow HEAD tip as before.
+            if tip_conflict:
+                self._applyProjectHistoryBundle(history, follow_head=False)
+                version_id = self._tipVersionIdForLane(
+                    conflict_lane or source_lane
+                ) or history.get("head_id")
+            else:
+                version_id = self._applyProjectHistoryBundle(
+                    history, follow_head=True
+                )
+            if version_id:
+                self._currentVersionId = version_id
+                sha, lane = self._shaAndLaneForVersion(version_id)
+                if sha:
+                    self._updateProgress(
+                        "Loading %s…" % self._versionDisplayTag(version_id)
+                    )
+                    checkout_local_version(local_path, sha, lane)
+                    self._loadOpenedProjectAssets(
+                        local_path, volume_folder=local_path
+                    )
+                    self._rememberProjectSceneNodes(
+                        self._selectorCurrentNode("volumeSelector"),
+                        self._selectorCurrentNode("segmentationSelector"),
+                    )
             self._clearChangeFlags()
             self._unshared_version = unshared
             self._syncAssetDataObservers()
@@ -2247,6 +2275,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._refreshUiState()
         self._clearChangeFlags()
         self._unshared_version = unshared
+        if version_id:
+            self._currentVersionId = version_id
+            self._selectHistoryRowForVersion(version_id)
         self._updateVersionActionButtons()
         self._armLoadSettle()
         self._updateActiveVersionIndicators()

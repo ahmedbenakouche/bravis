@@ -1377,6 +1377,15 @@ def checkout_local_version(
     current = _current_branch_name(repo_dir)
     tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
     if head == target and current == branch:
+        # HEAD already names this tip, but the worktree may still hold another
+        # version's files (update-ref while on the branch moves HEAD only —
+        # tip-conflict Apply hit this and reloaded the old local cubes).
+        reset = _run_git(["reset", "--hard", target], cwd=repo_dir, timeout=180)
+        if reset.returncode != 0:
+            detail = (reset.stderr or reset.stdout or "").strip()
+            raise GitHubAuthError(
+                "Could not update the local project.\n%s" % detail[:400]
+            )
         return
     # Already viewing this older commit with tip preserved.
     if (
@@ -2141,82 +2150,75 @@ def merge_cube_manifest_resolving_tip_conflict(
 
     from CollaborativeVersioningLib import SegmentationCubes
 
-    restore_sha = _git_rev_parse(repo_dir, "HEAD") or ""
-    restore_lane = _checkout_lane_for_branch_name(_current_branch_name(repo_dir))
+    # No restore of the pre-Compare version (success or failure): that checkout
+    # could move another lane's tip (e.g. main back onto an abandoned local tip
+    # after Reset). Success lands on the merged tip; failure leaves detached work.
     digests = _cv_seg_digests(merged_manifest)
-    restored_early = False
-    try:
-        # Base = shared tip; pull any missing cube blocks from the local tip.
-        checkout_local_version(repo_dir, origin_tip, display, attach_branch=False)
-        _fill_missing_cv_seg_blocks_from_commit(repo_dir, local_tip, digests)
-        SegmentationCubes.save_manifest(repo_dir, merged_manifest)
+    # Base = shared tip; pull any missing cube blocks from the local tip.
+    checkout_local_version(repo_dir, origin_tip, display, attach_branch=False)
+    _fill_missing_cv_seg_blocks_from_commit(repo_dir, local_tip, digests)
+    SegmentationCubes.save_manifest(repo_dir, merged_manifest)
 
-        add = _run_git(
-            ["add", "-A", "--", SegmentationCubes.STORE_DIRNAME],
-            cwd=repo_dir,
-            timeout=120,
+    add = _run_git(
+        ["add", "-A", "--", SegmentationCubes.STORE_DIRNAME],
+        cwd=repo_dir,
+        timeout=120,
+    )
+    if add.returncode != 0:
+        detail = (add.stderr or add.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not apply the cube merge.\n%s" % detail[:400]
         )
-        if add.returncode != 0:
-            detail = (add.stderr or add.stdout or "").strip()
-            raise GitHubAuthError(
-                "Could not apply the cube merge.\n%s" % detail[:400]
-            )
-        tree = _run_git(["write-tree"], cwd=repo_dir, timeout=60)
-        tree_sha = (tree.stdout or "").strip()
-        if tree.returncode != 0 or not tree_sha:
-            detail = (tree.stderr or tree.stdout or "").strip()
-            raise GitHubAuthError(
-                "Could not apply the cube merge.\n%s" % detail[:400]
-            )
-        # Single parent (shared tip) — ordinary local version, not Accept topology.
-        commit = _run_git(
-            [
-                "commit-tree",
-                tree_sha,
-                "-p",
-                origin_tip,
-                "-m",
-                "Resolve tip conflict on %s" % display,
-            ],
-            cwd=repo_dir,
-            timeout=30,
+    tree = _run_git(["write-tree"], cwd=repo_dir, timeout=60)
+    tree_sha = (tree.stdout or "").strip()
+    if tree.returncode != 0 or not tree_sha:
+        detail = (tree.stderr or tree.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not apply the cube merge.\n%s" % detail[:400]
         )
-        new_sha = (commit.stdout or "").strip()
-        if commit.returncode != 0 or not new_sha:
-            detail = (commit.stderr or commit.stdout or "").strip()
-            raise GitHubAuthError(
-                "Could not apply the cube merge.\n%s" % detail[:400]
-            )
-        reset = _run_git(
-            ["reset", "--hard", origin_tip], cwd=repo_dir, timeout=120
+    # Single parent (shared tip) — ordinary local version, not Accept topology.
+    commit = _run_git(
+        [
+            "commit-tree",
+            tree_sha,
+            "-p",
+            origin_tip,
+            "-m",
+            "Resolve tip conflict on %s" % display,
+        ],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    new_sha = (commit.stdout or "").strip()
+    if commit.returncode != 0 or not new_sha:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not apply the cube merge.\n%s" % detail[:400]
         )
-        if reset.returncode != 0:
-            detail = (reset.stderr or reset.stdout or "").strip()
-            raise GitHubAuthError(
-                "Could not apply the cube merge.\n%s" % detail[:400]
-            )
-        if restore_sha:
-            _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
-            restored_early = True
+    # Drop dirty worktree from the write; stay detached until we attach new tip.
+    reset = _run_git(
+        ["reset", "--hard", origin_tip], cwd=repo_dir, timeout=120
+    )
+    if reset.returncode != 0:
+        detail = (reset.stderr or reset.stdout or "").strip()
+        raise GitHubAuthError(
+            "Could not apply the cube merge.\n%s" % detail[:400]
+        )
 
-        # Local tip only — do not push; no remote activity (Share when ready).
+    # Local tip only — do not push; no remote activity (Share when ready).
+    _run_git(
+        ["update-ref", "refs/heads/%s" % branch, new_sha],
+        cwd=repo_dir,
+        timeout=20,
+    )
+    if branch == "main":
         _run_git(
-            ["update-ref", "refs/heads/%s" % branch, new_sha],
+            ["branch", "--set-upstream-to=origin/main", "main"],
             cwd=repo_dir,
             timeout=20,
         )
-        if branch == "main":
-            _run_git(
-                ["branch", "--set-upstream-to=origin/main", "main"],
-                cwd=repo_dir,
-                timeout=20,
-            )
-    finally:
-        if restore_sha and not restored_early:
-            try:
-                _restore_checkout_after_merge(repo_dir, restore_sha, restore_lane)
-            except Exception:
-                pass
+    # Land on the merged unshared tip only.
+    checkout_local_version(repo_dir, new_sha, display)
     return display
 
 
