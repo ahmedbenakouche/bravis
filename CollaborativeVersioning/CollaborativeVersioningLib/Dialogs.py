@@ -409,7 +409,6 @@ class CompareWithSharedDialog(qt.QDialog):
 
     ACTION_NONE = ""
     ACTION_UPDATE = "update"
-    ACTION_KEEP = "keep"
     ACTION_RESET = "reset"
     ACTION_MERGE = "merge"
 
@@ -623,12 +622,6 @@ class CompareWithSharedDialog(qt.QDialog):
         self._update_choice_btn.connect(
             "clicked()", lambda: self._selectChoice(self.ACTION_UPDATE)
         )
-        self._keep_btn = qt.QPushButton("Keep mine")
-        self._keep_btn.setStyleSheet(BTN_SECONDARY)
-        self._keep_btn.setToolTip(
-            "Preview: keep this computer's main tip. Shared tip is not applied."
-        )
-        self._keep_btn.connect("clicked()", lambda: self._selectChoice(self.ACTION_KEEP))
         self._reset_btn = qt.QPushButton("Reset all to shared")
         self._reset_btn.setStyleSheet(BTN_SECONDARY)
         self._reset_btn.setToolTip(
@@ -645,7 +638,6 @@ class CompareWithSharedDialog(qt.QDialog):
         )
         self._merge_btn.connect("clicked()", self._onMergePlanClicked)
         choice_row.addWidget(self._update_choice_btn)
-        choice_row.addWidget(self._keep_btn)
         choice_row.addWidget(self._reset_btn)
         choice_row.addWidget(self._merge_btn)
         choice_row.addStretch(1)
@@ -773,9 +765,6 @@ class CompareWithSharedDialog(qt.QDialog):
         self._update_choice_btn.setStyleSheet(
             self._choiceButtonStyle(self._pending == self.ACTION_UPDATE)
         )
-        self._keep_btn.setStyleSheet(
-            self._choiceButtonStyle(self._pending == self.ACTION_KEEP)
-        )
         self._reset_btn.setStyleSheet(
             self._choiceButtonStyle(self._pending == self.ACTION_RESET)
         )
@@ -785,7 +774,6 @@ class CompareWithSharedDialog(qt.QDialog):
 
     def _hideAllChoiceButtons(self) -> None:
         self._update_choice_btn.hide()
-        self._keep_btn.hide()
         self._reset_btn.hide()
         self._merge_btn.hide()
         help_lbl = getattr(self, "_conflict_options_help", None)
@@ -891,7 +879,6 @@ class CompareWithSharedDialog(qt.QDialog):
                 % (self._conflictLanesLabel(), ahead_line)
             )
             self._update_choice_btn.hide()
-            self._keep_btn.hide()
             self._reset_btn.show()
             self._merge_btn.show()
             self._conflict_options_help.show()
@@ -964,16 +951,16 @@ class CompareWithSharedDialog(qt.QDialog):
             self._selectChoice(self.ACTION_UPDATE, silent=True)
             return
 
-        # Local unshared only (e.g. DIY) — shared not ahead / no tip fork.
+        # Local unshared only — shared not ahead / no tip fork: nothing to integrate.
         if self._has_local:
             self._setConflictsMessage(
                 "No tip conflict — you have local versions not shared yet, "
                 "and the shared project is not ahead.\n"
-                "Preview: Keep mine. Click Validate to update "
-                "(or Close to leave the Version tree unchanged)."
+                "Nothing to integrate from shared. Close to leave the Version tree "
+                "unchanged (Share when you are ready)."
             )
-            self._keep_btn.show()
-            self._selectChoice(self.ACTION_KEEP, silent=True)
+            self._result_panel.hide()
+            self._validate_btn.setEnabled(False)
             return
 
         if self._aligned:
@@ -1036,9 +1023,6 @@ class CompareWithSharedDialog(qt.QDialog):
                     roles[vid] = "shared"
             for vid in self._idsForShas(model, only_local):
                 roles[vid] = "local"
-        elif choice == self.ACTION_KEEP:
-            for vid in self._idsForShas(model, only_local):
-                roles[vid] = "local"
         return set(roles.keys()), roles
 
     def _modelForChoice(self, choice: str) -> tuple:
@@ -1049,12 +1033,6 @@ class CompareWithSharedDialog(qt.QDialog):
         update_model = self._compare.get("result") or remote_model
         reset_model = self._compare.get("reset") or remote_model
 
-        if choice == self.ACTION_KEEP:
-            return (
-                local_model,
-                "Result — Keep mine",
-                "Local tip stays; shared tip is not applied",
-            )
         if choice == self.ACTION_RESET:
             reset_names = (
                 self._reset_lanes or self._conflict_lanes or self._obsolete_merged_lanes
@@ -1095,11 +1073,8 @@ class CompareWithSharedDialog(qt.QDialog):
             )
         if choice == self.ACTION_MERGE:
             return self._modelForLanePlan()
-        return (
-            {},
-            "Result — Compare and merge",
-            "Coming soon",
-        )
+        # Unknown choice — should not happen (buttons only set known actions).
+        return (local_model, "Result", "")
 
     def _planResetNames(self) -> list:
         return [
@@ -1469,7 +1444,6 @@ class CompareWithSharedDialog(qt.QDialog):
         self._validate_btn.setToolTip("Apply this choice to this computer.")
         if not silent:
             labels = {
-                self.ACTION_KEEP: "Keep mine",
                 self.ACTION_RESET: (
                     "Reset all to shared" if self._conflict else "Reset to shared"
                 ),
@@ -1483,7 +1457,6 @@ class CompareWithSharedDialog(qt.QDialog):
     def _onValidate(self) -> None:
         if self._pending in (
             self.ACTION_UPDATE,
-            self.ACTION_KEEP,
             self.ACTION_RESET,
         ):
             self.action = self._pending

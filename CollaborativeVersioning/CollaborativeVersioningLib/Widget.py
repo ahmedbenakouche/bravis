@@ -7799,8 +7799,8 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             return
         self._closeProgress()
         # Quit/Cancel remaining left a pending-merge flag for the bell. If this
-        # Compare sees no tip conflict anymore, drop it (Keep mine / aligned /
-        # local-ahead only must not keep "behind").
+        # Compare sees no tip conflict anymore, drop it (aligned / local-ahead
+        # only must not keep "behind").
         if not bool((compare or {}).get("conflict")):
             self._clearPendingPlanMergeLanes()
         # Re-assert frozen UI (fetch must never rewrite the Version tree panel).
@@ -7876,7 +7876,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 )
                 self._startNextPlanMergeCompare()
             return
-        # Cancel / Keep / Merge deferred: keep frozen tree + keep peek caps.
+        # Cancel / Close / no Validate action: keep frozen tree + peek caps.
         if peek_caps is not None:
             save_remote_sync_caps(local_path, peek_caps)
         self._project_history_bundle = saved_bundle
@@ -7884,12 +7884,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         self._unshared_version = saved_unshared
         self._updateCommitHistoryPanel()
         self._updateVersionActionButtons()
-        if action == CompareWithSharedDialog.ACTION_KEEP:
-            # No tip conflict to merge — pending bell flag must not stick.
-            self._clearPendingPlanMergeLanes()
-            self._appendFeed(
-                "Kept your local versions. Version tree unchanged until you update."
-            )
         self._updateNotificationsBadge()
 
     def _applySharedVersionsUpdate(self, local_path: str, fetched: bool = False) -> None:
