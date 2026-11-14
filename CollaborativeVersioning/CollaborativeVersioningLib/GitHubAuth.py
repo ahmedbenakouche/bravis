@@ -1253,8 +1253,8 @@ def ensure_can_share_with_shared(
     conflicts require Compare → Update/resolve first.
 
     ``obsolete_merged`` is not a Share gate: Save on an already-integrated tip
-    already forces Create a branch, and the detector false-positives nested
-    lanes whose parent tip was merged.
+    already forces Create a branch. Obsolete (flat→main or nested→parent) is
+    resolved in Compare, not blocked here.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
@@ -4444,35 +4444,82 @@ def read_compare_project_histories(
     conflict = bool(conflict_lanes)
     conflict_includes_main = "main" in conflict_lanes
 
-    # Branch already merged on shared, but this computer kept committing on it.
-    # Detect even when tip conflict exists — Compare UI treats the combination as
-    # "not handled" until integration is redesigned (conflict alone / obsolete alone OK).
+    # Branch already merged on shared, but this computer still has a different tip.
+    # Flat lanes (under main): shared tip integrated into origin/main.
+    # Nested lanes (c/a under c): shared tip integrated into parent lane.
+    # Covers local-ahead and local-vs-shared divergence; local-behind stays
+    # shared-ahead. Obsolete lanes are removed from conflict_lanes below.
     obsolete_merged_lanes: list[str] = []
-    if commit_by_sha and origin:
-        main_reach = _all_reachable_shas(commit_by_sha, origin)
+    if commit_by_sha:
+        main_reach = (
+            _all_reachable_shas(commit_by_sha, origin) if origin else set()
+        )
         # First-parent main line only (not merge second-parents).
-        main_first_parent = set(_first_parent_chain(commit_by_sha, origin))
+        main_first_parent = (
+            set(_first_parent_chain(commit_by_sha, origin)) if origin else set()
+        )
         for slug in sorted(
             set(local_review_tips.keys()) | set(remote_review_tips.keys()),
             key=lambda name: str(name).lower(),
         ):
             local_tip = _first_tip(local_review_tips.get(slug))
             remote_tip = _first_tip(remote_review_tips.get(slug))
-            if not local_tip or local_tip in main_reach:
+            if not local_tip or not remote_tip:
                 continue
-            # Empty task lanes keep origin tip on main (e.g. tache1/start). Local
-            # Save ahead of that tip is normal — not an obsolete-merged branch.
-            if remote_tip and remote_tip in main_first_parent:
+            parent = parent_lane_slug(slug)
+            if parent:
+                # Nested: obsolete vs parent tip (remote parent preferred = shared).
+                parent_tip = _first_tip(remote_review_tips.get(parent)) or _first_tip(
+                    local_review_tips.get(parent)
+                )
+                if not parent_tip:
+                    continue
+                parent_reach = _all_reachable_shas(commit_by_sha, parent_tip)
+                parent_fp = set(_first_parent_chain(commit_by_sha, parent_tip))
+                if local_tip in parent_reach:
+                    continue
+                # Empty nested lane tip sits on parent first-parent — not obsolete.
+                if remote_tip in parent_fp:
+                    continue
+                if remote_tip not in parent_reach:
+                    continue
+            else:
+                # Flat under main: obsolete when shared tip is on main.
+                if not origin or local_tip in main_reach:
+                    continue
+                # Empty task lanes keep origin tip on main (e.g. tache1/start).
+                if remote_tip in main_first_parent:
+                    continue
+                if not _branch_merged_into_main(commit_by_sha, origin, remote_tip):
+                    continue
+            if local_tip == remote_tip:
                 continue
-            if not _branch_merged_into_main(commit_by_sha, origin, remote_tip or local_tip):
+            # Local only behind shared on this lane → shared-ahead / Update, not obsolete.
+            if _sha_is_ancestor_in_map(commit_by_sha, local_tip, remote_tip):
                 continue
-            # Local continued from the shared tip (not a tip-divergence conflict).
-            if remote_tip and remote_tip not in set(
-                _first_parent_chain(commit_by_sha, local_tip)
-            ):
-                continue
+            # Local ahead of shared tip, OR diverged from it: once shared tip is
+            # already in the parent (main or nested parent), treat as obsolete and
+            # Reset to the shared lane tip (do not keep a separate tip-conflict).
             obsolete_merged_lanes.append(str(slug))
     obsolete_merged = bool(obsolete_merged_lanes)
+
+    # Obsolete wins over tip-conflict on the same lane (e.g. local c/a/2 vs shared
+    # c/a/2 after that shared tip was merged into c).
+    if obsolete_merged_lanes and conflict_lanes:
+        obsolete_keys = {
+            str(name).strip().lower()
+            for name in obsolete_merged_lanes
+            if str(name).strip()
+        }
+        conflict_lanes = [
+            name
+            for name in conflict_lanes
+            if str(name).strip().lower() not in obsolete_keys
+        ]
+        conflict = bool(conflict_lanes)
+        conflict_includes_main = any(
+            str(name).strip().lower() == "main" for name in conflict_lanes
+        )
 
     # Shared ahead, no tip fork: local tip is a strict ancestor of remote tip (or
     # remote tip exists with no local tip). Safe to fast-forward like Update.
@@ -4504,6 +4551,11 @@ def read_compare_project_histories(
             if not remote_tip:
                 continue
             if not local_tip:
+                # No local branch ref, but the shared tip is already in this
+                # computer's tree (merged into main, branch pointer dropped).
+                # Not a catch-up — nothing new to draw.
+                if remote_tip in local_shas or remote_tip in main_reach_local:
+                    continue
                 shared_ahead_lanes.append(str(slug))
                 continue
             if local_tip == remote_tip:
@@ -4521,13 +4573,27 @@ def read_compare_project_histories(
 
     reset_lanes = list(conflict_lanes)
     if obsolete_merged and not conflict:
-        reset_lanes = ["main"] + [
-            name for name in obsolete_merged_lanes if name.lower() != "main"
+        # Reset obsolete tips to shared. Include main only when a *flat* lane was
+        # merged into main (same as before). Nested obsolete (into parent) must
+        # not force a main reset — only the obsolete child lane(s).
+        reset_lanes = [
+            name
+            for name in obsolete_merged_lanes
+            if str(name).strip().lower() != "main"
         ]
+        has_flat_obsolete = any(
+            not parent_lane_slug(name) for name in obsolete_merged_lanes
+        )
+        if has_flat_obsolete:
+            reset_lanes = ["main"] + [
+                name
+                for name in reset_lanes
+                if str(name).strip().lower() != "main"
+            ]
     elif conflict:
-        # Reset all / later per-lane plan: also catch up shared-ahead (non-conflict) lanes.
+        # Reset all / per-lane plan: also catch up shared-ahead + obsolete lanes.
         seen_reset = {str(name).strip().lower() for name in reset_lanes}
-        for name in shared_ahead_lanes:
+        for name in list(shared_ahead_lanes) + list(obsolete_merged_lanes):
             key = str(name).strip().lower()
             if key and key not in seen_reset:
                 reset_lanes.append(str(name).strip())

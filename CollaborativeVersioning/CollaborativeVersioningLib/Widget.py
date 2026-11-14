@@ -7829,7 +7829,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 self._clearPendingPlanMergeLanes()
             return
         if action == CompareWithSharedDialog.ACTION_MERGE:
-            # Étape 4+5: Reset/shared-ahead, then MergeCompare queue for merge lanes.
+            # Étape 4+5: Reset/shared-ahead/obsolete, then MergeCompare queue.
             lane_plan = dict(getattr(dialog, "lane_plan", None) or {})
             plan_reset = [
                 str(name).strip()
@@ -7839,11 +7839,16 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             shared_ahead = list(getattr(dialog, "_shared_ahead_lanes", None) or [])
             if not shared_ahead:
                 shared_ahead = list((compare or {}).get("shared_ahead_lanes") or [])
+            obsolete = list(getattr(dialog, "_obsolete_merged_lanes", None) or [])
+            if not obsolete:
+                obsolete = list((compare or {}).get("obsolete_merged_lanes") or [])
             apply_lanes = []
             seen_apply = set()
-            for name in plan_reset + [
-                str(item).strip() for item in shared_ahead if str(item).strip()
-            ]:
+            for name in (
+                plan_reset
+                + [str(item).strip() for item in shared_ahead if str(item).strip()]
+                + [str(item).strip() for item in obsolete if str(item).strip()]
+            ):
                 key = name.lower()
                 if key in seen_apply:
                     continue

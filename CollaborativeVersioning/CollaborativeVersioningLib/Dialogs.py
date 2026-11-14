@@ -1,6 +1,7 @@
 """UI dialogs (split from CollaborativeVersioning.py). Behavior unchanged."""
 from __future__ import annotations
 
+import logging
 import time
 
 import qt
@@ -10,6 +11,7 @@ from CollaborativeVersioningLib.GitHubAuth import (
     GitHubAuthError,
     build_scoped_reset_preview,
     normalize_task_title,
+    parent_lane_slug,
     set_wait_callback,
     suggest_github_usernames,
     PEOPLE_ACCESS_SENIOR,
@@ -274,6 +276,7 @@ class ResolveConflictLanesDialog(qt.QDialog):
         parent,
         conflict_lanes,
         shared_ahead_lanes=None,
+        obsolete_merged_lanes=None,
         initial_plan=None,
     ) -> None:
         qt.QDialog.__init__(self, parent)
@@ -288,6 +291,11 @@ class ResolveConflictLanesDialog(qt.QDialog):
         ahead = [
             str(name).strip()
             for name in (shared_ahead_lanes or ())
+            if str(name).strip()
+        ]
+        obsolete = [
+            str(name).strip()
+            for name in (obsolete_merged_lanes or ())
             if str(name).strip()
         ]
         initial = dict(initial_plan or {})
@@ -357,6 +365,18 @@ class ResolveConflictLanesDialog(qt.QDialog):
             ahead_hint.setWordWrap(True)
             ahead_hint.setStyleSheet(DIALOG_HINT_STYLE)
             layout.addWidget(ahead_hint)
+
+        if obsolete:
+            obsolete_hint = qt.QLabel(
+                "Obsolete merged branches (%s) are not listed here — "
+                "they are reset to shared automatically on Validate "
+                "(already integrated into main or their parent branch "
+                "on the shared project)."
+                % _lanes_label_simple(obsolete)
+            )
+            obsolete_hint.setWordWrap(True)
+            obsolete_hint.setStyleSheet(DIALOG_HINT_STYLE)
+            layout.addWidget(obsolete_hint)
 
         if not lanes:
             empty = qt.QLabel("No conflicting branches to plan.")
@@ -817,10 +837,24 @@ class CompareWithSharedDialog(qt.QDialog):
         """Tip-conflict only: Reset all + merge label from conflict lane count."""
         merge_label = self._tipConflictMergeButtonLabel()
         self._reset_btn.setText("Reset all to shared")
-        self._reset_btn.setToolTip(
+        reset_tip = (
             "Reset every conflicting branch to its shared tip. "
             "Other local branches stay. Conflicting local versions leave those lines."
         )
+        if self._shared_ahead_lanes or self._obsolete_merged_lanes:
+            bits = []
+            if self._shared_ahead_lanes:
+                bits.append(
+                    "shared-ahead (%s) caught up"
+                    % self._lanesLabel(self._shared_ahead_lanes)
+                )
+            if self._obsolete_merged_lanes:
+                bits.append(
+                    "obsolete (%s) reset to shared"
+                    % self._lanesLabel(self._obsolete_merged_lanes)
+                )
+            reset_tip += " Also: %s." % "; ".join(bits)
+        self._reset_btn.setToolTip(reset_tip)
         self._merge_btn.setText(merge_label)
         if self._tipConflictLaneCount() <= 1:
             self._merge_btn.setToolTip(
@@ -850,33 +884,32 @@ class CompareWithSharedDialog(qt.QDialog):
             help_lbl.setText(help_text)
 
     def _setupInitialState(self) -> None:
-        # Handled flows: tip conflict alone, obsolete merged alone, shared ahead
-        # (Update). Tip conflict + obsolete together → not handled (integration TBD).
+        # Tip conflict (+ optional obsolete / shared-ahead auto-reset), obsolete
+        # alone, or shared ahead (Update).
         self._hideAllChoiceButtons()
-        if self._conflict and self._obsolete_merged:
-            self._setConflictsMessage(
-                "This case is not handled yet.\n"
-                "Tip conflict and an obsolete merged branch at the same time.\n"
-                "Ask the developer to integrate it."
-            )
-            self._result_panel.hide()
-            self._validate_btn.setEnabled(False)
-            return
         if self._conflict:
             self._applyTipConflictActionLabels()
-            ahead_line = ""
+            extra_lines = []
             if self._shared_ahead_lanes:
-                ahead_line = (
-                    "\nShared-ahead branches (%s) are caught up automatically "
+                extra_lines.append(
+                    "Shared-ahead branches (%s) are caught up automatically "
                     "on Validate with Reset all / plan (not listed in the plan grid)."
                     % self._lanesLabel(self._shared_ahead_lanes)
                 )
+            if self._obsolete_merged_lanes:
+                extra_lines.append(
+                    "Obsolete merged branches (%s) are reset to shared automatically "
+                    "on Validate (already integrated into main or their parent branch "
+                    "on the shared project; not listed in the plan grid)."
+                    % self._lanesLabel(self._obsolete_merged_lanes)
+                )
+            extra = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
             self._setConflictsMessage(
                 "Local and shared have diverged on: %s.\n"
                 "Reset all to shared resets every conflicting branch; "
                 "other local versions stay.%s\n"
                 "Choose how to integrate, then Validate."
-                % (self._conflictLanesLabel(), ahead_line)
+                % (self._conflictLanesLabel(), extra)
             )
             self._update_choice_btn.hide()
             self._reset_btn.show()
@@ -889,29 +922,63 @@ class CompareWithSharedDialog(qt.QDialog):
         if self._obsolete_merged:
             # Obsolete path: single Reset action (not the tip-conflict "Reset all" plan).
             self._reset_btn.setText("Reset to shared")
+            reset_names = list(
+                self._reset_lanes or list(self._obsolete_merged_lanes)
+            )
+            includes_main = any(
+                str(name).strip().lower() == "main" for name in reset_names
+            )
             self._reset_btn.setToolTip(
-                "Move obsolete merged branch tips (and main when listed) to shared."
+                "Move obsolete merged branch tips%s to shared."
+                % (" (and main)" if includes_main else "")
             )
             branches = self._lanesLabel(self._obsolete_merged_lanes)
             many = len(self._obsolete_merged_lanes) > 1
-            reset_also = self._lanesLabel(
-                self._reset_lanes or (["main"] + list(self._obsolete_merged_lanes))
+            reset_also = self._lanesLabel(reset_names)
+            nested = [
+                name
+                for name in (self._obsolete_merged_lanes or ())
+                if parent_lane_slug(name)
+            ]
+            flat = [
+                name
+                for name in (self._obsolete_merged_lanes or ())
+                if not parent_lane_slug(name)
+            ]
+            if nested and not flat:
+                parents = self._lanesLabel(
+                    sorted(
+                        {
+                            parent_lane_slug(name)
+                            for name in nested
+                            if parent_lane_slug(name)
+                        },
+                        key=str.lower,
+                    )
+                )
+                where = "their parent branch (%s)" % parents
+            elif flat and not nested:
+                where = "main"
+            else:
+                where = "main and/or their parent branch"
+            main_note = (
+                " (main included — unshared main versions leave the tree)"
+                if includes_main
+                else ""
             )
             self._setConflictsMessage(
                 (
-                    "Branches %s were already merged onto main on the shared project.\n"
+                    "Branches %s were already merged onto %s on the shared project.\n"
                     "Your local versions on those branches are obsolete.\n"
-                    "Reset moves these tips to shared: %s "
-                    "(main included — unshared main versions leave the tree).\n"
+                    "Reset moves these tips to shared: %s%s.\n"
                     "Click Validate to update."
                     if many
-                    else "Branch %s was already merged onto main on the shared project.\n"
+                    else "Branch %s was already merged onto %s on the shared project.\n"
                     "Your local versions on that branch are obsolete.\n"
-                    "Reset moves these tips to shared: %s "
-                    "(main included — unshared main versions leave the tree).\n"
+                    "Reset moves these tips to shared: %s%s.\n"
                     "Click Validate to update."
                 )
-                % (branches, reset_also)
+                % (branches, where, reset_also, main_note)
             )
             self._reset_btn.show()
             self._selectChoice(self.ACTION_RESET, silent=True)
@@ -971,17 +1038,79 @@ class CompareWithSharedDialog(qt.QDialog):
             self._validate_btn.setEnabled(False)
             return
 
-        self._setConflictsMessage(
-            "This case is not handled yet.\n"
-            "Ask the developer to integrate it."
-        )
+        # Safety net only: no known integrate path matched. Do not apply anything.
+        self._showUnhandledCompareFallback()
+
+    def _showUnhandledCompareFallback(self) -> None:
+        """Last-resort UI when compare flags match no known product path.
+
+        Does not change conflict / obsolete / update / local-only / aligned flows.
+        Blocks Validate and clears any pending action so Close leaves the tree as-is.
+        """
+        self._hideAllChoiceButtons()
+        self._pending = self.ACTION_NONE
+        self.action = self.ACTION_NONE
+        self.lane_plan = {}
         self._result_panel.hide()
+        legend = getattr(self, "_result_legend", None)
+        if legend is not None:
+            legend.hide()
         self._validate_btn.setEnabled(False)
+        self._validate_btn.setToolTip(
+            "No safe action for this compare case — Close without changing the Version tree."
+        )
+        self._setConflictsMessage(
+            "This compare case is not handled yet.\n"
+            "Nothing will be applied — Close to leave the Version tree unchanged.\n"
+            "Please note what you see (branches / recent Saves) and tell the developer."
+        )
+        try:
+            logging.warning(
+                "Compare with shared: unhandled case "
+                "(conflict=%s conflict_lanes=%s obsolete=%s obsolete_lanes=%s "
+                "shared_ahead=%s has_remote=%s has_local=%s new_remote_lanes=%s "
+                "aligned=%s reset_lanes=%s)",
+                self._conflict,
+                list(self._conflict_lanes or ()),
+                self._obsolete_merged,
+                list(self._obsolete_merged_lanes or ()),
+                list(self._shared_ahead_lanes or ()),
+                self._has_remote,
+                self._has_local,
+                list(self._new_remote_lanes or ()),
+                self._aligned,
+                list(self._reset_lanes or ()),
+            )
+        except Exception:
+            pass
 
     def _idsForShas(self, model: dict, shas) -> set:
         sha_by_id = (model or {}).get("sha_by_id") or {}
         wanted = set(shas or ())
         return {vid for vid, sha in sha_by_id.items() if sha in wanted}
+
+    def _localKnownShas(self) -> set:
+        local_model = self._compare.get("local") or {}
+        return {
+            str(sha).strip()
+            for sha in (local_model.get("sha_by_id") or {}).values()
+            if str(sha).strip()
+        }
+
+    def _obsoleteTipIdsAlreadyLocal(self, model: dict) -> set:
+        """Obsolete tips whose commit is already in the local tree.
+
+        A shared tip that reuses the lane name but is a new commit (local c/a/2
+        vs shared c/a/2) stays eligible for a green novelty mark.
+        """
+        known = self._localKnownShas()
+        sha_by_id = (model or {}).get("sha_by_id") or {}
+        out = set()
+        for vid in self._tipIdsForLanes(model, self._obsolete_merged_lanes or ()):
+            sha = str(sha_by_id.get(vid) or "").strip()
+            if sha and sha in known:
+                out.add(vid)
+        return out
 
     def _resultMarksForChoice(self, choice: str, model: dict) -> tuple:
         """Green marks for Result: (result_ids, result_roles)."""
@@ -999,6 +1128,8 @@ class CompareWithSharedDialog(qt.QDialog):
         if choice == self.ACTION_RESET:
             # Green: tips taken from shared + local-only versions that stay
             # (non-reset / local-ahead lanes still present in the scoped reset model).
+            # Drop green only when the obsolete tip commit is already local.
+            known_obsolete = self._obsoleteTipIdsAlreadyLocal(model)
             mark_shas = set(only_remote)
             if not mark_shas:
                 remote_model = self._compare.get("remote") or {}
@@ -1008,9 +1139,11 @@ class CompareWithSharedDialog(qt.QDialog):
                     if sha:
                         mark_shas.add(sha)
             for vid in self._idsForShas(model, mark_shas):
-                roles[vid] = "shared"
+                if vid not in known_obsolete:
+                    roles[vid] = "shared"
             for vid in self._idsForShas(model, only_local):
-                roles[vid] = "local"
+                if vid not in known_obsolete:
+                    roles[vid] = "local"
         elif choice == self.ACTION_UPDATE:
             # Shared tips acknowledged + local unshared kept.
             # Include new empty remote lanes (same SHA as main — not in only_remote_shas).
@@ -1046,6 +1179,11 @@ class CompareWithSharedDialog(qt.QDialog):
                 detail += (
                     "; shared-ahead (%s) caught up"
                     % self._lanesLabel(self._shared_ahead_lanes)
+                )
+            if self._conflict and self._obsolete_merged_lanes:
+                detail += (
+                    "; obsolete (%s) reset to shared"
+                    % self._lanesLabel(self._obsolete_merged_lanes)
                 )
             if includes_main:
                 detail += " — unshared main versions leave the tree"
@@ -1091,14 +1229,18 @@ class CompareWithSharedDialog(qt.QDialog):
         ]
 
     def _planStep4ApplyLanes(self) -> list:
-        """Lanes adopted on Validate for a mixed plan (Reset choices + shared-ahead).
+        """Lanes adopted on Validate for a mixed plan.
 
-        Compare-and-merge lanes are intentionally omitted (option 1): they stay
-        tip-conflicted until the MergeCompare step.
+        Reset choices + shared-ahead + obsolete (auto Reset). Compare-and-merge
+        lanes are omitted (option 1): they stay tip-conflicted until MergeCompare.
         """
         ordered = []
         seen = set()
-        for name in list(self._planResetNames()) + list(self._shared_ahead_lanes or ()):
+        for name in (
+            list(self._planResetNames())
+            + list(self._shared_ahead_lanes or ())
+            + list(self._obsolete_merged_lanes or ())
+        ):
             key = str(name).strip().lower()
             label = str(name).strip()
             if not label or key in seen:
@@ -1108,7 +1250,33 @@ class CompareWithSharedDialog(qt.QDialog):
         return ordered
 
     def _planPreviewSharedTipLanes(self) -> list:
-        """Lanes whose Result tip is shared: plan Reset + plan Merge + shared-ahead."""
+        """Lanes whose Result tip is shared: Reset/Merge plan + shared-ahead + obsolete.
+
+        Obsolete stays here so the Result *tree* shows the shared tip after auto-Reset.
+        Green marks use ``_planGreenSharedTipLanes`` (obsolete tips are not a novelty).
+        """
+        ordered = []
+        seen = set()
+        for name in (
+            list(self._planResetNames())
+            + list(self._planMergeNames())
+            + list(self._shared_ahead_lanes or ())
+            + list(self._obsolete_merged_lanes or ())
+        ):
+            key = str(name).strip().lower()
+            label = str(name).strip()
+            if not label or key in seen:
+                continue
+            ordered.append(label)
+            seen.add(key)
+        return ordered
+
+    def _planGreenSharedTipLanes(self) -> list:
+        """Green « From shared » tips: Reset/Merge plan + shared-ahead only.
+
+        Novel obsolete tips (new shared commit) are marked later via only_remote.
+        Already-known obsolete commits stay unmarked.
+        """
         ordered = []
         seen = set()
         for name in (
@@ -1236,6 +1404,11 @@ class CompareWithSharedDialog(qt.QDialog):
                 "shared-ahead caught up: %s"
                 % self._lanesLabel(self._shared_ahead_lanes)
             )
+        if self._obsolete_merged_lanes:
+            detail_bits.append(
+                "obsolete reset to shared: %s"
+                % self._lanesLabel(self._obsolete_merged_lanes)
+            )
         detail = "; ".join(detail_bits) if detail_bits else "Plan preview"
         return (
             model,
@@ -1256,15 +1429,19 @@ class CompareWithSharedDialog(qt.QDialog):
             if vid:
                 phantom_ids.add(vid)
                 roles[vid] = "merge"
-        # Real tips adopted from shared (reset + merge lanes + shared-ahead).
-        for vid in self._tipIdsForLanes(model, self._planPreviewSharedTipLanes()):
+        # Real tips adopted from shared (reset + merge + shared-ahead — not obsolete).
+        for vid in self._tipIdsForLanes(model, self._planGreenSharedTipLanes()):
             roles[vid] = "shared"
         for vid in self._idsForShas(model, only_remote):
             if vid not in phantom_ids:
                 roles.setdefault(vid, "shared")
+        # Drop green only when the obsolete tip commit is already in the local tree.
+        known_obsolete = self._obsoleteTipIdsAlreadyLocal(model)
+        for vid in known_obsolete:
+            roles.pop(vid, None)
         # Local-only versions that stay on other lanes.
         for vid in self._idsForShas(model, only_local):
-            if vid in phantom_ids:
+            if vid in phantom_ids or vid in known_obsolete:
                 continue
             roles.setdefault(vid, "local")
         return set(roles.keys()), roles
@@ -1307,33 +1484,38 @@ class CompareWithSharedDialog(qt.QDialog):
         # All Reset in the plan ≡ Reset all (Validate applies now).
         if reset_names and not merge_names:
             self._selectChoice(self.ACTION_RESET, silent=False)
+            extras = []
             if self._shared_ahead_lanes:
-                self._setConflictsMessage(
-                    "Preview: Reset all to shared (plan = reset on every conflicting "
-                    "branch; shared-ahead %s caught up).\n"
-                    "Click Validate to apply, or pick another option."
+                extras.append(
+                    "shared-ahead %s caught up"
                     % self._lanesLabel(self._shared_ahead_lanes)
                 )
-            else:
-                self._setConflictsMessage(
-                    "Preview: Reset all to shared (plan = reset on every conflicting "
-                    "branch).\n"
-                    "Click Validate to apply, or pick another option."
+            if self._obsolete_merged_lanes:
+                extras.append(
+                    "obsolete %s reset to shared"
+                    % self._lanesLabel(self._obsolete_merged_lanes)
                 )
+            extra = ("; " + "; ".join(extras)) if extras else ""
+            self._setConflictsMessage(
+                "Preview: Reset all to shared (plan = reset on every conflicting "
+                "branch%s).\n"
+                "Click Validate to apply, or pick another option."
+                % extra
+            )
             return
 
         self._pending = self.ACTION_MERGE
         self._refreshChoiceStyles()
         model, title, description = self._modelForLanePlan()
         self._showResultPreview(self.ACTION_MERGE, model, title, description, False)
-        # Étape 4+5: Validate applies Reset/shared-ahead then opens MergeCompare queue.
+        # Étape 4+5: Validate applies Reset/shared-ahead/obsolete then MergeCompare.
         apply_lanes = self._planStep4ApplyLanes()
         can_validate = bool(apply_lanes or merge_names)
         self._validate_btn.setEnabled(can_validate)
         if apply_lanes and merge_names:
             self._validate_btn.setToolTip(
-                "Apply Reset / shared-ahead, then open Compare and merge for "
-                "the remaining branches."
+                "Apply Reset / shared-ahead / obsolete, then open Compare and merge "
+                "for the remaining branches."
             )
         elif merge_names:
             self._validate_btn.setToolTip(
@@ -1341,7 +1523,7 @@ class CompareWithSharedDialog(qt.QDialog):
             )
         else:
             self._validate_btn.setToolTip(
-                "Apply Reset / shared-ahead to this computer."
+                "Apply Reset / shared-ahead / obsolete to this computer."
             )
         parts = ["Preview: plan ready."]
         if reset_names:
@@ -1357,6 +1539,11 @@ class CompareWithSharedDialog(qt.QDialog):
             parts.append(
                 "Shared-ahead (%s) caught up on Validate."
                 % self._lanesLabel(self._shared_ahead_lanes)
+            )
+        if self._obsolete_merged_lanes:
+            parts.append(
+                "Obsolete (%s) reset to shared on Validate."
+                % self._lanesLabel(self._obsolete_merged_lanes)
             )
         parts.append("Click Validate to apply.")
         if self._tipConflictLaneCount() > 1:
@@ -1384,6 +1571,7 @@ class CompareWithSharedDialog(qt.QDialog):
             self,
             lanes,
             shared_ahead_lanes=self._shared_ahead_lanes,
+            obsolete_merged_lanes=self._obsolete_merged_lanes,
             initial_plan=self.lane_plan,
         )
         if plan_dlg.exec_() != qt.QDialog.Accepted:
@@ -1406,7 +1594,7 @@ class CompareWithSharedDialog(qt.QDialog):
                 self._validate_btn.setEnabled(can_validate)
                 if apply_lanes and merge_names:
                     self._validate_btn.setToolTip(
-                        "Apply Reset / shared-ahead, then open Compare and merge."
+                        "Apply Reset / shared-ahead / obsolete, then open Compare and merge."
                     )
                 elif merge_names:
                     self._validate_btn.setToolTip(
@@ -1414,7 +1602,7 @@ class CompareWithSharedDialog(qt.QDialog):
                     )
                 else:
                     self._validate_btn.setToolTip(
-                        "Apply Reset / shared-ahead to this computer."
+                        "Apply Reset / shared-ahead / obsolete to this computer."
                     )
                 return
             self._result_panel.hide()
@@ -1449,9 +1637,22 @@ class CompareWithSharedDialog(qt.QDialog):
                 ),
                 self.ACTION_UPDATE: "Update version tree",
             }
+            extras = []
+            if choice == self.ACTION_RESET and self._conflict:
+                if self._shared_ahead_lanes:
+                    extras.append(
+                        "shared-ahead (%s) caught up"
+                        % self._lanesLabel(self._shared_ahead_lanes)
+                    )
+                if self._obsolete_merged_lanes:
+                    extras.append(
+                        "obsolete (%s) reset to shared"
+                        % self._lanesLabel(self._obsolete_merged_lanes)
+                    )
+            extra = ("; " + "; ".join(extras)) if extras else ""
             self._setConflictsMessage(
-                "Preview: %s.\nClick Validate to apply, or pick another option."
-                % labels.get(choice, choice)
+                "Preview: %s%s.\nClick Validate to apply, or pick another option."
+                % (labels.get(choice, choice), extra)
             )
 
     def _onValidate(self) -> None:
