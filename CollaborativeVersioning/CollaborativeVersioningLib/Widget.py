@@ -7791,7 +7791,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             self._updateProgress("Building version graphs…")
             # Local = frozen Version tree; Remote = origin/* after fetch; diff = SHA Δ.
             compare = read_compare_project_histories(
-                local_path, local_history=local_snapshot
+                local_path,
+                local_history=local_snapshot,
+                remote_tips_synced=True,
             )
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()

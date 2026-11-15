@@ -1259,7 +1259,12 @@ def ensure_can_share_with_shared(
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         raise GitHubAuthError("Open the project first.")
     fetch_remote_updates(repo_dir)
-    compare = read_compare_project_histories(repo_dir, local_history=local_history)
+    # fetch already listed origin/cv-review/* — do not ls-remote GitHub again.
+    compare = read_compare_project_histories(
+        repo_dir,
+        local_history=local_history,
+        remote_tips_synced=True,
+    )
     if (
         compare.get("has_remote_extras")
         or compare.get("has_new_remote_lanes")
@@ -4180,6 +4185,7 @@ def _history_shas(model: dict[str, Any] | None) -> set[str]:
 def read_compare_project_histories(
     repo_dir: str,
     local_history: dict[str, Any] | None = None,
+    remote_tips_synced: bool = False,
 ) -> dict[str, Any]:
     """Build local vs shared graphs for Compare (call after fetch for the remote side).
 
@@ -4194,9 +4200,12 @@ def read_compare_project_histories(
     - ``conflict_lanes``: lane names that diverged (``main`` and/or branch slugs).
     """
     empty = _empty_history_model()
-    # Shared tips: prefer GitHub ls-remote (already synced in fetch_remote_updates).
-    # Re-sync here so callers that skip fetch still get true origin tips.
-    remote_review_tips = _sync_origin_review_tips_from_ls_remote(repo_dir)
+    # Shared tips: prefer GitHub ls-remote. Skip when the caller just fetched:
+    # that already ran the same listing, and a second round-trip only waits.
+    if remote_tips_synced:
+        remote_review_tips = _review_tips(repo_dir, remote_only=True)
+    else:
+        remote_review_tips = _sync_origin_review_tips_from_ls_remote(repo_dir)
     if not remote_review_tips:
         remote_review_tips = _review_tips(repo_dir, remote_only=True)
     commit_by_sha = _read_repo_commits(repo_dir)

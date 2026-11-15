@@ -1126,8 +1126,7 @@ class CompareWithSharedDialog(qt.QDialog):
         }
         roles = {}
         if choice == self.ACTION_RESET:
-            # Green: tips taken from shared + local-only versions that stay
-            # (non-reset / local-ahead lanes still present in the scoped reset model).
+            # Green: tips taken from shared + local-only versions that stay.
             # Drop green only when the obsolete tip commit is already local.
             known_obsolete = self._obsoleteTipIdsAlreadyLocal(model)
             mark_shas = set(only_remote)
