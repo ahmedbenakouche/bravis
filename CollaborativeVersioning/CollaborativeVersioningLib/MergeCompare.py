@@ -353,7 +353,7 @@ class CubeDiffOverlay:
             self._chosen_lower_color_id = color_id
 
     def pick_key_at_ras(self, ras) -> str:
-        """Return changed-cube key containing this RAS point, else ''."""
+        """Return the changed cube that contains this RAS point, else ''."""
         if self._ras_to_ijk is None or not ras:
             return ""
         out = [0.0, 0.0, 0.0, 1.0]
@@ -361,31 +361,28 @@ class CubeDiffOverlay:
             [float(ras[0]), float(ras[1]), float(ras[2]), 1.0], out
         )
         i, j, k = float(out[0]), float(out[1]), float(out[2])
-        # Exact containment (with tiny slack for plane rounding).
-        slack = 0.51
+        # Inside the cube or on its faces. Nothing outside counts.
+        hits: list[dict] = []
         for cube in self._cubes:
             if (
-                float(cube["i0"]) - slack <= i < float(cube["i1"]) + slack
-                and float(cube["j0"]) - slack <= j < float(cube["j1"]) + slack
-                and float(cube["k0"]) - slack <= k < float(cube["k1"]) + slack
+                float(cube["i0"]) <= i <= float(cube["i1"])
+                and float(cube["j0"]) <= j <= float(cube["j1"])
+                and float(cube["k0"]) <= k <= float(cube["k1"])
             ):
-                return str(cube.get("key") or "")
-        # Fallback: nearest cube center in IJK (helps if click is slightly off).
+                hits.append(cube)
+        if not hits:
+            return ""
+        if len(hits) == 1:
+            return str(hits[0].get("key") or "")
+        # Shared face between two cubes: keep the nearer center.
         best_key = ""
         best_dist = 1e18
-        for cube in self._cubes:
+        for cube in hits:
             ci = 0.5 * (float(cube["i0"]) + float(cube["i1"]))
             cj = 0.5 * (float(cube["j0"]) + float(cube["j1"]))
             ck = 0.5 * (float(cube["k0"]) + float(cube["k1"]))
             dist = (i - ci) ** 2 + (j - cj) ** 2 + (k - ck) ** 2
-            # Only accept if roughly inside/near the cube diagonal.
-            half = max(
-                abs(float(cube["i1"]) - float(cube["i0"])),
-                abs(float(cube["j1"]) - float(cube["j0"])),
-                abs(float(cube["k1"]) - float(cube["k0"])),
-                1.0,
-            )
-            if dist < best_dist and dist <= (0.75 * half) ** 2:
+            if dist < best_dist:
                 best_dist = dist
                 best_key = str(cube.get("key") or "")
         return best_key
