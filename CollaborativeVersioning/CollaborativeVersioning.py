@@ -153,18 +153,19 @@ from CollaborativeVersioningLib.Logic import CollaborativeVersioningLogic  # noq
 class CollaborativeVersioning(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = _("Collaborative Versioning")
+        self.parent.title = _("BRAVIS")
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Informatics")]
         self.parent.dependencies = []
         self.parent.contributors = ["Ahmed Ben Akouche (ISIR)", "Julien Gori (CNRS)"]
         self.parent.helpText = _(
             """
-            Collaborative versioning for 3D image annotations — UI MVP.<br><br>
+            BRAVIS — BRAin-atlas Versioning Interactive System.<br><br>
+            Collaborative versioning for 3D image annotations.<br>
             Connect with GitHub, then create or open a project.<br>
             Right panel: graphs, history, and activity feed.
             """
         )
-        self.parent.acknowledgementText = _("ISIR/ICM project — collaborative 3D annotation versioning.")
+        self.parent.acknowledgementText = _("ISIR/ICM project — BRAVIS collaborative 3D annotation versioning.")
 
 
 class CollaborativeVersioningTest(ScriptedLoadableModuleTest):

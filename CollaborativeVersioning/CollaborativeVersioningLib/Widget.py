@@ -362,7 +362,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             import traceback
             logging.error("CollaborativeVersioning setup failed: %s", traceback.format_exc())
             slicer.util.errorDisplay(
-                "Collaborative Versioning UI failed to load:\n%s" % error
+                "BRAVIS UI failed to load:\n%s" % error
             )
             raise
 
@@ -1221,7 +1221,7 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             oldDock.deleteLater()
         self._rightDock = None
 
-        self._rightDock = qt.QDockWidget("Collaborative Versioning — Collaborative mode", mainWin)
+        self._rightDock = qt.QDockWidget("BRAVIS — Collaborative mode", mainWin)
         self._rightDock.setObjectName("CollaborativeVersioning_RightDock")
         self._rightDock.setAllowedAreas(qt.Qt.RightDockWidgetArea)
         self._rightDock.setStyleSheet(DOCK_STYLE)
