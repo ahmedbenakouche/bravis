@@ -9540,6 +9540,12 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
         except (GitHubAuthError, OSError, RuntimeError, ValueError) as error:
             self._closeProgress()
             self._updateVersionActionButtons()
+            # Empty / unchanged mask: UI was dirty, Git had nothing to commit.
+            if write_segmentation and str(error).strip() == "No new changes to save.":
+                error = GitHubAuthError(
+                    "Nothing new in the segmentation to save "
+                    "(empty segment or no painted voxels)."
+                )
             self._showGithubError(error, box=True)
             return
         finally:
