@@ -9055,7 +9055,9 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
                 and (request.get("full_name") or "") == (self._currentProjectName() or "")
             ):
                 self._updateProgress("Updating version history…")
-                history = read_project_history(local_path)
+                # Decline must not hide already-known remote lanes via UI caps
+                # (e.g. nested hindbrain/pass2). Caps stay for Compare/Update.
+                history = read_project_history(local_path, apply_ui_caps=False)
                 previous_unshared = self._unshared_version
                 self._applyProjectHistoryBundle(history)
                 self._unshared_version = previous_unshared or self._historyHasUnsharedVersion(history)
