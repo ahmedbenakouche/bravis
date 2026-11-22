@@ -10473,19 +10473,6 @@ class CollaborativeVersioningWidget(ScriptedLoadableModuleWidget, VTKObservation
             changed = int(cube_diff.get("changed") or 0)
             total = int(cube_diff.get("total") or 0)
             self._appendFeed("Segmentation cubes changed: %d/%d" % (changed, total))
-            if changed:
-                self._appendFeed(
-                    "Selon X : %s"
-                    % SegmentationCubes.format_voxel_intervals(cube_diff.get("x") or [])
-                )
-                self._appendFeed(
-                    "Selon Y : %s"
-                    % SegmentationCubes.format_voxel_intervals(cube_diff.get("y") or [])
-                )
-                self._appendFeed(
-                    "Selon Z : %s"
-                    % SegmentationCubes.format_voxel_intervals(cube_diff.get("z") or [])
-                )
         self._painted_ids_cache_key = None
         self._painted_ids_cache = set()
         self._scheduleAnatomyTreeCoverageRefresh()

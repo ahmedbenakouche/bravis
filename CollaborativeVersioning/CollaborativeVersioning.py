@@ -156,7 +156,7 @@ class CollaborativeVersioning(ScriptedLoadableModule):
         self.parent.title = _("BRAVIS")
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Informatics")]
         self.parent.dependencies = []
-        self.parent.contributors = ["Ahmed Ben Akouche (ISIR)", "Julien Gori (CNRS)"]
+        self.parent.contributors = ["Ahmed Ben Akouche (ISIR)"]
         self.parent.helpText = _(
             """
             BRAVIS — BRAin-atlas Versioning Interactive System.<br><br>
