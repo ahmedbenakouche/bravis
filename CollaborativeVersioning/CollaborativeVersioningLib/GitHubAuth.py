@@ -2313,38 +2313,55 @@ def _publish_parent_lane_tips_for_share(
 ) -> None:
     """Create/advance origin tips for parent lanes needed by this Share history.
 
-    Pushes root → nearest parent first. Publishes the parent SHA required by the
-    shared tip (fork point if the parent tip has diverged ahead locally).
+    Order: ``main`` (root parent of every review lane), then nested parents
+    root → nearest. Publishes the parent SHA required by the shared tip (fork
+    point if the parent tip has diverged ahead locally). Does not move local
+    ``refs/heads/main`` — only ``origin/main`` when a fast-forward is possible.
     """
     share = str(share_sha or "").strip()
     if not share:
         return
+
+    def _publish_parent_ref(local_tip: str, origin_ref: str, push_branch: str) -> None:
+        tip = str(local_tip or "").strip()
+        if not tip:
+            return
+        publish_sha = _parent_share_sha_on_lane(repo_dir, tip, share)
+        if not publish_sha:
+            return
+        remote_tip = _git_rev_parse(repo_dir, origin_ref)
+        if remote_tip == publish_sha:
+            return
+        if remote_tip and not _is_ancestor(repo_dir, remote_tip, publish_sha):
+            return
+        _push_review_sha_to_origin(repo_dir, publish_sha, push_branch)
+
+    # Flat and nested review lanes both hang under main in the Version tree.
+    local_main = _git_rev_parse(repo_dir, "refs/heads/main")
+    _publish_parent_ref(local_main, "refs/remotes/origin/main", "main")
+
     for parent in _lane_ancestor_parent_slugs(share_slug):
         branch = review_branch_for(parent)
         local_tip = _git_rev_parse(repo_dir, "refs/heads/%s" % branch)
-        if not local_tip:
-            continue
-        publish_sha = _parent_share_sha_on_lane(repo_dir, local_tip, share)
-        if not publish_sha:
-            continue
-        remote_tip = _git_rev_parse(repo_dir, "refs/remotes/origin/%s" % branch)
-        if remote_tip == publish_sha:
-            continue
-        if remote_tip and not _is_ancestor(repo_dir, remote_tip, publish_sha):
-            continue
-        _push_review_sha_to_origin(repo_dir, publish_sha, branch)
+        _publish_parent_ref(
+            local_tip,
+            "refs/remotes/origin/%s" % branch,
+            branch,
+        )
 
 
 def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
     """Share current versions on a named branch beside main. Returns the slug used.
 
-    Does not change local main — unshared main versions stay on this computer.
+    Does not rewind local main. Unshared main commits beyond the fork stay local
+    until Share on main; the fork point on main is published when needed so
+    colleagues keep ``main/N`` labels.
 
     When HEAD is detached on an older lane commit (tip still ahead locally), Share
     publishes only up to HEAD and does not move the local tip backward — same idea
     as sharing an older main commit.
 
-    Nested lanes: parent branch tips on origin are created/advanced first (root →
+    Parent tips on origin are created/advanced first (main, then nested root →
     parent) so remotes reconstruct the same hierarchy as this computer.
     """
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
@@ -2387,8 +2404,7 @@ def publish_review_branch(repo_dir: str, branch_name: str | None = None) -> str:
         _point_head_at(repo_dir, branch, head)
     _publish_parent_lane_tips_for_share(repo_dir, slug, head)
     _push_review_sha_to_origin(repo_dir, head, branch)
-    # Do not move refs/heads/main — Share publishes this branch (+ parents). Recolling
-    # main onto origin/main would hide local unshared main versions from the tree.
+    # Local refs/heads/main is left as-is (may stay ahead of the published fork).
     return slug
 
 
